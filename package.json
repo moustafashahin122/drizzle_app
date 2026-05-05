@@ -9,10 +9,13 @@
     "db:studio": "drizzle-kit studio",
     "dev": "tsx watch src/server.ts",
     "start": "tsx src/server.ts",
-    "test": "node --import tsx --test src/graphql/*.test.ts"
+    "test": "node --import tsx --test src/graphql/*.test.ts",
+    "seed:admin": "tsx src/scripts/seed-admin.ts"
   },
   "dependencies": {
     "@hono/node-server": "^1.13.7",
+    "@types/bcryptjs": "^2.4.6",
+    "bcryptjs": "^3.0.3",
     "better-sqlite3": "^11.7.0",
     "drizzle-orm": "^0.38.3",
     "graphql": "^16.10.0",

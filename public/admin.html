@@ -1,0 +1,207 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Admin — Users</title>
+    <style>
+      :root { color-scheme: light dark; }
+      body {
+        font-family: system-ui, sans-serif;
+        max-width: 880px;
+        margin: 2rem auto;
+        padding: 0 1rem;
+      }
+      header { display: flex; align-items: center; gap: 1rem; margin-bottom: 1rem; }
+      header h1 { margin: 0; flex: 1; }
+      nav a, nav button {
+        font-size: 0.9rem;
+        margin-left: 0.5rem;
+        background: transparent;
+        border: 0;
+        color: inherit;
+        cursor: pointer;
+        text-decoration: underline;
+      }
+      table { width: 100%; border-collapse: collapse; }
+      th, td { padding: 0.5rem; text-align: left; border-bottom: 1px solid #8884; }
+      th { font-size: 0.85rem; opacity: 0.7; }
+      td input[type="text"], td input[type="email"] { width: 100%; padding: 0.25rem; }
+      td.actions { white-space: nowrap; text-align: right; }
+      button { font-size: 0.9rem; cursor: pointer; padding: 0.3rem 0.6rem; }
+      .danger { color: #c33; }
+      .new { margin-top: 1.5rem; padding: 1rem; border: 1px solid #8884; }
+      .new h2 { margin-top: 0; font-size: 1rem; }
+      .new form { display: grid; grid-template-columns: 1fr 1fr 1fr auto; gap: 0.5rem; }
+      .new form input { padding: 0.5rem; }
+      .error { color: #c33; min-height: 1.2em; margin-top: 0.5rem; }
+      .me { font-size: 0.85rem; opacity: 0.7; }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>Users</h1>
+      <span class="me" id="me"></span>
+      <nav>
+        <a href="/">Todos</a>
+        <button id="logout" type="button">Sign out</button>
+      </nav>
+    </header>
+
+    <table>
+      <thead>
+        <tr>
+          <th>ID</th>
+          <th>Name</th>
+          <th>Email</th>
+          <th>Active</th>
+          <th>Created</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody id="rows"></tbody>
+    </table>
+
+    <section class="new">
+      <h2>Create user</h2>
+      <form id="new-form">
+        <input id="new-name" type="text" placeholder="Name" required />
+        <input id="new-email" type="email" placeholder="Email" required />
+        <input id="new-password" type="password" placeholder="Password" required minlength="4" />
+        <button type="submit">Create</button>
+      </form>
+      <div class="error" id="new-error"></div>
+    </section>
+
+    <script type="module">
+      import { gql, requireAuth, logout } from "/app.js";
+
+      const me = await requireAuth();
+      document.getElementById("me").textContent = `Signed in as ${me.name}`;
+      document.getElementById("logout").onclick = logout;
+
+      const rows = document.getElementById("rows");
+      const newForm = document.getElementById("new-form");
+      const newError = document.getElementById("new-error");
+
+      const Q_USERS = `
+        query { users(orderBy: { id: asc }) { id name email active createdAt } }
+      `;
+      const M_UPDATE = `
+        mutation($id: ID!, $set: UsersUpdate!) {
+          updateUsers(where: { id: { eq: $id } }, set: $set) {
+            id name email active
+          }
+        }
+      `;
+      const M_DELETE = `
+        mutation($id: ID!) {
+          deleteFromUsers(where: { id: { eq: $id } }) { id }
+        }
+      `;
+      const M_CREATE = `
+        mutation($name: String!, $email: String!, $password: String!) {
+          createUser(name: $name, email: $email, password: $password) {
+            id name email active createdAt
+          }
+        }
+      `;
+
+      async function load() {
+        const { users } = await gql(Q_USERS);
+        rows.innerHTML = "";
+        for (const u of users) rows.appendChild(renderRow(u));
+      }
+
+      function cell(text) {
+        const td = document.createElement("td");
+        td.textContent = text ?? "";
+        return td;
+      }
+
+      function editableCell(initial, onCommit) {
+        const td = document.createElement("td");
+        const input = document.createElement("input");
+        input.type = "text";
+        input.value = initial ?? "";
+        input.onkeydown = (e) => { if (e.key === "Enter") input.blur(); };
+        input.onblur = async () => {
+          const v = input.value.trim();
+          if (v && v !== initial) {
+            try { await onCommit(v); } catch (err) { alert(err.message); input.value = initial; }
+          } else {
+            input.value = initial ?? "";
+          }
+        };
+        td.appendChild(input);
+        return td;
+      }
+
+      function renderRow(u) {
+        const tr = document.createElement("tr");
+
+        tr.appendChild(cell(u.id));
+        tr.appendChild(editableCell(u.name, (v) =>
+          gql(M_UPDATE, { id: u.id, set: { name: v } }),
+        ));
+        tr.appendChild(editableCell(u.email, (v) =>
+          gql(M_UPDATE, { id: u.id, set: { email: v } }),
+        ));
+
+        const activeTd = document.createElement("td");
+        const activeCb = document.createElement("input");
+        activeCb.type = "checkbox";
+        activeCb.checked = !!u.active;
+        activeCb.onchange = async () => {
+          try {
+            await gql(M_UPDATE, { id: u.id, set: { active: activeCb.checked } });
+          } catch (err) {
+            alert(err.message);
+            activeCb.checked = !activeCb.checked;
+          }
+        };
+        activeTd.appendChild(activeCb);
+        tr.appendChild(activeTd);
+
+        tr.appendChild(cell(u.createdAt?.replace("T", " ").slice(0, 19) ?? ""));
+
+        const actions = document.createElement("td");
+        actions.className = "actions";
+        const del = document.createElement("button");
+        del.className = "danger";
+        del.textContent = "Delete";
+        del.onclick = async () => {
+          if (!confirm(`Delete ${u.email}?`)) return;
+          try {
+            await gql(M_DELETE, { id: u.id });
+            load();
+          } catch (err) {
+            alert(err.message);
+          }
+        };
+        actions.appendChild(del);
+        tr.appendChild(actions);
+
+        return tr;
+      }
+
+      newForm.onsubmit = async (e) => {
+        e.preventDefault();
+        newError.textContent = "";
+        try {
+          await gql(M_CREATE, {
+            name: document.getElementById("new-name").value.trim(),
+            email: document.getElementById("new-email").value.trim(),
+            password: document.getElementById("new-password").value,
+          });
+          newForm.reset();
+          load();
+        } catch (err) {
+          newError.textContent = err.message;
+        }
+      };
+
+      load();
+    </script>
+  </body>
+</html>

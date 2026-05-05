@@ -3,15 +3,50 @@ import { serve } from "@hono/node-server";
 import { serveStatic } from "@hono/node-server/serve-static";
 import { createYoga } from "graphql-yoga";
 import { buildSchema } from "./graphql/index.js";
+import { buildAuthExtensions, resolveSessionFromHeader, type AuthContext } from "./graphql/auth.js";
+import { buildRbac } from "./graphql/rbac.js";
+import { buildRbacDb, type RbacDb } from "./graphql/rbacDb.js";
 import * as dbModule from "./db.js";
 
-const { schema } = buildSchema(dbModule.db, dbModule);
+const auth = buildAuthExtensions(dbModule.db, {
+  users: dbModule.users,
+  sessions: dbModule.sessions,
+});
 
-const yoga = createYoga({
+const rbac = buildRbac(dbModule.db, {
+  groups: dbModule.groups,
+  userGroups: dbModule.userGroups,
+  accessRights: dbModule.accessRights,
+  recordRules: dbModule.recordRules,
+});
+
+const { schema } = buildSchema(dbModule.db, dbModule, {
+  hiddenOutputColumns: { users: ["passwordHash"] },
+  extraQueryFields: auth.extraQueryFields,
+  extraMutationFields: auth.extraMutationFields,
+  rbac: { enforce: rbac.enforce },
+});
+
+const rdbFor = buildRbacDb({
+  db: dbModule.db,
+  schema: dbModule,
+  enforce: rbac.enforce,
+});
+
+const yoga = createYoga<{}, AuthContext & { db: RbacDb }>({
   schema,
   graphqlEndpoint: "/graphql",
   graphiql: true,
-  context: () => ({ batch: new Map() }),
+  context: async ({ request }) => {
+    const { user, session } = await resolveSessionFromHeader(
+      dbModule.db,
+      { users: dbModule.users, sessions: dbModule.sessions },
+      request.headers.get("authorization"),
+    );
+    const batch = new Map();
+    const baseCtx = { user, session, batch };
+    return { ...baseCtx, db: rdbFor(baseCtx) };
+  },
 });
 
 const app = new Hono();

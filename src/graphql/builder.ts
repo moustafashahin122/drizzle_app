@@ -114,6 +114,58 @@ export interface BuildSchemaOptions {
    * `<TypeName>Update`, `<TypeName>Where`, `<TypeName>OrderBy`).
    */
   typeNames?: Record<string, string>;
+  /**
+   * Per-table list of column field names to omit from the **output** object
+   * type. Inputs (`Insert`/`Update`/`Where`) are unaffected — the auto-CRUD
+   * surface still reads/writes the column for callers that have it (RBAC will
+   * gate those). Use for fields like `passwordHash` that must not leak in
+   * query responses but still need to be writable internally.
+   */
+  hiddenOutputColumns?: Record<string, string[]>;
+  /**
+   * Extra root Query fields to merge into the schema. Receives the map of
+   * generated object types keyed by JS schema key, so callers can compose
+   * payloads that reference auto-generated types (e.g. an `AuthPayload` that
+   * embeds the `User` object type).
+   */
+  extraQueryFields?: (
+    typesByKey: Record<string, GraphQLObjectType>,
+  ) => GraphQLFieldConfigMap<unknown, any>;
+  /**
+   * Extra root Mutation fields to merge into the schema. Same shape as
+   * `extraQueryFields`. If supplied alongside zero auto mutations, a Mutation
+   * root is still created.
+   */
+  extraMutationFields?: (
+    typesByKey: Record<string, GraphQLObjectType>,
+  ) => GraphQLFieldConfigMap<unknown, any>;
+  /**
+   * RBAC enforcement hook. Called by every auto-generated CRUD resolver before
+   * touching the database. Throws `FORBIDDEN` to deny; returns an optional
+   * `where` SQL fragment that the resolver AND-s into its query (record-rule
+   * row-level filter). Admin callers receive `{}` (no filter, no throw).
+   *
+   * `resource` is the table's JS schema key (the same key used for the
+   * `Query.<jsKey>` root field).
+   *
+   * Insert resolvers only run the ACL check — record rules on `create` would
+   * require post-insert validation in a transaction, which the auto-CRUD
+   * surface does not yet model. ACLs alone are sufficient for the common case.
+   */
+  rbac?: {
+    enforce: (
+      ctx: any,
+      resource: string,
+      action: "create" | "read" | "update" | "delete",
+      columns: ColumnMap,
+    ) => Promise<{ where?: SQL }>;
+    /**
+     * Per-table opt-out (e.g. for a public `register` flow that needs to
+     * insert into `users` without the caller being authenticated). Resolvers
+     * for tables in this set skip enforcement entirely.
+     */
+     bypassResources?: Set<string>;
+  };
 }
 
 /** Capitalize first character of a string. */
@@ -197,9 +249,10 @@ export function buildSchema(
     const columns = getTableColumns(table) as ColumnMap;
     const relations = intro.relations.get(sqlName) ?? [];
 
+    const hiddenOutput = new Set(options.hiddenOutputColumns?.[jsKey] ?? []);
     const objectType = new GraphQLObjectType({
       name: typeName,
-      fields: () => buildObjectFields(meta, intro, metas, db, whereCtxFor),
+      fields: () => buildObjectFields(meta, intro, metas, db, whereCtxFor, hiddenOutput),
     });
     const insertInput = buildInsertInput(typeName, columns);
     const updateInput = buildUpdateInput(typeName, columns);
@@ -229,8 +282,16 @@ export function buildSchema(
   // Pass 2: build root Query and Mutation.
   const queryFields: GraphQLFieldConfigMap<unknown, unknown> = {};
   const mutationFields: GraphQLFieldConfigMap<unknown, unknown> = {};
+  const rbac = options.rbac;
   for (const meta of metas.values()) {
-    addRootFields(meta, queryFields, mutationFields, db, whereCtxFor(meta));
+    addRootFields(meta, queryFields, mutationFields, db, whereCtxFor(meta), rbac);
+  }
+
+  if (options.extraQueryFields || options.extraMutationFields) {
+    const typesByKey: Record<string, GraphQLObjectType> = {};
+    for (const m of metas.values()) typesByKey[m.jsKey] = m.objectType;
+    Object.assign(queryFields, options.extraQueryFields?.(typesByKey) ?? {});
+    Object.assign(mutationFields, options.extraMutationFields?.(typesByKey) ?? {});
   }
 
   return {
@@ -300,9 +361,11 @@ function buildObjectFields(
   metas: Map<string, TableMeta>,
   db: DrizzleLike,
   whereCtxFor: (m: TableMeta) => WhereContext,
+  hiddenOutput: Set<string>,
 ): GraphQLFieldConfigMap<any, any> {
   const fields: GraphQLFieldConfigMap<any, any> = {};
   for (const [name, col] of Object.entries(meta.columns)) {
+    if (hiddenOutput.has(name)) continue;
     fields[name] = {
       type: wrapNonNull(columnToBaseType(col), (col as any).notNull),
       resolve: (src) => src?.[name],
@@ -525,13 +588,27 @@ function addRootFields(
   mutationFields: GraphQLFieldConfigMap<unknown, unknown>,
   db: DrizzleLike,
   ctx: WhereContext,
+  rbac: BuildSchemaOptions["rbac"],
 ) {
-  queryFields[meta.jsKey] = buildListQueryField(meta, db, ctx);
-  queryFields[`${meta.jsKey}Single`] = buildSingleQueryField(meta, db, ctx);
-  mutationFields[`insertInto${meta.typeName}`] = buildInsertMutationField(meta, db);
-  mutationFields[`update${meta.typeName}`] = buildUpdateMutationField(meta, db, ctx);
-  mutationFields[`deleteFrom${meta.typeName}`] = buildDeleteMutationField(meta, db, ctx);
+  // Resolve once: a function that returns the rbac extra-where for a given
+  // request context, or undefined when rbac is disabled / bypassed for this
+  // resource.
+  const bypass = rbac?.bypassResources?.has(meta.jsKey);
+  const guard = rbac && !bypass
+    ? async (gqlCtx: any, action: "create" | "read" | "update" | "delete") =>
+        (await rbac.enforce(gqlCtx, meta.jsKey, action, meta.columns)).where
+    : null;
+
+  queryFields[meta.jsKey] = buildListQueryField(meta, db, ctx, guard);
+  queryFields[`${meta.jsKey}Single`] = buildSingleQueryField(meta, db, ctx, guard);
+  mutationFields[`insertInto${meta.typeName}`] = buildInsertMutationField(meta, db, guard);
+  mutationFields[`update${meta.typeName}`] = buildUpdateMutationField(meta, db, ctx, guard);
+  mutationFields[`deleteFrom${meta.typeName}`] = buildDeleteMutationField(meta, db, ctx, guard);
 }
+
+type Guard =
+  | ((ctx: any, action: "create" | "read" | "update" | "delete") => Promise<SQL | undefined>)
+  | null;
 
 /** Non-null list of the table's object type — used as the return type of all list/mutation root fields. */
 function listType(meta: TableMeta) {
@@ -553,12 +630,15 @@ function buildListQueryField(
   meta: TableMeta,
   db: DrizzleLike,
   ctx: WhereContext,
+  guard: Guard,
 ): GraphQLFieldConfig<unknown, unknown> {
   return {
     type: listType(meta),
     args: listArgsConfig(meta),
-    resolve: (_, args) =>
-      applyListArgs(db.select().from(meta.table), args, meta.columns, undefined, ctx),
+    resolve: async (_, args, gqlCtx) => {
+      const extra = guard ? await guard(gqlCtx, "read") : undefined;
+      return applyListArgs(db.select().from(meta.table), args, meta.columns, extra, ctx);
+    },
   };
 }
 
@@ -567,16 +647,18 @@ function buildSingleQueryField(
   meta: TableMeta,
   db: DrizzleLike,
   ctx: WhereContext,
+  guard: Guard,
 ): GraphQLFieldConfig<unknown, unknown> {
   return {
     type: meta.objectType,
     args: { where: { type: meta.whereInput }, orderBy: { type: meta.orderByInput } },
-    resolve: async (_, args) => {
+    resolve: async (_, args, gqlCtx) => {
+      const extra = guard ? await guard(gqlCtx, "read") : undefined;
       const rows = await applyListArgs(
         db.select().from(meta.table),
         args,
         meta.columns,
-        undefined,
+        extra,
         ctx,
       ).limit(1);
       return rows[0] ?? null;
@@ -585,7 +667,11 @@ function buildSingleQueryField(
 }
 
 /** `Mutation.insertInto<TypeName>(values)` — bulk insert, returns inserted rows. */
-function buildInsertMutationField(meta: TableMeta, db: DrizzleLike): GraphQLFieldConfig<unknown, unknown> {
+function buildInsertMutationField(
+  meta: TableMeta,
+  db: DrizzleLike,
+  guard: Guard,
+): GraphQLFieldConfig<unknown, unknown> {
   return {
     type: listType(meta),
     args: {
@@ -595,8 +681,10 @@ function buildInsertMutationField(meta: TableMeta, db: DrizzleLike): GraphQLFiel
         ),
       },
     },
-    resolve: async (_, args) =>
-      db.insert(meta.table).values(args.values).returning(),
+    resolve: async (_, args, gqlCtx) => {
+      if (guard) await guard(gqlCtx, "create");
+      return db.insert(meta.table).values(args.values).returning();
+    },
   };
 }
 
@@ -605,6 +693,7 @@ function buildUpdateMutationField(
   meta: TableMeta,
   db: DrizzleLike,
   ctx: WhereContext,
+  guard: Guard,
 ): GraphQLFieldConfig<unknown, unknown> {
   return {
     type: listType(meta),
@@ -612,12 +701,13 @@ function buildUpdateMutationField(
       set: { type: new GraphQLNonNull(meta.updateInput) },
       where: { type: meta.whereInput },
     },
-    resolve: async (_, args) =>
-      db
-        .update(meta.table)
-        .set(args.set)
-        .where(whereToSql(args?.where, meta.columns, ctx))
-        .returning(),
+    resolve: async (_, args, gqlCtx) => {
+      const extra = guard ? await guard(gqlCtx, "update") : undefined;
+      const userWhere = whereToSql(args?.where, meta.columns, ctx);
+      const combined =
+        extra && userWhere ? and(extra, userWhere) : extra ?? userWhere;
+      return db.update(meta.table).set(args.set).where(combined).returning();
+    },
   };
 }
 
@@ -626,14 +716,17 @@ function buildDeleteMutationField(
   meta: TableMeta,
   db: DrizzleLike,
   ctx: WhereContext,
+  guard: Guard,
 ): GraphQLFieldConfig<unknown, unknown> {
   return {
     type: listType(meta),
     args: { where: { type: meta.whereInput } },
-    resolve: async (_, args) =>
-      db
-        .delete(meta.table)
-        .where(whereToSql(args?.where, meta.columns, ctx))
-        .returning(),
+    resolve: async (_, args, gqlCtx) => {
+      const extra = guard ? await guard(gqlCtx, "delete") : undefined;
+      const userWhere = whereToSql(args?.where, meta.columns, ctx);
+      const combined =
+        extra && userWhere ? and(extra, userWhere) : extra ?? userWhere;
+      return db.delete(meta.table).where(combined).returning();
+    },
   };
 }
