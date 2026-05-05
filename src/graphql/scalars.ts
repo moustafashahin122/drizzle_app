@@ -24,7 +24,7 @@ export const GraphQLJSON = new GraphQLScalarType({
   description: "Arbitrary JSON value",
   serialize: (v) => v,
   parseValue: (v) => v,
-  parseLiteral(ast): unknown {
+  parseLiteral(ast, variables): unknown {
     switch (ast.kind) {
       case Kind.STRING:
       case Kind.BOOLEAN:
@@ -34,23 +34,22 @@ export const GraphQLJSON = new GraphQLScalarType({
         return Number(ast.value);
       case Kind.OBJECT: {
         const obj: Record<string, unknown> = {};
-        for (const f of ast.fields) obj[f.name.value] = parseAst(f.value);
+        for (const f of ast.fields) obj[f.name.value] = GraphQLJSON.parseLiteral(f.value, variables);
         return obj;
       }
       case Kind.LIST:
-        return ast.values.map(parseAst);
+        return ast.values.map((v) => GraphQLJSON.parseLiteral(v, variables));
       case Kind.NULL:
         return null;
+      case Kind.ENUM:
+        return ast.value;
+      case Kind.VARIABLE:
+        return variables?.[ast.name.value];
       default:
-        return null;
+        throw new Error(`GraphQLJSON: unsupported literal kind ${(ast as { kind: string }).kind}`);
     }
   },
 });
-
-/** Recursively parse an inline-literal AST node for the {@link GraphQLJSON} scalar. */
-function parseAst(ast: any): unknown {
-  return GraphQLJSON.parseLiteral(ast, undefined);
-}
 
 /**
  * `BigIntString` scalar. Big integers are exchanged as decimal strings on the

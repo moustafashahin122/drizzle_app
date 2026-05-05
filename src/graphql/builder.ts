@@ -74,7 +74,6 @@ import {
   eq,
   getTableColumns,
   getTableName,
-  type Column,
   type SQL,
 } from "drizzle-orm";
 import {
@@ -137,8 +136,6 @@ interface TableMeta {
   columns: ColumnMap;
   /** Relations declared on this table (forward + inverse, after introspection). */
   relations: ExtractedRelation[];
-  /** Primary-key columns; used as the default "local side" of relation joins when not specified. */
-  pkColumns: Column[];
   objectType: GraphQLObjectType;
   insertInput: GraphQLInputObjectType;
   updateInput: GraphQLInputObjectType;
@@ -197,7 +194,6 @@ export function buildSchema(
     const sqlName = getTableName(table);
     const typeName = options.typeNames?.[jsKey] ?? cap(jsKey);
     const columns = getTableColumns(table) as ColumnMap;
-    const pkColumns = Object.values(columns).filter((c: any) => c.primary);
     const relations = intro.relations.get(sqlName) ?? [];
 
     const objectType = new GraphQLObjectType({
@@ -220,7 +216,6 @@ export function buildSchema(
       table,
       columns,
       relations,
-      pkColumns,
       objectType,
       insertInput,
       updateInput,
