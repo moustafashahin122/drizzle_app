@@ -1,0 +1,38 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Debug server (tsx)",
+      "type": "node",
+      "request": "launch",
+      "cwd": "/opt/work_code/ai_mvp/research/drizzle_todo_app",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["run", "dev"],
+      "console": "integratedTerminal",
+      "skipFiles": ["<node_internals>/**"],
+      "env": {
+        "NODE_OPTIONS": "--enable-source-maps"
+      }
+    },
+    {
+      "name": "Debug server (no watch)",
+      "type": "node",
+      "request": "launch",
+      "cwd": "/opt/work_code/ai_mvp/research/drizzle_todo_app",
+      "runtimeExecutable": "npx",
+      "runtimeArgs": ["tsx", "src/server.ts"],
+      "console": "integratedTerminal",
+      "skipFiles": ["<node_internals>/**"],
+      "env": {
+        "NODE_OPTIONS": "--enable-source-maps"
+      }
+    },
+    {
+      "name": "Attach to running server",
+      "type": "node",
+      "request": "attach",
+      "port": 9229,
+      "skipFiles": ["<node_internals>/**"]
+    }
+  ]
+}

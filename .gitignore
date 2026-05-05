@@ -1,0 +1,5 @@
+node_modules/
+todo.db
+todo.db-journal
+drizzle/
+.env

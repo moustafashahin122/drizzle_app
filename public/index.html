@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Drizzle GraphQL Todo</title>
+    <style>
+      :root { color-scheme: light dark; }
+      body {
+        font-family: system-ui, sans-serif;
+        max-width: 560px;
+        margin: 2rem auto;
+        padding: 0 1rem;
+      }
+      h1 { margin-bottom: 0.25rem; }
+      .hint { font-size: 0.85rem; opacity: 0.7; margin-bottom: 1rem; }
+      form { display: flex; gap: 0.5rem; margin-bottom: 1rem; }
+      input[type="text"] { flex: 1; padding: 0.5rem; font-size: 1rem; }
+      button { padding: 0.5rem 0.9rem; font-size: 1rem; cursor: pointer; }
+      ul { list-style: none; padding: 0; }
+      li {
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+        padding: 0.5rem;
+        border-bottom: 1px solid #8884;
+      }
+      li.done .title { text-decoration: line-through; opacity: 0.6; }
+      .title { flex: 1; cursor: pointer; }
+      .title input { width: 100%; font-size: 1rem; padding: 0.25rem; }
+      .del { background: transparent; border: 0; color: #c33; font-size: 1.1rem; }
+    </style>
+  </head>
+  <body>
+    <h1>Todos</h1>
+    <p class="hint">Powered by GraphQL — explore the schema at <a href="/graphql">/graphql</a></p>
+    <form id="new-form">
+      <input id="new-title" type="text" placeholder="What needs doing?" required />
+      <button type="submit">Add</button>
+    </form>
+    <ul id="list"></ul>
+
+    <script>
+      const list = document.getElementById("list");
+      const form = document.getElementById("new-form");
+      const input = document.getElementById("new-title");
+
+      async function gql(query, variables = {}) {
+        const res = await fetch("/graphql", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ query, variables }),
+        });
+        const json = await res.json();
+        if (json.errors) {
+          console.error(json.errors);
+          throw new Error(json.errors[0].message);
+        }
+        return json.data;
+      }
+
+      const Q_LIST = `
+        query { todos(orderBy: { id: asc }) { id title completed } }
+      `;
+      const M_CREATE = `
+        mutation($title: String!) {
+          insertIntoTodosSingle(values: { title: $title, completed: false }) {
+            id title completed
+          }
+        }
+      `;
+      const M_UPDATE = `
+        mutation($id: Int!, $set: TodosUpdateInput!) {
+          updateTodos(where: { id: { eq: $id } }, set: $set) {
+            id title completed
+          }
+        }
+      `;
+      const M_DELETE = `
+        mutation($id: Int!) {
+          deleteFromTodos(where: { id: { eq: $id } }) { id }
+        }
+      `;
+
+      async function load() {
+        const { todos } = await gql(Q_LIST);
+        list.innerHTML = "";
+        for (const t of todos) list.appendChild(render(t));
+      }
+
+      function render(t) {
+        const li = document.createElement("li");
+        if (t.completed) li.classList.add("done");
+
+        const cb = document.createElement("input");
+        cb.type = "checkbox";
+        cb.checked = !!t.completed;
+        cb.onchange = async () => {
+          await gql(M_UPDATE, { id: t.id, set: { completed: cb.checked } });
+          load();
+        };
+
+        const title = document.createElement("span");
+        title.className = "title";
+        title.textContent = t.title;
+        title.ondblclick = () => {
+          const ed = document.createElement("input");
+          ed.type = "text";
+          ed.value = t.title;
+          ed.onkeydown = (e) => { if (e.key === "Enter") ed.blur(); if (e.key === "Escape") load(); };
+          ed.onblur = async () => {
+            const v = ed.value.trim();
+            if (v && v !== t.title) {
+              await gql(M_UPDATE, { id: t.id, set: { title: v } });
+            }
+            load();
+          };
+          title.textContent = "";
+          title.appendChild(ed);
+          ed.focus();
+          ed.select();
+        };
+
+        const del = document.createElement("button");
+        del.className = "del";
+        del.textContent = "✕";
+        del.title = "Delete";
+        del.onclick = async () => {
+          await gql(M_DELETE, { id: t.id });
+          load();
+        };
+
+        li.append(cb, title, del);
+        return li;
+      }
+
+      form.onsubmit = async (e) => {
+        e.preventDefault();
+        const title = input.value.trim();
+        if (!title) return;
+        await gql(M_CREATE, { title });
+        input.value = "";
+        load();
+      };
+
+      load();
+    </script>
+  </body>
+</html>
