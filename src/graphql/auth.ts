@@ -80,6 +80,22 @@ const newExpiresAt = () => new Date(Date.now() + SESSION_MS).toISOString();
 export function buildAuthExtensions(db: AuthDb, schema: AuthSchema) {
   const { users, sessions } = schema;
 
+  const insertUser = async (
+     target: AuthDb,
+     values: { name: string; email: string; passwordHash: string; active?: boolean },
+  ): Promise<User> => {
+    try {
+      const [user] = await target.insert(users).values(values).returning();
+      return user;
+    } catch (err: any) {
+      // SQLite UNIQUE constraint message includes "UNIQUE".
+      if (String(err?.message ?? "").includes("UNIQUE")) {
+        throw userError("Email already registered");
+      }
+      throw err;
+    }
+  };
+
   const issueSession = async (userId: number) => {
     const token = newToken();
     const [row] = await db
@@ -123,19 +139,11 @@ export function buildAuthExtensions(db: AuthDb, schema: AuthSchema) {
         },
         resolve: async (_s, args) => {
           const passwordHash = await bcrypt.hash(args.password, 10);
-          let user: User;
-          try {
-            [user] = await db
-              .insert(users)
-              .values({ name: args.name, email: args.email, passwordHash })
-              .returning();
-          } catch (err: any) {
-            // SQLite UNIQUE constraint message includes "UNIQUE".
-            if (String(err?.message ?? "").includes("UNIQUE")) {
-              throw userError("Email already registered");
-            }
-            throw err;
-          }
+          const user = await insertUser(db, {
+            name: args.name,
+            email: args.email,
+            passwordHash,
+          });
           const { token } = await issueSession(user.id);
           return { token, user };
         },
@@ -173,23 +181,12 @@ export function buildAuthExtensions(db: AuthDb, schema: AuthSchema) {
           // separate auth check is needed here.
           if (!ctx.db) throw authError("Not authenticated");
           const passwordHash = await bcrypt.hash(args.password, 10);
-          try {
-            const [user] = await ctx.db
-              .insert(users)
-              .values({
-                name: args.name,
-                email: args.email,
-                passwordHash,
-                active: args.active ?? true,
-              })
-              .returning();
-            return user;
-          } catch (err: any) {
-            if (String(err?.message ?? "").includes("UNIQUE")) {
-              throw userError("Email already registered");
-            }
-            throw err;
-          }
+          return insertUser(ctx.db as unknown as AuthDb, {
+            name: args.name,
+            email: args.email,
+            passwordHash,
+            active: args.active ?? true,
+          });
         },
       },
       logout: {

@@ -26,13 +26,12 @@
  * RBAC engine — anything that must run before there is a user.
  */
 import {
-  and,
   getTableColumns,
   is,
   Table,
   type SQL,
 } from "drizzle-orm";
-import type { ColumnMap } from "./filters.js";
+import { combineWhere, type ColumnMap } from "./filters.js";
 import type { Action, RbacContext, RbacEnforce } from "./rbac.js";
 
 export interface RbacDbDeps {
@@ -200,13 +199,10 @@ function makeWhereInjectingProxy(
 ): any {
   let chain: any = initialChain;
   let userWhere: SQL | undefined;
-  let userWhereSet = false;
 
   const finalize = async () => {
     const extra = await getExtra();
-    const combined = extra && userWhere
-      ? and(extra, userWhere)
-      : extra ?? userWhere;
+    const combined = combineWhere(extra, userWhere);
     const finalChain = combined !== undefined ? chain.where(combined) : chain;
     return await finalChain;
   };
@@ -216,7 +212,6 @@ function makeWhereInjectingProxy(
       if (prop === "where") {
         return (w: SQL | undefined) => {
           userWhere = w;
-          userWhereSet = true;
           return proxy;
         };
       }

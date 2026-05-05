@@ -493,12 +493,20 @@ export function applyListArgs<Q>(
   ctx?: WhereContext,
 ): Q {
   const userWhere = whereToSql(args?.where, columns, ctx);
-  const combined =
-    extraWhere && userWhere ? and(extraWhere, userWhere) : extraWhere ?? userWhere;
+  const combined = combineWhere(extraWhere, userWhere);
   let q: any = (query as any).where(combined);
   const order = orderByToSql(args?.orderBy, columns);
   if (order.length) q = q.orderBy(...order);
   if (args?.limit != null) q = q.limit(args.limit);
   if (args?.offset != null) q = q.offset(args.offset);
   return q as Q;
+}
+
+/**
+ * AND-combine two optional SQL fragments, dropping `undefined` ones.
+ * Returns `undefined` when both are `undefined` so callers can skip emitting
+ * a where clause entirely.
+ */
+export function combineWhere(a: SQL | undefined, b: SQL | undefined): SQL | undefined {
+  return a && b ? and(a, b) : a ?? b;
 }

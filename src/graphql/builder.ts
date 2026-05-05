@@ -81,6 +81,7 @@ import {
   applyListArgs,
   buildOrderByInput,
   buildWhereInput,
+  combineWhere,
   whereToSql,
   type ColumnMap,
   type WhereContext,
@@ -704,8 +705,7 @@ function buildUpdateMutationField(
     resolve: async (_, args, gqlCtx) => {
       const extra = guard ? await guard(gqlCtx, "update") : undefined;
       const userWhere = whereToSql(args?.where, meta.columns, ctx);
-      const combined =
-        extra && userWhere ? and(extra, userWhere) : extra ?? userWhere;
+      const combined = combineWhere(extra, userWhere);
       return db.update(meta.table).set(args.set).where(combined).returning();
     },
   };
@@ -724,8 +724,7 @@ function buildDeleteMutationField(
     resolve: async (_, args, gqlCtx) => {
       const extra = guard ? await guard(gqlCtx, "delete") : undefined;
       const userWhere = whereToSql(args?.where, meta.columns, ctx);
-      const combined =
-        extra && userWhere ? and(extra, userWhere) : extra ?? userWhere;
+      const combined = combineWhere(extra, userWhere);
       return db.delete(meta.table).where(combined).returning();
     },
   };
