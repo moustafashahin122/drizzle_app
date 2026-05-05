@@ -74,6 +74,7 @@ import {
   eq,
   getTableColumns,
   getTableName,
+  inArray,
   type SQL,
 } from "drizzle-orm";
 import {
@@ -362,29 +363,145 @@ function buildRelationField(
           offset: { type: GraphQLInt },
         }
       : undefined,
-    resolve: async (parent, args) => {
+    resolve: async (parent, args, context) => {
       const localCols = rel.fields;
       const refCols = rel.references;
       if (!localCols?.length || !refCols?.length) return isMany ? [] : null;
 
-      const conds: SQL[] = [];
+      const keys: unknown[] = [];
       for (let i = 0; i < refCols.length; i++) {
         const localKey = jsKeyOf(parentMeta.columns, localCols[i]);
         if (!localKey) return isMany ? [] : null;
         const v = parent?.[localKey];
         if (v === undefined || v === null) return isMany ? [] : null;
-        conds.push(eq(refCols[i], v));
+        keys.push(v);
       }
 
-      const joinSql = conds.length === 1 ? conds[0] : and(...conds);
-      const rows = await applyListArgs(
+      // Batch when (a) we have a per-request cache, (b) the join is single-column,
+      // and (c) we don't need per-parent limit/offset (those can't be expressed
+      // as a single IN-query without window functions / lateral joins).
+      const batch: BatchCache | undefined = context?.batch;
+      const canBatch =
+        !!batch &&
+        refCols.length === 1 &&
+        !(isMany && (args?.limit != null || args?.offset != null));
+
+      if (!canBatch) {
+        const conds: SQL[] = [];
+        for (let i = 0; i < refCols.length; i++) conds.push(eq(refCols[i], keys[i] as any));
+        const joinSql = conds.length === 1 ? conds[0] : and(...conds);
+        const rows = await applyListArgs(
+          db.select().from(refMeta.table as any),
+          args,
+          refMeta.columns,
+          joinSql,
+          refCtx,
+        );
+        return isMany ? rows : rows[0] ?? null;
+      }
+
+      const cacheKey = `${getTableName(parentMeta.table)}.${rel.fieldName}|${
+        isMany ? "many" : "one"
+      }|${JSON.stringify(args?.where ?? null)}|${JSON.stringify(args?.orderBy ?? null)}`;
+      let loader = batch!.get(cacheKey) as RelationLoader | undefined;
+      if (!loader) {
+        loader = createRelationLoader(rel, refMeta, db, refCtx, isMany, args);
+        batch!.set(cacheKey, loader);
+      }
+      return loader.load(keys[0]);
+    },
+  };
+}
+
+/**
+ * Per-request batch cache. The GraphQL execution layer hands a fresh `Map` (on
+ * the context's `batch` field) to each request; relation resolvers stash one
+ * loader per `(parentTable, relation, args)` key in it so sibling parent rows
+ * coalesce their child lookups into a single `WHERE fk IN (...)` query.
+ */
+export type BatchCache = Map<string, unknown>;
+
+interface RelationLoader {
+  load(key: unknown): Promise<unknown>;
+}
+
+/**
+ * Build a DataLoader-style batched loader for a relation field.
+ *
+ * Parent resolvers all `await load(key)` synchronously within a tick; the
+ * loader queues their keys, then on the next microtask runs a single
+ * `SELECT ... WHERE refCol IN (queuedKeys)` query (composed with any caller
+ * `where`/`orderBy`), groups rows by `refCol`, and resolves each pending
+ * promise with that parent's slice (one row for `one` relations, an array for
+ * `many`). All callers sharing the cache key see the same loader, so siblings
+ * with identical args coalesce into a single round-trip.
+ */
+function createRelationLoader(
+  rel: ExtractedRelation,
+  refMeta: TableMeta,
+  db: DrizzleLike,
+  refCtx: WhereContext,
+  isMany: boolean,
+  args: any,
+): RelationLoader {
+  const refCol = rel.references![0];
+  const refKeyName = jsKeyOf(refMeta.columns, refCol);
+  type Pending = { key: unknown; resolve: (v: unknown) => void; reject: (e: unknown) => void };
+  let queue: Pending[] = [];
+  let scheduled = false;
+
+  const flush = async () => {
+    const pending = queue;
+    queue = [];
+    scheduled = false;
+    try {
+      if (!refKeyName) {
+        for (const p of pending) p.resolve(isMany ? [] : null);
+        return;
+      }
+      const uniqueKeys = Array.from(new Set(pending.map((p) => p.key)));
+      const joinSql = inArray(refCol, uniqueKeys as any[]);
+      const rows: any[] = await applyListArgs(
         db.select().from(refMeta.table as any),
-        args,
+        // limit/offset are dropped at the per-batch level (they were only
+        // safe to apply per-parent, which the canBatch gate already excluded
+        // for `many` relations; for `one` relations args is undefined).
+        args ? { where: args.where, orderBy: args.orderBy } : undefined,
         refMeta.columns,
         joinSql,
         refCtx,
       );
-      return isMany ? rows : rows[0] ?? null;
+      if (isMany) {
+        const buckets = new Map<unknown, any[]>();
+        for (const row of rows) {
+          const k = row[refKeyName];
+          let arr = buckets.get(k);
+          if (!arr) buckets.set(k, (arr = []));
+          arr.push(row);
+        }
+        for (const p of pending) p.resolve(buckets.get(p.key) ?? []);
+      } else {
+        const byKey = new Map<unknown, any>();
+        for (const row of rows) {
+          const k = row[refKeyName];
+          if (!byKey.has(k)) byKey.set(k, row);
+        }
+        for (const p of pending) p.resolve(byKey.get(p.key) ?? null);
+      }
+    } catch (err) {
+      for (const p of pending) p.reject(err);
+    }
+  };
+
+  return {
+    load(key) {
+      return new Promise((resolve, reject) => {
+        queue.push({ key, resolve, reject });
+        if (!scheduled) {
+          scheduled = true;
+          queueMicrotask(flush);
+        }
+      });
     },
   };
 }

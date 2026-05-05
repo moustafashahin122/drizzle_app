@@ -256,6 +256,57 @@ describe("buildSchema — nested relation filters", () => {
   });
 });
 
+describe("buildSchema — relation batching", () => {
+  // Wrap the better-sqlite3 instance with a query counter that observes the
+  // raw SQL fired by Drizzle. Reusing the suite-wide `db` would require
+  // mutating it; instead we build a fresh schema bound to a counted DB and
+  // reuse the same in-memory data via ATTACH would be overkill — just rebuild
+  // a tiny isolated DB.
+  let countedSchema: GraphQLSchema;
+  let selectCount = 0;
+  before(() => {
+    const sqlite = new Database(":memory:");
+    sqlite.exec(`
+      CREATE TABLE assignees (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, email TEXT NOT NULL);
+      CREATE TABLE todos (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, completed INTEGER NOT NULL DEFAULT 0, assignee_id INTEGER REFERENCES assignees(id));
+      INSERT INTO assignees (name, email) VALUES ('Alice','a@x'), ('Bob','b@x'), ('Cara','c@x');
+      INSERT INTO todos (title, assignee_id) VALUES ('t1',1),('t2',2),('t3',1),('t4',3),('t5',2);
+    `);
+    const counted = drizzle(sqlite, {
+      logger: { logQuery: (q) => { if (q.startsWith("select")) selectCount++; } },
+    });
+    countedSchema = buildSchema(counted, { assignees, todos }).schema;
+  });
+
+  it("coalesces forward 'one' lookups into a single IN-query when context.batch is provided", async () => {
+    selectCount = 0;
+    const result = await graphql({
+      schema: countedSchema,
+      source: `{ todos(orderBy: { id: ASC }) { title assigneeId { name } } }`,
+      contextValue: { batch: new Map() },
+    });
+    assert.equal(result.errors, undefined);
+    // 1 query for the parent todos list + 1 batched IN-query for all assignees.
+    assert.equal(selectCount, 2);
+    const data: any = result.data;
+    assert.deepEqual(
+      data.todos.map((t: any) => [t.title, t.assigneeId.name]),
+      [["t1","Alice"],["t2","Bob"],["t3","Alice"],["t4","Cara"],["t5","Bob"]],
+    );
+  });
+
+  it("falls back to per-parent queries when no batch context is provided", async () => {
+    selectCount = 0;
+    const result = await graphql({
+      schema: countedSchema,
+      source: `{ todos(orderBy: { id: ASC }) { title assigneeId { name } } }`,
+    });
+    assert.equal(result.errors, undefined);
+    // 1 parent query + 5 child queries (one per todo).
+    assert.equal(selectCount, 6);
+  });
+});
+
 describe("buildSchema — mutations round-trip", () => {
   it("insert / update / delete each return the affected rows", async () => {
     const inserted: any = await run(`

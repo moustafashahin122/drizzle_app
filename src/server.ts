@@ -11,6 +11,7 @@ const yoga = createYoga({
   schema,
   graphqlEndpoint: "/graphql",
   graphiql: true,
+  context: () => ({ batch: new Map() }),
 });
 
 const app = new Hono();
