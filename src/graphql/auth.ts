@@ -38,6 +38,7 @@ import type { RbacDb } from "./rbacDb.js";
 
 const SESSION_DAYS = 7;
 const SESSION_MS = SESSION_DAYS * 86_400_000;
+export const SESSION_COOKIE_NAME = "sid";
 
 export interface AuthContext {
   user: User | null;
@@ -51,6 +52,45 @@ export interface AuthContext {
    * (`login`/`register`) deliberately operate before there's a user.
    */
   db?: RbacDb;
+  /**
+   * Set the session cookie on the outgoing response. Called by `login` /
+   * `register` so browser-based clients (e.g. GraphiQL on the same origin)
+   * stay authenticated without manually pasting a Bearer token.
+   */
+  setSessionCookie?: (token: string) => void;
+  /** Clear the session cookie. Called by `logout`. */
+  clearSessionCookie?: () => void;
+}
+
+/**
+ * Build the `Set-Cookie` header value for the session cookie. HttpOnly +
+ * SameSite=Lax — sufficient for same-origin GraphiQL; flip `Secure` on for
+ * HTTPS deployments.
+ */
+export function buildSessionCookie(token: string): string {
+  return `${SESSION_COOKIE_NAME}=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${SESSION_DAYS * 86400}`;
+}
+
+/** Header value that clears the session cookie (Max-Age=0). */
+export function buildClearSessionCookie(): string {
+  return `${SESSION_COOKIE_NAME}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0`;
+}
+
+/**
+ * Extract the session token from a `Cookie` header, or `null` if the cookie
+ * is absent / empty. Tolerant of whitespace around `;` and `=`.
+ */
+export function parseSessionCookie(cookieHeader: string | null | undefined): string | null {
+  if (!cookieHeader) return null;
+  for (const part of cookieHeader.split(";")) {
+    const eq = part.indexOf("=");
+    if (eq < 0) continue;
+    const name = part.slice(0, eq).trim();
+    if (name !== SESSION_COOKIE_NAME) continue;
+    const value = part.slice(eq + 1).trim();
+    return value || null;
+  }
+  return null;
 }
 
 interface AuthSchema {
@@ -137,7 +177,7 @@ export function buildAuthExtensions(db: AuthDb, schema: AuthSchema) {
           email: { type: new GraphQLNonNull(GraphQLString) },
           password: { type: new GraphQLNonNull(GraphQLString) },
         },
-        resolve: async (_s, args) => {
+        resolve: async (_s, args, ctx) => {
           const passwordHash = await bcrypt.hash(args.password, 10);
           const user = await insertUser(db, {
             name: args.name,
@@ -145,6 +185,7 @@ export function buildAuthExtensions(db: AuthDb, schema: AuthSchema) {
             passwordHash,
           });
           const { token } = await issueSession(user.id);
+          ctx.setSessionCookie?.(token);
           return { token, user };
         },
       },
@@ -154,7 +195,7 @@ export function buildAuthExtensions(db: AuthDb, schema: AuthSchema) {
           email: { type: new GraphQLNonNull(GraphQLString) },
           password: { type: new GraphQLNonNull(GraphQLString) },
         },
-        resolve: async (_s, args) => {
+        resolve: async (_s, args, ctx) => {
           const [user] = await db
             .select()
             .from(users)
@@ -164,6 +205,7 @@ export function buildAuthExtensions(db: AuthDb, schema: AuthSchema) {
           const ok = await bcrypt.compare(args.password, user.passwordHash);
           if (!ok) throw userError("Invalid credentials");
           const { token } = await issueSession(user.id);
+          ctx.setSessionCookie?.(token);
           return { token, user };
         },
       },
@@ -192,6 +234,7 @@ export function buildAuthExtensions(db: AuthDb, schema: AuthSchema) {
       logout: {
         type: new GraphQLNonNull(GraphQLBoolean),
         resolve: async (_s, _a, ctx) => {
+          ctx.clearSessionCookie?.();
           if (!ctx.session) return false;
           await db.delete(sessions).where(eq(sessions.id, ctx.session.id));
           return true;
@@ -215,10 +258,28 @@ export async function resolveSessionFromHeader(
   schema: AuthSchema,
   authorization: string | null | undefined,
 ): Promise<{ user: User | null; session: Session | null }> {
-  if (!authorization) return { user: null, session: null };
+  return resolveSessionFromToken(db, schema, extractBearerToken(authorization));
+}
+
+/** Extract the token from a `Bearer <token>` header value, or `null`. */
+export function extractBearerToken(authorization: string | null | undefined): string | null {
+  if (!authorization) return null;
   const m = /^Bearer\s+(.+)$/i.exec(authorization.trim());
-  if (!m) return { user: null, session: null };
+  if (!m) return null;
   const token = m[1].trim();
+  return token || null;
+}
+
+/**
+ * Resolve a raw session token to `{ user, session }`. Source-agnostic — feed
+ * it from a `Bearer` header or a session cookie. Returns nulls on miss /
+ * expiry / inactive user; refreshes the session's sliding expiry on hit.
+ */
+export async function resolveSessionFromToken(
+  db: AuthDb,
+  schema: AuthSchema,
+  token: string | null,
+): Promise<{ user: User | null; session: Session | null }> {
   if (!token) return { user: null, session: null };
 
   const { users, sessions } = schema;
