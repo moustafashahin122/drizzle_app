@@ -74,7 +74,7 @@
     </section>
 
     <script type="module">
-      import { gql, requireAuth, logout } from "/app.js";
+      import { api, requireAuth, logout } from "/app.js";
 
       const me = await requireAuth();
       document.getElementById("me").textContent = `Signed in as ${me.name}`;
@@ -84,31 +84,8 @@
       const newForm = document.getElementById("new-form");
       const newError = document.getElementById("new-error");
 
-      const Q_USERS = `
-        query { users(orderBy: { id: asc }) { id name email active createdAt } }
-      `;
-      const M_UPDATE = `
-        mutation($id: ID!, $set: UsersUpdate!) {
-          updateUsers(where: { id: { eq: $id } }, set: $set) {
-            id name email active
-          }
-        }
-      `;
-      const M_DELETE = `
-        mutation($id: ID!) {
-          deleteFromUsers(where: { id: { eq: $id } }) { id }
-        }
-      `;
-      const M_CREATE = `
-        mutation($name: String!, $email: String!, $password: String!) {
-          createUser(name: $name, email: $email, password: $password) {
-            id name email active createdAt
-          }
-        }
-      `;
-
       async function load() {
-        const { users } = await gql(Q_USERS);
+        const { users } = await api("/admin/users");
         rows.innerHTML = "";
         for (const u of users) rows.appendChild(renderRow(u));
       }
@@ -142,10 +119,10 @@
 
         tr.appendChild(cell(u.id));
         tr.appendChild(editableCell(u.name, (v) =>
-          gql(M_UPDATE, { id: u.id, set: { name: v } }),
+          api(`/admin/users/${u.id}`, { method: "PATCH", body: { name: v } }),
         ));
         tr.appendChild(editableCell(u.email, (v) =>
-          gql(M_UPDATE, { id: u.id, set: { email: v } }),
+          api(`/admin/users/${u.id}`, { method: "PATCH", body: { email: v } }),
         ));
 
         const activeTd = document.createElement("td");
@@ -154,7 +131,10 @@
         activeCb.checked = !!u.active;
         activeCb.onchange = async () => {
           try {
-            await gql(M_UPDATE, { id: u.id, set: { active: activeCb.checked } });
+            await api(`/admin/users/${u.id}`, {
+              method: "PATCH",
+              body: { active: activeCb.checked },
+            });
           } catch (err) {
             alert(err.message);
             activeCb.checked = !activeCb.checked;
@@ -173,7 +153,7 @@
         del.onclick = async () => {
           if (!confirm(`Delete ${u.email}?`)) return;
           try {
-            await gql(M_DELETE, { id: u.id });
+            await api(`/admin/users/${u.id}`, { method: "DELETE" });
             load();
           } catch (err) {
             alert(err.message);
@@ -189,10 +169,13 @@
         e.preventDefault();
         newError.textContent = "";
         try {
-          await gql(M_CREATE, {
-            name: document.getElementById("new-name").value.trim(),
-            email: document.getElementById("new-email").value.trim(),
-            password: document.getElementById("new-password").value,
+          await api("/admin/users", {
+            method: "POST",
+            body: {
+              name: document.getElementById("new-name").value.trim(),
+              email: document.getElementById("new-email").value.trim(),
+              password: document.getElementById("new-password").value,
+            },
           });
           newForm.reset();
           load();

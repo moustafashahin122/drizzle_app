@@ -3,23 +3,14 @@ import { serve } from "@hono/node-server";
 import { serveStatic } from "@hono/node-server/serve-static";
 import { createYoga } from "graphql-yoga";
 import { buildSchema } from "./graphql/index.js";
-import {
-  buildAuthExtensions,
-  buildClearSessionCookie,
-  buildSessionCookie,
-  extractBearerToken,
-  parseSessionCookie,
-  resolveSessionFromToken,
-  type AuthContext,
-} from "./graphql/auth/auth.js";
 import { buildRbac } from "./graphql/rbac/rbac.js";
 import { buildRbacDb, type RbacDb } from "./graphql/rbac/rbacDb.js";
+import { buildAuthRoutes } from "./auth/routes.js";
+import { buildAdminRoutes } from "./admin/routes.js";
+import { sessionMiddleware, type AuthEnv } from "./auth/middleware.js";
 import * as dbModule from "./db.js";
 
-const auth = buildAuthExtensions(dbModule.db, {
-  users: dbModule.users,
-  sessions: dbModule.sessions,
-});
+const sessionSchema = { users: dbModule.users, sessions: dbModule.sessions };
 
 const rbac = buildRbac(dbModule.db, {
   groups: dbModule.groups,
@@ -30,8 +21,6 @@ const rbac = buildRbac(dbModule.db, {
 
 const { schema } = buildSchema(dbModule.db, dbModule, {
   hiddenOutputColumns: { users: ["passwordHash"] },
-  extraQueryFields: auth.extraQueryFields,
-  extraMutationFields: auth.extraMutationFields,
   rbac: { enforce: rbac.enforce },
 });
 
@@ -41,46 +30,48 @@ const rdbFor = buildRbacDb({
   enforce: rbac.enforce,
 });
 
-const yoga = createYoga<{}, AuthContext & { db: RbacDb }>({
+interface YogaContext {
+  user: dbModule.User | null;
+  session: dbModule.Session | null;
+  batch: Map<string, unknown>;
+  db: RbacDb;
+}
+
+const yoga = createYoga<{}, YogaContext>({
   schema,
   graphqlEndpoint: "/graphql",
   graphiql: true,
   context: async ({ request }) => {
-    // Cookie wins over Authorization header — same-origin browsers (GraphiQL)
-    // ship the session cookie automatically, and explicit Bearer is still
-    // supported for non-browser clients.
-    const cookieToken = parseSessionCookie(request.headers.get("cookie"));
-    const headerToken = extractBearerToken(request.headers.get("authorization"));
-    const { user, session } = await resolveSessionFromToken(
-      dbModule.db,
-      { users: dbModule.users, sessions: dbModule.sessions },
-      cookieToken ?? headerToken,
-    );
-    const batch = new Map();
-    const cookieJar = (request as any)._cookieJar as string[] | undefined;
-    const baseCtx: AuthContext = {
-      user,
-      session,
-      batch,
-      setSessionCookie: (token) => cookieJar?.push(buildSessionCookie(token)),
-      clearSessionCookie: () => cookieJar?.push(buildClearSessionCookie()),
-    };
-    return { ...baseCtx, db: rdbFor(baseCtx) };
+    const stash = (request as any)._authCtx as
+      | { user: dbModule.User | null; session: dbModule.Session | null }
+      | undefined;
+    const user = stash?.user ?? null;
+    const session = stash?.session ?? null;
+    const batch = new Map<string, unknown>();
+    return { user, session, batch, db: rdbFor({ user, batch }) };
   },
 });
 
-const app = new Hono();
+const app = new Hono<AuthEnv>();
 
+// REST: authentication and admin dashboard live here, GraphQL is data-only.
+app.route("/auth", buildAuthRoutes({ db: dbModule.db, schema: sessionSchema }));
+app.route(
+  "/admin",
+  buildAdminRoutes({
+    db: dbModule.db,
+    schema: sessionSchema,
+    usersTable: dbModule.users,
+    rdbFor,
+  }),
+);
+
+// GraphQL endpoint: session middleware populates c.var.user, then Yoga
+// receives that as its serverContext so resolvers see the same user object.
+app.use("/graphql", sessionMiddleware(dbModule.db, sessionSchema));
 app.all("/graphql", async (c) => {
-  // Resolvers push Set-Cookie headers onto this jar via ctx.setSessionCookie /
-  // ctx.clearSessionCookie; the values are appended to the Yoga response.
-  const cookieJar: string[] = [];
-  (c.req.raw as any)._cookieJar = cookieJar;
-  const res = await yoga.fetch(c.req.raw, {});
-  if (!cookieJar.length) return res;
-  const headers = new Headers(res.headers);
-  for (const cookie of cookieJar) headers.append("set-cookie", cookie);
-  return new Response(res.body, { status: res.status, statusText: res.statusText, headers });
+  (c.req.raw as any)._authCtx = { user: c.get("user"), session: c.get("session") };
+  return yoga.fetch(c.req.raw, {});
 });
 
 app.use("/*", serveStatic({ root: "./public" }));

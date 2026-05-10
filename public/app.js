@@ -1,38 +1,57 @@
-// Shared client helpers: token storage, GraphQL fetch wrapper, light auth
-// gates. Until RBAC lands, gating is purely client-side; the server still
-// enforces "logged in" on the auth resolvers and `createUser`.
+// Shared client helpers. The session is held in a same-origin HttpOnly cookie
+// set by /auth/* — the browser ships it automatically with every fetch, so
+// the JS side just deals with JSON.
 
-const TOKEN_KEY = "auth.token";
+async function jsonOrError(res) {
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(data?.error ?? `HTTP ${res.status}`);
+  }
+  return data;
+}
 
-export const getToken = () => localStorage.getItem(TOKEN_KEY);
-export const setToken = (t) => localStorage.setItem(TOKEN_KEY, t);
-export const clearToken = () => localStorage.removeItem(TOKEN_KEY);
-
+/** GraphQL fetch wrapper — used by the todo + admin pages for data queries. */
 export async function gql(query, variables = {}) {
-  const headers = { "Content-Type": "application/json" };
-  const token = getToken();
-  if (token) headers["Authorization"] = `Bearer ${token}`;
   const res = await fetch("/graphql", {
     method: "POST",
-    headers,
+    headers: { "Content-Type": "application/json" },
+    credentials: "same-origin",
     body: JSON.stringify({ query, variables }),
   });
   const json = await res.json();
   if (json.errors) {
     const msg = json.errors[0].message;
-    // If the server rejects the session, drop it so the next page load
-    // bounces to /login.html instead of looping on a stale token.
-    if (/not authenticated/i.test(msg)) clearToken();
+    if (/not authenticated|unauthenticated/i.test(msg)) {
+      window.location.replace("/login.html");
+      return new Promise(() => {});
+    }
     throw new Error(msg);
   }
   return json.data;
 }
 
+/** Generic REST helper. Reads JSON, throws Error(data.error) on non-2xx. */
+export async function api(path, { method = "GET", body } = {}) {
+  const init = { method, credentials: "same-origin", headers: {} };
+  if (body !== undefined) {
+    init.headers["Content-Type"] = "application/json";
+    init.body = JSON.stringify(body);
+  }
+  const res = await fetch(path, init);
+  if (res.status === 401) {
+    window.location.replace("/login.html");
+    return new Promise(() => {});
+  }
+  return jsonOrError(res);
+}
+
+/** Returns the current user, or null if no session. Never throws. */
 export async function getMe() {
-  if (!getToken()) return null;
   try {
-    const { me } = await gql(`{ me { id name email active } }`);
-    return me;
+    const res = await fetch("/auth/me", { credentials: "same-origin" });
+    if (!res.ok) return null;
+    const { user } = await res.json();
+    return user ?? null;
   } catch {
     return null;
   }
@@ -42,9 +61,7 @@ export async function getMe() {
 export async function requireAuth() {
   const me = await getMe();
   if (!me) {
-    clearToken();
     window.location.replace("/login.html");
-    // Promise that never resolves so callers' await pauses until redirect.
     return new Promise(() => {});
   }
   return me;
@@ -56,12 +73,31 @@ export async function redirectIfAuth() {
   if (me) window.location.replace("/");
 }
 
+export async function login(email, password) {
+  const res = await fetch("/auth/login", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    credentials: "same-origin",
+    body: JSON.stringify({ email, password }),
+  });
+  return jsonOrError(res);
+}
+
+export async function register(name, email, password) {
+  const res = await fetch("/auth/register", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    credentials: "same-origin",
+    body: JSON.stringify({ name, email, password }),
+  });
+  return jsonOrError(res);
+}
+
 export async function logout() {
   try {
-    await gql(`mutation { logout }`);
+    await fetch("/auth/logout", { method: "POST", credentials: "same-origin" });
   } catch {
-    /* ignore — we're clearing local state regardless */
+    /* ignore — server-side cookie clear is best-effort */
   }
-  clearToken();
   window.location.replace("/login.html");
 }

@@ -4,16 +4,37 @@ This app includes a minimal authentication system (users + sessions) and an Odoo
 
 ## Auth and sessions
 
-- **GraphQL auth fields** are provided by `src/graphql/auth.ts` and mounted via `extraQueryFields` / `extraMutationFields` in `src/server.ts`.
+Authentication is **REST only** — there are no `register` / `login` / `logout` / `me` GraphQL fields. The endpoints live under `/auth/*` and are owned by `src/auth/routes.ts`:
+
+| Method | Path             | Body                              | Auth |
+|--------|------------------|-----------------------------------|------|
+| POST   | `/auth/register` | `{ name, email, password }`       | no   |
+| POST   | `/auth/login`    | `{ email, password }`             | no   |
+| POST   | `/auth/logout`   | —                                 | yes  |
+| GET    | `/auth/me`       | —                                 | yes  |
+
 - **Token sources (precedence)**:
-  - session cookie (preferred), otherwise
-  - `Authorization: Bearer <token>`
+  - session cookie `sid` (HttpOnly, set by `/auth/login` and `/auth/register`), otherwise
+  - `Authorization: Bearer <token>` (for non-browser clients)
 - **Session storage**: `sessions` table in SQLite (`src/db.ts`)
 - **Sliding expiry**: session expiry is refreshed when a valid token is used.
 
+The same `sessionMiddleware` (`src/auth/middleware.ts`) is mounted on `/graphql` so resolvers see `ctx.user` exactly as before.
+
+### Admin dashboard endpoints
+
+The admin dashboard's user CRUD also runs over REST (`src/admin/routes.ts`), enforced by RBAC via `RbacDb`:
+
+| Method | Path                | Body                                | Auth |
+|--------|---------------------|-------------------------------------|------|
+| GET    | `/admin/users`      | —                                   | yes  |
+| POST   | `/admin/users`      | `{ name, email, password, active? }`| yes  |
+| PATCH  | `/admin/users/:id`  | partial `{ name, email, active }`   | yes  |
+| DELETE | `/admin/users/:id`  | —                                   | yes  |
+
 ### Frontend behavior
 
-The static frontend in `public/` stores a token in `localStorage` and sends it as `Authorization: Bearer <token>` to `/graphql`.
+The static frontend in `public/` relies on the HttpOnly session cookie — no token in `localStorage`. `app.js` exposes `login`, `register`, `logout`, `getMe`, `requireAuth`, and an `api(path, opts)` helper for the admin REST calls.
 
 ## RBAC model (implementation)
 

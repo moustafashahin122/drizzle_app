@@ -118,8 +118,8 @@ const userCtx = (id: number, name = "u") => ({
   batch: new Map(),
 });
 
-async function run(query: string, contextValue: any) {
-  return graphql({ schema, source: query, contextValue });
+async function run(query: string, contextValue: any, variableValues?: Record<string, unknown>) {
+  return graphql({ schema, source: query, contextValue, variableValues });
 }
 
 // ---------------------------------------------------------------------------
@@ -229,8 +229,9 @@ describe("rbac — enforcement", () => {
     // Alice attempts to rename Bob's todo. ACL allows update, but the record
     // rule narrows the WHERE to ownerId = Alice — so zero rows are affected.
     const r = await run(
-      `mutation { updateTodos(set: { title: "stolen" }, where: { title: { eq: "bob-1" } }) { id title } }`,
+      `mutation ($w: JSON) { updateTodos(set: { title: "stolen" }, where: $w) { id title } }`,
       userCtx(u1.id),
+      { w: [["title", "=", "bob-1"]] },
     );
     assert.equal(r.errors, undefined);
     assert.deepEqual((r.data as any).updateTodos, []);

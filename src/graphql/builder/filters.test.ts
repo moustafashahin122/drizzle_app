@@ -3,14 +3,13 @@ import assert from "node:assert/strict";
 import Database from "better-sqlite3";
 import { drizzle } from "drizzle-orm/better-sqlite3";
 import { integer, sqliteTable, text } from "drizzle-orm/sqlite-core";
-import { sql } from "drizzle-orm";
+import { gt, sql } from "drizzle-orm";
 
 import {
   applyListArgs,
   buildOrderByInput,
-  buildWhereInput,
+  combineWhere,
   orderByToSql,
-  whereToSql,
   type ColumnMap,
 } from "./filters.js";
 
@@ -30,42 +29,6 @@ const columns: ColumnMap = {
   status: items.status,
 };
 
-describe("whereToSql", () => {
-  it("returns undefined for null/undefined/empty input", () => {
-    assert.equal(whereToSql(null, columns), undefined);
-    assert.equal(whereToSql(undefined, columns), undefined);
-    assert.equal(whereToSql({}, columns), undefined);
-  });
-
-  it("ignores unknown column keys (clients can't synthesize columns)", () => {
-    assert.equal(whereToSql({ bogus: { eq: 1 } }, columns), undefined);
-  });
-
-  it("translates eq into Drizzle SQL referencing the matching column", () => {
-    const out = whereToSql({ id: { eq: 5 } }, columns);
-    assert.ok(out, "expected SQL fragment");
-    // Cheap structural check — we don't render SQL here, just confirm a
-    // fragment came back. End-to-end behavior is covered in builder.test.ts.
-  });
-
-  it("AND-combines multiple operators on the same column", () => {
-    const out = whereToSql({ count: { gt: 1, lt: 10 } }, columns);
-    assert.ok(out);
-  });
-
-  it("supports AND/OR/NOT combinators with recursion", () => {
-    const out = whereToSql(
-      {
-        AND: [{ id: { gt: 1 } }, { status: { isNull: false } }],
-        OR: [{ title: { like: "%a%" } }, { count: { eq: 0 } }],
-        NOT: { id: { eq: 999 } },
-      },
-      columns,
-    );
-    assert.ok(out);
-  });
-});
-
 describe("orderByToSql", () => {
   it("returns [] for null/undefined input", () => {
     assert.deepEqual(orderByToSql(null, columns), []);
@@ -81,21 +44,30 @@ describe("orderByToSql", () => {
   });
 });
 
-describe("buildWhereInput / buildOrderByInput", () => {
-  it("registers per-column fields plus AND/OR/NOT on the where input", () => {
-    const where = buildWhereInput("Item", columns);
-    const fields = where.getFields();
-    for (const k of ["id", "title", "count", "status", "AND", "OR", "NOT"]) {
-      assert.ok(fields[k], `expected field ${k}`);
-    }
-  });
-
+describe("buildOrderByInput", () => {
   it("registers a direction field per column on the orderBy input", () => {
     const orderBy = buildOrderByInput("Item", columns);
     const fields = orderBy.getFields();
     for (const k of Object.keys(columns)) {
       assert.ok(fields[k], `expected field ${k}`);
     }
+  });
+});
+
+describe("combineWhere", () => {
+  it("returns undefined when both inputs are undefined", () => {
+    assert.equal(combineWhere(undefined, undefined), undefined);
+  });
+
+  it("returns the non-undefined fragment when only one is supplied", () => {
+    const a = sql`a = 1`;
+    assert.equal(combineWhere(a, undefined), a);
+    assert.equal(combineWhere(undefined, a), a);
+  });
+
+  it("AND-combines when both are supplied", () => {
+    const out = combineWhere(sql`a = 1`, sql`b = 2`);
+    assert.ok(out);
   });
 });
 
@@ -124,11 +96,12 @@ describe("applyListArgs (integration with in-memory SQLite)", () => {
     assert.equal(rows.length, 4);
   });
 
-  it("filters by a where clause", async () => {
+  it("filters by a precomputed where clause", async () => {
     const rows = await applyListArgs(
       db.select().from(items),
-      { where: { count: { gt: 2 } } },
+      undefined,
       columns,
+      gt(items.count, 2),
     );
     assert.deepEqual(rows.map((r: any) => r.title).sort(), ["b", "c"]);
   });
@@ -142,12 +115,12 @@ describe("applyListArgs (integration with in-memory SQLite)", () => {
     assert.deepEqual(rows.map((r: any) => r.title), ["b", "d"]);
   });
 
-  it("AND-combines extraWhere with the user where", async () => {
+  it("AND-combines two where fragments via combineWhere", async () => {
     const rows = await applyListArgs(
       db.select().from(items),
-      { where: { count: { gt: 0 } } },
+      undefined,
       columns,
-      sql`status = 'open'`,
+      combineWhere(sql`status = 'open'`, gt(items.count, 0)),
     );
     assert.deepEqual(rows.map((r: any) => r.title).sort(), ["a", "b"]);
   });

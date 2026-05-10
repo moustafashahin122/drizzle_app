@@ -22,18 +22,31 @@
  *      - an `Insert` input ({@link buildInsertInput}) — required = `notNull &&
  *        !hasDefault && !generated`;
  *      - an `Update` input ({@link buildUpdateInput}) — every column optional;
- *      - a `Where` input and `OrderBy` input from {@link buildWhereInput} /
- *        {@link buildOrderByInput} in `./filters.js`.
+ *      - an `OrderBy` input from {@link buildOrderByInput} in `./filters.js`.
+ *        There is no per-table `Where` input — `where` is a single JSON arg
+ *        carrying an Odoo-style domain (see "Filtering syntax" below).
  * 3. **Pass 2** — {@link addRootFields} wires per-table root fields onto
  *    `Query` and `Mutation`:
- *      - `<jsKey>(where?, orderBy?, limit?, offset?): [<Type>!]!`
- *      - `<jsKey>Single(where?, orderBy?): <Type>`
+ *      - `<jsKey>(where?: JSON, orderBy?, limit?, offset?): [<Type>!]!`
+ *      - `<jsKey>Single(where?: JSON, orderBy?): <Type>`
  *      - `insertInto<Type>(values: [<Type>Insert!]!): [<Type>!]!`
- *      - `update<Type>(set: <Type>Update!, where?): [<Type>!]!`
- *      - `deleteFrom<Type>(where?): [<Type>!]!`
- * 4. Resolvers translate inputs through {@link whereToSql} / {@link orderByToSql}
- *    and call Drizzle's `db.select()/insert()/update()/delete()` — mutations use
+ *      - `update<Type>(set: <Type>Update!, where?: JSON): [<Type>!]!`
+ *      - `deleteFrom<Type>(where?: JSON): [<Type>!]!`
+ * 4. Resolvers translate the `where` JSON via
+ *    `parseDomain` + `domainToSql` (from `../domain/domain.js`) and call
+ *    Drizzle's `db.select()/insert()/update()/delete()` — mutations use
  *    `.returning()` so they emit the affected rows.
+ *
+ * Filtering syntax
+ * ----------------
+ * `where` accepts an Odoo polish-prefix domain array, e.g.
+ *   `[["completed", "=", false], ["title", "ilike", "%pr%"]]`
+ * combinators `"&"`, `"|"`, `"!"` are prefix operators; the implicit
+ * combinator across remaining top-level items is `&` (AND). Dotted fields
+ * traverse single-column relations, e.g. `["assigneeId.email", "=", "x@y"]`.
+ * The placeholder string `"current_user.id"` is substituted from the
+ * GraphQL request context (`gqlCtx.user.id`). Full reference:
+ * `../domain/README.md`.
  *
  * Recursive relation resolution
  * -----------------------------
@@ -50,8 +63,10 @@
  * -----
  * - A relation field with the same name as a scalar column **replaces** that
  *   column on the **output** type (so `assigneeId { name }` traverses to the
- *   referenced row). The scalar value is still reachable in `where`, `set`,
- *   Insert, and Update inputs because those iterate the unchanged column map.
+ *   referenced row). The scalar value is still reachable in `set`, Insert,
+ *   and Update inputs (and inside a domain leaf, e.g.
+ *   `[["assigneeId", "=", 5]]`) because those iterate the unchanged column
+ *   map.
  * - The relation resolver issues one query per relation field per parent row
  *   (no DataLoader batching). Acceptable for small/medium response sizes;
  *   batch externally if needed.
@@ -80,15 +95,19 @@ import {
 import {
   applyListArgs,
   buildOrderByInput,
-  buildWhereInput,
   combineWhere,
-  whereToSql,
   type ColumnMap,
-  type WhereContext,
 } from "./filters.js";
 import { introspectSchema, type ExtractedRelation } from "./relations.js";
 import { columnToBaseType, wrapNonNull } from "./types.js";
 import { jsKeyOf } from "./util.js";
+import {
+  domainToSql,
+  parseDomain,
+  type DomainContext,
+  type DomainPlaceholders,
+} from "../domain/domain.js";
+import { GraphQLJSON } from "./scalars.js";
 
 /**
  * Structural shape of a Drizzle DB instance accepted by {@link buildSchema}.
@@ -193,7 +212,6 @@ interface TableMeta {
   objectType: GraphQLObjectType;
   insertInput: GraphQLInputObjectType;
   updateInput: GraphQLInputObjectType;
-  whereInput: GraphQLInputObjectType;
   orderByInput: GraphQLInputObjectType;
 }
 
@@ -229,12 +247,11 @@ export function buildSchema(
   const intro = introspectSchema(schema);
   const metas = new Map<string, TableMeta>(); // keyed by SQL table name
 
-  // Shared {@link WhereContext} factory — used by every resolver that runs
-  // `whereToSql` / `applyListArgs` so nested relation filters resolve to the
-  // correct referenced table info regardless of which root or relation
-  // resolver dispatched the query. Declared before pass 1 so the closures
+  // Shared {@link DomainContext} factory — used by every resolver that
+  // translates a JSON domain so dotted-field relation filters resolve to the
+  // correct referenced table info. Declared before pass 1 so the closures
   // captured by GraphQL field thunks have a stable reference.
-  const whereCtxFor = (meta: TableMeta): WhereContext => ({
+  const domainCtxFor = (meta: TableMeta): DomainContext => ({
     db,
     relations: meta.relations,
     lookup: (refSql) => {
@@ -253,16 +270,10 @@ export function buildSchema(
     const hiddenOutput = new Set(options.hiddenOutputColumns?.[jsKey] ?? []);
     const objectType = new GraphQLObjectType({
       name: typeName,
-      fields: () => buildObjectFields(meta, intro, metas, db, whereCtxFor, hiddenOutput),
+      fields: () => buildObjectFields(meta, intro, metas, db, domainCtxFor, hiddenOutput),
     });
     const insertInput = buildInsertInput(typeName, columns);
     const updateInput = buildUpdateInput(typeName, columns);
-    const whereInput = buildWhereInput(typeName, columns, {
-      relations,
-      // Lazy lookup — fired inside the where input's fields thunk, after every
-      // table's whereInput has been registered in `metas`.
-      getRefWhereInput: (refSql) => metas.get(refSql)?.whereInput,
-    });
     const orderByInput = buildOrderByInput(typeName, columns);
 
     const meta: TableMeta = {
@@ -274,7 +285,6 @@ export function buildSchema(
       objectType,
       insertInput,
       updateInput,
-      whereInput,
       orderByInput,
     };
     metas.set(sqlName, meta);
@@ -285,7 +295,7 @@ export function buildSchema(
   const mutationFields: GraphQLFieldConfigMap<unknown, unknown> = {};
   const rbac = options.rbac;
   for (const meta of metas.values()) {
-    addRootFields(meta, queryFields, mutationFields, db, whereCtxFor(meta), rbac);
+    addRootFields(meta, queryFields, mutationFields, db, domainCtxFor(meta), rbac);
   }
 
   if (options.extraQueryFields || options.extraMutationFields) {
@@ -361,7 +371,7 @@ function buildObjectFields(
   intro: ReturnType<typeof introspectSchema>,
   metas: Map<string, TableMeta>,
   db: DrizzleLike,
-  whereCtxFor: (m: TableMeta) => WhereContext,
+  domainCtxFor: (m: TableMeta) => DomainContext,
   hiddenOutput: Set<string>,
 ): GraphQLFieldConfigMap<any, any> {
   const fields: GraphQLFieldConfigMap<any, any> = {};
@@ -379,11 +389,38 @@ function buildObjectFields(
     const refMeta = metas.get(getTableName(rel.referencedTable));
     if (!refMeta) continue;
     // Relation field replaces a same-named scalar column on the output type.
-    // The scalar FK column remains usable in `where` / `set` / Insert / Update inputs
-    // because those input types iterate the column map, which is unchanged.
-    fields[rel.fieldName] = buildRelationField(rel, meta, refMeta, db, whereCtxFor(refMeta));
+    // The scalar FK column remains usable in `set` / Insert / Update inputs
+    // (and inside a domain leaf) because they iterate the unchanged column map.
+    fields[rel.fieldName] = buildRelationField(rel, meta, refMeta, db, domainCtxFor(refMeta));
   }
   return fields;
+}
+
+/**
+ * Default placeholder map for resolver-supplied domains. Pulls
+ * `current_user.id` off the GraphQL request context so callers can write
+ * domain rules that mirror RBAC conventions.
+ */
+function placeholdersFor(gqlCtx: any): DomainPlaceholders {
+  return { "current_user.id": gqlCtx?.user?.id ?? null };
+}
+
+/**
+ * Translate the JSON `where` arg on a list/single/update/delete/many-relation
+ * resolver into a Drizzle SQL fragment, or `undefined` when no usable where
+ * was supplied. Throws a `GraphQLError`-friendly `Error` on malformed domains.
+ */
+function whereDomainToSql(
+  rawWhere: unknown,
+  meta: TableMeta,
+  ctx: DomainContext,
+  gqlCtx: any,
+): SQL | undefined {
+  if (rawWhere == null) return undefined;
+  if (!Array.isArray(rawWhere)) {
+    throw new Error("where must be a JSON Odoo-style domain array");
+  }
+  return domainToSql(parseDomain(rawWhere), meta.columns, placeholdersFor(gqlCtx), ctx);
 }
 
 /**
@@ -409,7 +446,7 @@ function buildRelationField(
   parentMeta: TableMeta,
   refMeta: TableMeta,
   db: DrizzleLike,
-  refCtx: WhereContext,
+  refCtx: DomainContext,
 ): GraphQLFieldConfig<any, any> {
 
   const isMany = rel.kind === "many";
@@ -421,7 +458,7 @@ function buildRelationField(
     type: baseType,
     args: isMany
       ? {
-          where: { type: refMeta.whereInput },
+          where: { type: GraphQLJSON },
           orderBy: { type: refMeta.orderByInput },
           limit: { type: GraphQLInt },
           offset: { type: GraphQLInt },
@@ -441,6 +478,10 @@ function buildRelationField(
         keys.push(v);
       }
 
+      const userWhere = isMany
+        ? whereDomainToSql(args?.where, refMeta, refCtx, context)
+        : undefined;
+
       // Batch when (a) we have a per-request cache, (b) the join is single-column,
       // and (c) we don't need per-parent limit/offset (those can't be expressed
       // as a single IN-query without window functions / lateral joins).
@@ -454,12 +495,12 @@ function buildRelationField(
         const conds: SQL[] = [];
         for (let i = 0; i < refCols.length; i++) conds.push(eq(refCols[i], keys[i] as any));
         const joinSql = conds.length === 1 ? conds[0] : and(...conds);
+        const where = combineWhere(joinSql, userWhere);
         const rows = await applyListArgs(
           db.select().from(refMeta.table as any),
           args,
           refMeta.columns,
-          joinSql,
-          refCtx,
+          where,
         );
         return isMany ? rows : rows[0] ?? null;
       }
@@ -469,7 +510,7 @@ function buildRelationField(
       }|${JSON.stringify(args?.where ?? null)}|${JSON.stringify(args?.orderBy ?? null)}`;
       let loader = batch!.get(cacheKey) as RelationLoader | undefined;
       if (!loader) {
-        loader = createRelationLoader(rel, refMeta, db, refCtx, isMany, args);
+        loader = createRelationLoader(rel, refMeta, db, isMany, args, userWhere);
         batch!.set(cacheKey, loader);
       }
       return loader.load(keys[0]);
@@ -504,9 +545,9 @@ function createRelationLoader(
   rel: ExtractedRelation,
   refMeta: TableMeta,
   db: DrizzleLike,
-  refCtx: WhereContext,
   isMany: boolean,
   args: any,
+  userWhere: SQL | undefined,
 ): RelationLoader {
   const refCol = rel.references![0];
   const refKeyName = jsKeyOf(refMeta.columns, refCol);
@@ -525,15 +566,15 @@ function createRelationLoader(
       }
       const uniqueKeys = Array.from(new Set(pending.map((p) => p.key)));
       const joinSql = inArray(refCol, uniqueKeys as any[]);
+      const where = combineWhere(joinSql, userWhere);
       const rows: any[] = await applyListArgs(
         db.select().from(refMeta.table as any),
         // limit/offset are dropped at the per-batch level (they were only
         // safe to apply per-parent, which the canBatch gate already excluded
         // for `many` relations; for `one` relations args is undefined).
-        args ? { where: args.where, orderBy: args.orderBy } : undefined,
+        args ? { orderBy: args.orderBy } : undefined,
         refMeta.columns,
-        joinSql,
-        refCtx,
+        where,
       );
       if (isMany) {
         const buckets = new Map<unknown, any[]>();
@@ -588,7 +629,7 @@ function addRootFields(
   queryFields: GraphQLFieldConfigMap<unknown, unknown>,
   mutationFields: GraphQLFieldConfigMap<unknown, unknown>,
   db: DrizzleLike,
-  ctx: WhereContext,
+  ctx: DomainContext,
   rbac: BuildSchemaOptions["rbac"],
 ) {
   // Resolve once: a function that returns the rbac extra-where for a given
@@ -619,7 +660,7 @@ function listType(meta: TableMeta) {
 /** Standard `(where?, orderBy?, limit?, offset?)` arg map for list queries. */
 function listArgsConfig(meta: TableMeta) {
   return {
-    where: { type: meta.whereInput },
+    where: { type: GraphQLJSON },
     orderBy: { type: meta.orderByInput },
     limit: { type: GraphQLInt },
     offset: { type: GraphQLInt },
@@ -630,7 +671,7 @@ function listArgsConfig(meta: TableMeta) {
 function buildListQueryField(
   meta: TableMeta,
   db: DrizzleLike,
-  ctx: WhereContext,
+  ctx: DomainContext,
   guard: Guard,
 ): GraphQLFieldConfig<unknown, unknown> {
   return {
@@ -638,7 +679,9 @@ function buildListQueryField(
     args: listArgsConfig(meta),
     resolve: async (_, args, gqlCtx) => {
       const extra = guard ? await guard(gqlCtx, "read") : undefined;
-      return applyListArgs(db.select().from(meta.table), args, meta.columns, extra, ctx);
+      const userWhere = whereDomainToSql(args?.where, meta, ctx, gqlCtx);
+      const where = combineWhere(extra, userWhere);
+      return applyListArgs(db.select().from(meta.table), args, meta.columns, where);
     },
   };
 }
@@ -647,20 +690,21 @@ function buildListQueryField(
 function buildSingleQueryField(
   meta: TableMeta,
   db: DrizzleLike,
-  ctx: WhereContext,
+  ctx: DomainContext,
   guard: Guard,
 ): GraphQLFieldConfig<unknown, unknown> {
   return {
     type: meta.objectType,
-    args: { where: { type: meta.whereInput }, orderBy: { type: meta.orderByInput } },
+    args: { where: { type: GraphQLJSON }, orderBy: { type: meta.orderByInput } },
     resolve: async (_, args, gqlCtx) => {
       const extra = guard ? await guard(gqlCtx, "read") : undefined;
+      const userWhere = whereDomainToSql(args?.where, meta, ctx, gqlCtx);
+      const where = combineWhere(extra, userWhere);
       const rows = await applyListArgs(
         db.select().from(meta.table),
         args,
         meta.columns,
-        extra,
-        ctx,
+        where,
       ).limit(1);
       return rows[0] ?? null;
     },
@@ -693,18 +737,18 @@ function buildInsertMutationField(
 function buildUpdateMutationField(
   meta: TableMeta,
   db: DrizzleLike,
-  ctx: WhereContext,
+  ctx: DomainContext,
   guard: Guard,
 ): GraphQLFieldConfig<unknown, unknown> {
   return {
     type: listType(meta),
     args: {
       set: { type: new GraphQLNonNull(meta.updateInput) },
-      where: { type: meta.whereInput },
+      where: { type: GraphQLJSON },
     },
     resolve: async (_, args, gqlCtx) => {
       const extra = guard ? await guard(gqlCtx, "update") : undefined;
-      const userWhere = whereToSql(args?.where, meta.columns, ctx);
+      const userWhere = whereDomainToSql(args?.where, meta, ctx, gqlCtx);
       const combined = combineWhere(extra, userWhere);
       return db.update(meta.table).set(args.set).where(combined).returning();
     },
@@ -715,15 +759,15 @@ function buildUpdateMutationField(
 function buildDeleteMutationField(
   meta: TableMeta,
   db: DrizzleLike,
-  ctx: WhereContext,
+  ctx: DomainContext,
   guard: Guard,
 ): GraphQLFieldConfig<unknown, unknown> {
   return {
     type: listType(meta),
-    args: { where: { type: meta.whereInput } },
+    args: { where: { type: GraphQLJSON } },
     resolve: async (_, args, gqlCtx) => {
       const extra = guard ? await guard(gqlCtx, "delete") : undefined;
-      const userWhere = whereToSql(args?.where, meta.columns, ctx);
+      const userWhere = whereDomainToSql(args?.where, meta, ctx, gqlCtx);
       const combined = combineWhere(extra, userWhere);
       return db.delete(meta.table).where(combined).returning();
     },

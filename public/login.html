@@ -58,7 +58,7 @@
     </form>
 
     <script type="module">
-      import { gql, setToken, redirectIfAuth } from "/app.js";
+      import { login, register, redirectIfAuth } from "/app.js";
 
       await redirectIfAuth();
 
@@ -93,28 +93,12 @@
         errorEl.textContent = "";
         submit.disabled = true;
         try {
-          const variables = {
-            email: emailInput.value.trim(),
-            password: passwordInput.value,
-          };
-          let data;
+          const email = emailInput.value.trim();
+          const password = passwordInput.value;
           if (mode === "login") {
-            data = await gql(
-              `mutation($email: String!, $password: String!) {
-                 login(email: $email, password: $password) { token user { id name } }
-               }`,
-              variables,
-            );
-            setToken(data.login.token);
+            await login(email, password);
           } else {
-            variables.name = nameInput.value.trim();
-            data = await gql(
-              `mutation($name: String!, $email: String!, $password: String!) {
-                 register(name: $name, email: $email, password: $password) { token user { id name } }
-               }`,
-              variables,
-            );
-            setToken(data.register.token);
+            await register(nameInput.value.trim(), email, password);
           }
           window.location.replace("/");
         } catch (err) {

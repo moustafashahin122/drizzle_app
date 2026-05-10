@@ -5,9 +5,12 @@ schema namespace (`import * as schema from "../db.js"`) and produces an
 executable `GraphQLSchema` with per-table CRUD, filtering, ordering,
 pagination, and recursive nested-relation traversal.
 
-This module is the **main** building block of the GraphQL layer. The `auth/`
-and `rbac/` modules plug into it through the `extraQueryFields`,
-`extraMutationFields`, and `rbac` options on `buildSchema`.
+This module is the **main** building block of the GraphQL layer. The `rbac/`
+module plugs into it through the `rbac` option on `buildSchema`. Authentication
+itself is **not** part of the GraphQL surface — it lives behind REST endpoints
+under `/auth/*` (see `src/auth/`). The `extraQueryFields` / `extraMutationFields`
+hooks remain on `buildSchema` for any future bespoke fields, but are unused by
+the default app.
 
 ## Files
 
@@ -15,7 +18,7 @@ and `rbac/` modules plug into it through the `extraQueryFields`,
 |----------------|---------------------------------------------------------------------------------------|
 | `builder.ts`   | The main pipeline: introspect → object/input types → root fields. Public entry point. |
 | `relations.ts` | Walks the schema namespace, merges explicit `relations(...)` with auto-detected FKs.  |
-| `filters.ts`   | `Where` / `OrderBy` input types and the `whereToSql` / `orderByToSql` translators.    |
+| `filters.ts`   | `OrderBy` input type, `applyListArgs`, `combineWhere`. (Where filtering is delegated to `../domain`.) |
 | `types.ts`     | Drizzle `Column` → GraphQL scalar/ID mapping + `notNull` wrapping.                    |
 | `scalars.ts`   | Custom scalars: `JSON`, `BigIntString`.                                               |
 | `util.ts`      | Tiny helpers shared across files (currently just `jsKeyOf`).                          |
@@ -43,29 +46,42 @@ import type { BuildSchemaOptions, DrizzleLike } from "./graphql/index.js";
    each `Relations` config, and auto-promotes single-column FKs into a forward
    "one" + inverse "many". Composite FKs are skipped.
 2. **Pass 1** in `buildSchema` — for each table, build the `GraphQLObjectType`
-   (lazy fields thunk) plus `<Type>Insert` / `<Type>Update` / `<Type>Where` /
-   `<Type>OrderBy` input types.
+   (lazy fields thunk) plus `<Type>Insert` / `<Type>Update` / `<Type>OrderBy`
+   input types. There is **no** `<Type>Where` input — filtering is done via a
+   single `JSON` arg carrying an Odoo-style domain.
 3. **Pass 2** in `buildSchema` (`addRootFields`) — wire root fields:
-   - `Query.<jsKey>(where?, orderBy?, limit?, offset?): [<Type>!]!`
-   - `Query.<jsKey>Single(where?, orderBy?): <Type>`
+   - `Query.<jsKey>(where: JSON, orderBy?, limit?, offset?): [<Type>!]!`
+   - `Query.<jsKey>Single(where: JSON, orderBy?): <Type>`
    - `Mutation.insertInto<Type>(values: [<Type>Insert!]!): [<Type>!]!`
-   - `Mutation.update<Type>(set: <Type>Update!, where?): [<Type>!]!`
-   - `Mutation.deleteFrom<Type>(where?): [<Type>!]!`
+   - `Mutation.update<Type>(set: <Type>Update!, where: JSON): [<Type>!]!`
+   - `Mutation.deleteFrom<Type>(where: JSON): [<Type>!]!`
 
 Mutations use Drizzle's `.returning()` so resolvers emit the affected rows.
 
-## Filter vocabulary
+## Filtering — domain syntax
 
-Per column: `eq`, `ne`, `gt`, `gte`, `lt`, `lte`, `in`, `notIn`, `like`,
-`ilike`, `isNull`. Multiple operators on the same column AND together.
+`where` accepts a JSON Odoo-style polish-prefix domain. Examples:
 
-Top-level combinators in `Where`: `AND: [..]`, `OR: [..]`, `NOT: { .. }`.
+```graphql
+# simple
+todos(where: [["completed", "=", false]], orderBy: { id: DESC }, limit: 10) { id title }
 
-Nested-relation filters: when a relation field shadows a column (typical
-forward FK), the column's filter input also accepts the referenced table's
-where fields. Inverse "many" relations appear as plain fields with the
-referenced `<RefType>Where` type. Both translate to
-`parent.<localCol> IN (SELECT ref.<remoteCol> FROM ref WHERE …)`.
+# multiple leaves AND together implicitly
+todos(where: [["completed", "=", false], ["title", "ilike", "%pr%"]]) { title }
+
+# OR combinator (prefix)
+todos(where: ["|", ["title", "=", "orphan"], ["assigneeId.email", "ilike", "alice%"]]) { title }
+
+# dotted path traverses a single-column relation as IN-subquery
+assignees(where: [["todos.title", "=", "deploy"]]) { name }
+
+# placeholder substituted from gqlCtx.user.id
+todos(where: [["ownerId", "=", "current_user.id"]]) { title }
+```
+
+Operators: `=`, `!=` (alias `<>`), `>`, `>=`, `<`, `<=`, `in`, `not in`,
+`like`, `ilike`, `not like`, `not ilike`, `=?`. Combinators: `&`, `|`, `!`
+(prefix). Full reference: `../domain/README.md`.
 
 ## Recursion model
 

@@ -75,9 +75,29 @@ Opens Drizzle Studio in the browser for browsing/editing rows.
 
 > Note: the app can create its tables without a prior migrate step; see `src/db.ts` and `docs/DATABASE.md` for details.
 
-## Endpoint
+## Endpoints
 
-All operations go to a single endpoint:
+The server exposes three surfaces:
+
+- **REST `/auth/*`** — authentication only. Register, login, logout, and "who am I?" all happen here. The successful responses set an HttpOnly session cookie (`sid`); a bearer token is also accepted for non-browser clients.
+
+  | Method | Path             | Body                              | Auth |
+  |--------|------------------|-----------------------------------|------|
+  | POST   | `/auth/register` | `{ name, email, password }`       | no   |
+  | POST   | `/auth/login`    | `{ email, password }`             | no   |
+  | POST   | `/auth/logout`   | —                                 | yes  |
+  | GET    | `/auth/me`       | —                                 | yes  |
+
+- **REST `/admin/*`** — admin dashboard's user CRUD. RBAC-enforced.
+
+  | Method | Path                 | Body                                |
+  |--------|----------------------|-------------------------------------|
+  | GET    | `/admin/users`       | —                                   |
+  | POST   | `/admin/users`       | `{ name, email, password, active? }`|
+  | PATCH  | `/admin/users/:id`   | partial `{ name, email, active }`   |
+  | DELETE | `/admin/users/:id`   | —                                   |
+
+- **GraphQL `POST /graphql`** — application data (todos, assignees, etc.). No auth fields here.
 
 ```
 POST http://localhost:3000/graphql
@@ -171,29 +191,27 @@ query Paged {
 }
 ```
 
-Filter (only incomplete):
+Filter (only incomplete) — `where` accepts an Odoo polish-prefix domain (a
+JSON array). See `src/graphql/domain/README.md` for the full syntax.
 
 ```graphql
-query Pending {
-  todos(where: { completed: { eq: false } }, orderBy: { id: asc }) {
+query Pending($w: JSON) {
+  todos(where: $w, orderBy: { id: ASC }) {
     id
     title
   }
 }
 ```
 
+```json
+{ "w": [["completed", "=", false]] }
+```
+
 More complex filter (title contains "buy" OR completed=true):
 
 ```graphql
-query Search {
-  todos(
-    where: {
-      OR: [
-        { title: { ilike: "%buy%" } }
-        { completed: { eq: true } }
-      ]
-    }
-  ) {
+query Search($w: JSON) {
+  todos(where: $w) {
     id
     title
     completed
@@ -201,11 +219,15 @@ query Search {
 }
 ```
 
+```json
+{ "w": ["|", ["title", "ilike", "%buy%"], ["completed", "=", true]] }
+```
+
 Read a single todo by id:
 
 ```graphql
-query OneTodo($id: Int!) {
-  todosSingle(where: { id: { eq: $id } }) {
+query OneTodo($w: JSON) {
+  todosSingle(where: $w) {
     id
     title
     completed
@@ -215,7 +237,7 @@ query OneTodo($id: Int!) {
 ```
 
 ```json
-{ "id": 1 }
+{ "w": [["id", "=", 1]] }
 ```
 
 ---
@@ -225,8 +247,8 @@ query OneTodo($id: Int!) {
 Update one todo by id:
 
 ```graphql
-mutation MarkDone($id: Int!) {
-  updateTodos(where: { id: { eq: $id } }, set: { completed: true }) {
+mutation MarkDone($w: JSON) {
+  updateTodos(where: $w, set: { completed: true }) {
     id
     title
     completed
@@ -235,14 +257,14 @@ mutation MarkDone($id: Int!) {
 ```
 
 ```json
-{ "id": 1 }
+{ "w": [["id", "=", 1]] }
 ```
 
 Rename a todo:
 
 ```graphql
-mutation Rename($id: Int!, $title: String!) {
-  updateTodos(where: { id: { eq: $id } }, set: { title: $title }) {
+mutation Rename($w: JSON, $title: String!) {
+  updateTodos(where: $w, set: { title: $title }) {
     id
     title
   }
@@ -250,18 +272,22 @@ mutation Rename($id: Int!, $title: String!) {
 ```
 
 ```json
-{ "id": 1, "title": "buy oat milk" }
+{ "w": [["id", "=", 1]], "title": "buy oat milk" }
 ```
 
 Bulk update — mark all incomplete todos as complete:
 
 ```graphql
-mutation CompleteAll {
-  updateTodos(where: { completed: { eq: false } }, set: { completed: true }) {
+mutation CompleteAll($w: JSON) {
+  updateTodos(where: $w, set: { completed: true }) {
     id
     completed
   }
 }
+```
+
+```json
+{ "w": [["completed", "=", false]] }
 ```
 
 ---
@@ -271,26 +297,30 @@ mutation CompleteAll {
 Delete one todo by id:
 
 ```graphql
-mutation DeleteTodo($id: Int!) {
-  deleteFromTodos(where: { id: { eq: $id } }) {
+mutation DeleteTodo($w: JSON) {
+  deleteFromTodos(where: $w) {
     id
   }
 }
 ```
 
 ```json
-{ "id": 1 }
+{ "w": [["id", "=", 1]] }
 ```
 
 Delete all completed todos:
 
 ```graphql
-mutation ClearDone {
-  deleteFromTodos(where: { completed: { eq: true } }) {
+mutation ClearDone($w: JSON) {
+  deleteFromTodos(where: $w) {
     id
     title
   }
 }
+```
+
+```json
+{ "w": [["completed", "=", true]] }
 ```
 
 ---
@@ -318,7 +348,7 @@ Update:
 ```bash
 curl -X POST http://localhost:3000/graphql \
   -H 'Content-Type: application/json' \
-  -d '{"query":"mutation($i:Int!){updateTodos(where:{id:{eq:$i}}, set:{completed:true}){id completed}}","variables":{"i":1}}'
+  -d '{"query":"mutation($w:JSON){updateTodos(where:$w, set:{completed:true}){id completed}}","variables":{"w":[["id","=",1]]}}'
 ```
 
 Delete:
@@ -326,26 +356,35 @@ Delete:
 ```bash
 curl -X POST http://localhost:3000/graphql \
   -H 'Content-Type: application/json' \
-  -d '{"query":"mutation($i:Int!){deleteFromTodos(where:{id:{eq:$i}}){id}}","variables":{"i":1}}'
+  -d '{"query":"mutation($w:JSON){deleteFromTodos(where:$w){id}}","variables":{"w":[["id","=",1]]}}'
 ```
 
 ---
 
 ## Filter operators (cheat sheet)
 
-The generated GraphQL `where` inputs support these per-field operators:
+`where` is a JSON Odoo polish-prefix domain. Per-leaf operators:
 
-- `eq`, `ne` — equals / not equals
-- `lt`, `lte`, `gt`, `gte` — comparisons
-- `inArray`, `notInArray` — set membership
-- `like`, `ilike`, `notLike`, `notIlike` — pattern match
-- `isNull` — boolean
+- `=`, `!=` (alias `<>`) — equals / not equals
+- `<`, `<=`, `>`, `>=` — comparisons
+- `in`, `not in` — set membership
+- `like`, `ilike`, `not like`, `not ilike` — pattern match
+- `=?` — equal-or-null (drops the predicate when the value resolves to `null`,
+  useful with placeholders)
 
-And logical combinators at the top of `where`:
+Combinators (prefix, polish-style):
 
-- `AND: [...]`
-- `OR: [...]`
-- `NOT: { ... }`
+- `&` — AND of next two sub-expressions (also the implicit combinator across
+  remaining top-level items)
+- `|` — OR of next two sub-expressions
+- `!` — NOT of the next sub-expression
+
+Dotted field paths traverse single-column relations:
+`[["assigneeId.email", "ilike", "%@x.com"]]` →
+`assigneeId IN (SELECT id FROM assignees WHERE email ILIKE …)`.
+
+The string `"current_user.id"` is substituted from the request context at
+evaluation time. Full reference: `src/graphql/domain/README.md`.
 
 The SQLite database file `todo.db` is created automatically on first run.
 # drizzle_app

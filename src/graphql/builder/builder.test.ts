@@ -92,9 +92,10 @@ describe("buildSchema — list query", () => {
     assert.equal(data.todos.length, 4);
   });
 
-  it("filters by where", async () => {
+  it("filters by where (JSON domain)", async () => {
     const data: any = await run(
-      `{ todos(where: { title: { like: "%PR%" } }) { title } }`,
+      `query ($w: JSON) { todos(where: $w) { title } }`,
+      { w: [["title", "like", "%PR%"]] },
     );
     assert.deepEqual(data.todos.map((t: any) => t.title), ["review PR"]);
   });
@@ -110,12 +111,14 @@ describe("buildSchema — list query", () => {
 describe("buildSchema — Single query", () => {
   it("returns the first match or null", async () => {
     const found: any = await run(
-      `{ todosSingle(where: { title: { eq: "deploy" } }) { id title } }`,
+      `query ($w: JSON) { todosSingle(where: $w) { id title } }`,
+      { w: [["title", "=", "deploy"]] },
     );
     assert.equal(found.todosSingle.title, "deploy");
 
     const missing: any = await run(
-      `{ todosSingle(where: { title: { eq: "nope" } }) { id } }`,
+      `query ($w: JSON) { todosSingle(where: $w) { id } }`,
+      { w: [["title", "=", "nope"]] },
     );
     assert.equal(missing.todosSingle, null);
   });
@@ -151,11 +154,12 @@ describe("buildSchema — recursive relation traversal", () => {
   });
 
   it("recurses through multiple relation hops", async () => {
-    const data: any = await run(`
-      { todosSingle(where: { id: { eq: 1 } }) {
+    const data: any = await run(
+      `query ($w: JSON) { todosSingle(where: $w) {
           assigneeId { todos(orderBy: { id: ASC }) { title } }
-      } }
-    `);
+      } }`,
+      { w: [["id", "=", 1]] },
+    );
     assert.deepEqual(
       data.todosSingle.assigneeId.todos.map((t: any) => t.title),
       ["write tests", "review PR"],
@@ -163,31 +167,30 @@ describe("buildSchema — recursive relation traversal", () => {
   });
 
   it("accepts where/limit on a 'many' relation field", async () => {
-    const data: any = await run(`
-      { assignees(where: { id: { eq: 1 } }) {
-          todos(where: { title: { like: "%tests%" } }, limit: 1) { title }
-      } }
-    `);
+    const data: any = await run(
+      `query ($a: JSON, $t: JSON) { assignees(where: $a) {
+          todos(where: $t, limit: 1) { title }
+      } }`,
+      {
+        a: [["id", "=", 1]],
+        t: [["title", "like", "%tests%"]],
+      },
+    );
     assert.deepEqual(data.assignees[0].todos.map((t: any) => t.title), ["write tests"]);
   });
 });
 
-describe("buildSchema — nested relation filters", () => {
-  it("filters parent rows by a predicate on the forward 'one' relation (FK column shadow)", async () => {
-    // The `assigneeId` field on TodosWhere keeps its column ops AND exposes
-    // the referenced Assignees fields, so callers can write
-    // `assigneeId: { email: { eq: ... } }` without losing `eq: 1` etc.
-    const data: any = await run(`
-      query {
-        todos(
-          where: { assigneeId: { email: { eq: "alice@example.com" } } }
-          orderBy: { id: ASC }
-        ) {
+describe("buildSchema — nested relation filters (dotted domain paths)", () => {
+  it("filters parent rows via a dotted path through the forward 'one' relation", async () => {
+    const data: any = await run(
+      `query ($w: JSON) {
+        todos(where: $w, orderBy: { id: ASC }) {
           title
           assigneeId { email }
         }
-      }
-    `);
+      }`,
+      { w: [["assigneeId.email", "=", "alice@example.com"]] },
+    );
     assert.deepEqual(
       data.todos.map((t: any) => [t.title, t.assigneeId?.email ?? null]),
       [
@@ -197,58 +200,49 @@ describe("buildSchema — nested relation filters", () => {
     );
   });
 
-  it("still supports column-op filtering on the same FK field", async () => {
-    const data: any = await run(`
-      { todos(where: { assigneeId: { eq: 2 } }) { title } }
-    `);
+  it("still supports column-op filtering on the same FK column", async () => {
+    const data: any = await run(
+      `query ($w: JSON) { todos(where: $w) { title } }`,
+      { w: [["assigneeId", "=", 2]] },
+    );
     assert.deepEqual(data.todos.map((t: any) => t.title), ["deploy"]);
   });
 
-  it("mixes column ops and nested predicates in a single filter object", async () => {
-    const data: any = await run(`
-      query {
-        todos(
-          where: {
-            completed: { eq: false }
-            assigneeId: { name: { eq: "Alice" } }
-          }
-          orderBy: { id: ASC }
-        ) { title }
-      }
-    `);
+  it("mixes column ops and dotted predicates in a single domain", async () => {
+    const data: any = await run(
+      `query ($w: JSON) { todos(where: $w, orderBy: { id: ASC }) { title } }`,
+      {
+        w: [
+          ["completed", "=", false],
+          ["assigneeId.name", "=", "Alice"],
+        ],
+      },
+    );
     assert.deepEqual(
       data.todos.map((t: any) => t.title),
       ["write tests", "review PR"],
     );
   });
 
-  it("filters parents by an inverse 'many' relation field that doesn't shadow a column", async () => {
-    // `todos` is the inverse-many on assignees — filter assignees that have
-    // at least one matching todo.
-    const data: any = await run(`
-      query {
-        assignees(
-          where: { todos: { title: { eq: "deploy" } } }
-        ) { name }
-      }
-    `);
+  it("filters parents by an inverse 'many' relation via dotted path", async () => {
+    const data: any = await run(
+      `query ($w: JSON) { assignees(where: $w) { name } }`,
+      { w: [["todos.title", "=", "deploy"]] },
+    );
     assert.deepEqual(data.assignees.map((a: any) => a.name), ["Bob"]);
   });
 
-  it("composes nested filters with AND/OR", async () => {
-    const data: any = await run(`
-      query {
-        todos(
-          where: {
-            OR: [
-              { assigneeId: { email: { like: "alice%" } } }
-              { title: { eq: "orphan" } }
-            ]
-          }
-          orderBy: { id: ASC }
-        ) { title }
-      }
-    `);
+  it("composes domain combinators (OR) with dotted predicates", async () => {
+    const data: any = await run(
+      `query ($w: JSON) { todos(where: $w, orderBy: { id: ASC }) { title } }`,
+      {
+        w: [
+          "|",
+          ["assigneeId.email", "like", "alice%"],
+          ["title", "=", "orphan"],
+        ],
+      },
+    );
     assert.deepEqual(
       data.todos.map((t: any) => t.title),
       ["write tests", "review PR", "orphan"],
@@ -318,18 +312,21 @@ describe("buildSchema — mutations round-trip", () => {
     assert.equal(inserted.insertIntoTodos[0].title, "new-mutation-roundtrip");
 
     const updated: any = await run(
-      `mutation { updateTodos(set: { completed: true }, where: { id: { eq: ${newId} } }) { id completed } }`,
+      `mutation ($w: JSON) { updateTodos(set: { completed: true }, where: $w) { id completed } }`,
+      { w: [["id", "=", newId]] },
     );
     assert.equal(updated.updateTodos[0].completed, true);
 
     const deleted: any = await run(
-      `mutation { deleteFromTodos(where: { id: { eq: ${newId} } }) { id title } }`,
+      `mutation ($w: JSON) { deleteFromTodos(where: $w) { id title } }`,
+      { w: [["id", "=", newId]] },
     );
     assert.equal(deleted.deleteFromTodos[0].title, "new-mutation-roundtrip");
 
     // Confirm row is actually gone.
     const after: any = await run(
-      `{ todosSingle(where: { id: { eq: ${newId} } }) { id } }`,
+      `query ($w: JSON) { todosSingle(where: $w) { id } }`,
+      { w: [["id", "=", newId]] },
     );
     assert.equal(after.todosSingle, null);
   });

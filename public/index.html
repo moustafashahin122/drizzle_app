@@ -79,15 +79,15 @@
         }
       `;
       const M_UPDATE = `
-        mutation($id: ID!, $set: TodosUpdate!) {
-          updateTodos(where: { id: { eq: $id } }, set: $set) {
+        mutation($where: JSON, $set: TodosUpdate!) {
+          updateTodos(where: $where, set: $set) {
             id title completed
           }
         }
       `;
       const M_DELETE = `
-        mutation($id: ID!) {
-          deleteFromTodos(where: { id: { eq: $id } }) { id }
+        mutation($where: JSON) {
+          deleteFromTodos(where: $where) { id }
         }
       `;
 
@@ -105,7 +105,10 @@
         cb.type = "checkbox";
         cb.checked = !!t.completed;
         cb.onchange = async () => {
-          await gql(M_UPDATE, { id: t.id, set: { completed: cb.checked } });
+          await gql(M_UPDATE, {
+            where: [["id", "=", t.id]],
+            set: { completed: cb.checked },
+          });
           load();
         };
 
@@ -120,7 +123,10 @@
           ed.onblur = async () => {
             const v = ed.value.trim();
             if (v && v !== t.title) {
-              await gql(M_UPDATE, { id: t.id, set: { title: v } });
+              await gql(M_UPDATE, {
+                where: [["id", "=", t.id]],
+                set: { title: v },
+              });
             }
             load();
           };
@@ -135,7 +141,7 @@
         del.textContent = "✕";
         del.title = "Delete";
         del.onclick = async () => {
-          await gql(M_DELETE, { id: t.id });
+          await gql(M_DELETE, { where: [["id", "=", t.id]] });
           load();
         };
 
