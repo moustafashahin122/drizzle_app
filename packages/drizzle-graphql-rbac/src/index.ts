@@ -68,9 +68,18 @@ export type {
   RbacEnforce,
   RbacSchema,
   Action,
+  BuildRbacOptions,
 } from "./graphql/rbac/rbac.js";
 export { buildRbacDb, RbacDb } from "./graphql/rbac/rbacDb.js";
 export type { RbacDbDeps } from "./graphql/rbac/rbacDb.js";
+
+// RBAC cache — exposed for advanced consumers building a custom enforce.
+export { RbacCache, TtlLruCache } from "./graphql/rbac/cache.js";
+export type {
+  CachedGroups,
+  EnforceEntry,
+  RbacCacheOptions,
+} from "./graphql/rbac/cache.js";
 
 // Domain (Odoo-style filter) primitives.
 export { parseDomain, domainToSql } from "./graphql/domain/domain.js";

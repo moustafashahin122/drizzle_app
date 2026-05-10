@@ -36,6 +36,11 @@ import type {
 } from "../../tables.js";
 import type { ColumnMap } from "../builder/filters.js";
 import { parseDomain, domainToSql } from "../domain/domain.js";
+import {
+  RbacCache,
+  type CachedGroups,
+  type RbacCacheOptions,
+} from "./cache.js";
 
 export interface RbacSchema {
   groups: typeof groupsTable;
@@ -66,10 +71,12 @@ const ACTION_TO_PERM: Record<Action, "canCreate" | "canRead" | "canUpdate" | "ca
   delete: "canDelete",
 };
 
-interface CachedGroups {
-  ids: number[];
-  isAdmin: boolean;
-}
+/**
+ * Tunables for {@link buildRbac}'s cross-request cache. Aliased from
+ * {@link RbacCacheOptions} in `./cache.js`; re-exported here so the public
+ * RBAC surface is one import.
+ */
+export type BuildRbacOptions = RbacCacheOptions;
 
 /**
  * Resolve the user's effective group set: direct memberships plus every
@@ -115,13 +122,23 @@ async function getEffectiveGroups(
   db: RbacDb,
   schema: RbacSchema,
   ctx: RbacContext,
+  cache: RbacCache<SQL>,
 ): Promise<CachedGroups> {
   if (!ctx.user) return { ids: [], isAdmin: false };
-  const cacheKey = `__rbac_groups:${ctx.user.id}`;
-  const cached = ctx.batch?.get(cacheKey) as CachedGroups | undefined;
-  if (cached) return cached;
-  const out = await resolveEffectiveGroups(db, schema, ctx.user.id);
-  ctx.batch?.set(cacheKey, out);
+  const userId = ctx.user.id;
+  const requestKey = `__rbac_groups:${userId}`;
+  // Layer 1: per-request memo — cheapest, always coherent within a request.
+  const cachedReq = ctx.batch?.get(requestKey) as CachedGroups | undefined;
+  if (cachedReq) return cachedReq;
+  // Layer 2: cross-request TTL+LRU cache — survives between requests, bounded.
+  const cachedGlobal = cache.getGroups(userId);
+  if (cachedGlobal) {
+    ctx.batch?.set(requestKey, cachedGlobal);
+    return cachedGlobal;
+  }
+  const out = await resolveEffectiveGroups(db, schema, userId);
+  ctx.batch?.set(requestKey, out);
+  cache.setGroups(userId, out);
   return out;
 }
 
@@ -166,13 +183,52 @@ export interface RbacEnforce {
  * @param schema The four RBAC tables, typically a slice of the project schema.
  * @returns `{ enforce }` — pass `enforce` to `buildSchema({ rbac: { enforce } })`.
  */
-export function buildRbac(db: RbacDb, schema: RbacSchema): { enforce: RbacEnforce } {
+export function buildRbac(
+  db: RbacDb,
+  schema: RbacSchema,
+  options: BuildRbacOptions = {},
+): { enforce: RbacEnforce; invalidateUser: (userId: number) => void; clearCache: () => void } {
+  const cache = new RbacCache<SQL>(options);
+
   const enforce: RbacEnforce = async (ctx, resource, action, columns) => {
     if (!ctx.user) throw forbidden("Not authenticated");
+    const userId = ctx.user.id;
 
-    const { ids, isAdmin } = await getEffectiveGroups(db, schema, ctx);
-    if (isAdmin) return {};
-    if (!ids.length) throw forbidden(`Access denied on '${resource}'`);
+    // Layered cache for the full enforce result — depends only on (user,
+    // resource, action) and the RBAC tables, so safe to share across requests
+    // up to TTL. Layer 1: per-request memo (cheapest, perfectly coherent).
+    // Layer 2: cross-request TTL+LRU cache (bounded; staleness up to TTL).
+    const requestKey = `__rbac_enforce:${userId}:${resource}:${action}`;
+    const cachedReq = ctx.batch?.get(requestKey) as
+      | { where?: SQL }
+      | { __forbidden: string }
+      | undefined;
+    if (cachedReq) {
+      if ("__forbidden" in cachedReq) throw forbidden(cachedReq.__forbidden);
+      return cachedReq;
+    }
+    const cachedGlobal = cache.getEnforce(userId, resource, action);
+    if (cachedGlobal) {
+      ctx.batch?.set(requestKey, cachedGlobal);
+      if ("__forbidden" in cachedGlobal) throw forbidden(cachedGlobal.__forbidden);
+      return cachedGlobal;
+    }
+
+    const memo = (out: { where?: SQL }) => {
+      ctx.batch?.set(requestKey, out);
+      cache.setEnforce(userId, resource, action, out);
+      return out;
+    };
+    const denyAndThrow = (msg: string): never => {
+      const entry = { __forbidden: msg };
+      ctx.batch?.set(requestKey, entry);
+      cache.setEnforce(userId, resource, action, entry);
+      throw forbidden(msg);
+    };
+
+    const { ids, isAdmin } = await getEffectiveGroups(db, schema, ctx, cache);
+    if (isAdmin) return memo({});
+    if (!ids.length) denyAndThrow(`Access denied on '${resource}'`);
 
     const permCol = ACTION_TO_PERM[action];
     const granting: { groupId: number }[] = await db
@@ -186,7 +242,7 @@ export function buildRbac(db: RbacDb, schema: RbacSchema): { enforce: RbacEnforc
         ),
       );
     if (!granting.length) {
-      throw forbidden(`Access denied on '${resource}' for '${action}'`);
+      denyAndThrow(`Access denied on '${resource}' for '${action}'`);
     }
 
     // Record rules: only those owned by groups that *also* grant the action
@@ -207,7 +263,7 @@ export function buildRbac(db: RbacDb, schema: RbacSchema): { enforce: RbacEnforc
           inArray(schema.recordRules.groupId, grantingIds),
         ),
       );
-    if (!rules.length) return {};
+    if (!rules.length) return memo({});
 
     const rulesByGroup = new Map<number, SQL[]>();
     for (const r of rules) {
@@ -237,16 +293,26 @@ export function buildRbac(db: RbacDb, schema: RbacSchema): { enforce: RbacEnforc
 
     // If any granting group has no rule, that group grants unrestricted access
     // → no row filter needed.
-    if (groupsWithoutRules.length) return {};
+    if (groupsWithoutRules.length) return memo({});
 
     const perGroup: SQL[] = [];
     for (const arr of rulesByGroup.values()) {
       perGroup.push(arr.length === 1 ? arr[0] : and(...arr)!);
     }
-    if (!perGroup.length) return {};
+    if (!perGroup.length) return memo({});
     const combined = perGroup.length === 1 ? perGroup[0] : or(...perGroup)!;
-    return { where: combined };
+    return memo({ where: combined });
   };
 
-  return { enforce };
+  return {
+    enforce,
+    /**
+     * Drop every cached entry for a user — call after mutations that change
+     * group membership, access rights, or record rules for that user, and on
+     * sign-out so a re-login picks up any out-of-band changes immediately.
+     */
+    invalidateUser: (userId: number) => cache.invalidateUser(userId),
+    /** Drop every cached RBAC entry process-wide. */
+    clearCache: () => cache.clear(),
+  };
 }

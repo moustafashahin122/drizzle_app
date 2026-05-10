@@ -16,6 +16,10 @@ import type { sessions as sessionsTable, users as usersTable, User, Session } fr
 
 const SESSION_DAYS = 7;
 const SESSION_MS = SESSION_DAYS * 86_400_000;
+// Skip the sliding-expiry write when the session still has more than half its
+// window remaining. Caps refresh writes at roughly one per session per
+// SESSION_REFRESH_MS, instead of one per request.
+const SESSION_REFRESH_MS = SESSION_MS / 2;
 export const SESSION_COOKIE_NAME = "sid";
 
 export interface SessionSchema {
@@ -96,25 +100,29 @@ export async function resolveSessionFromToken(
   if (!token) return { user: null, session: null };
 
   const { users, sessions } = schema;
-  const nowIso = new Date().toISOString();
-  const [session] = await db
-    .select()
+  const now = Date.now();
+  const nowIso = new Date(now).toISOString();
+  const [row] = await db
+    .select({ session: sessions, user: users })
     .from(sessions)
+    .innerJoin(users, eq(users.id, sessions.userId))
     .where(and(eq(sessions.token, token), gt(sessions.expiresAt, nowIso)))
     .limit(1);
-  if (!session) return { user: null, session: null };
+  if (!row) return { user: null, session: null };
+  const { session, user } = row as { session: Session; user: User };
+  if (!user.active) return { user: null, session: null };
 
-  const [user] = await db
-    .select()
-    .from(users)
-    .where(eq(users.id, session.userId))
-    .limit(1);
-  if (!user || !user.active) return { user: null, session: null };
-
-  await db
-    .update(sessions)
-    .set({ expiresAt: newExpiresAt() })
-    .where(eq(sessions.id, session.id));
+  // Sliding expiry: only refresh once the remaining window has dropped below
+  // SESSION_REFRESH_MS, so a busy session does not write on every request.
+  const expiresMs = Date.parse(session.expiresAt);
+  if (Number.isFinite(expiresMs) && expiresMs - now < SESSION_REFRESH_MS) {
+    const nextExpiresAt = newExpiresAt();
+    await db
+      .update(sessions)
+      .set({ expiresAt: nextExpiresAt })
+      .where(eq(sessions.id, session.id));
+    session.expiresAt = nextExpiresAt;
+  }
 
   return { user, session };
 }

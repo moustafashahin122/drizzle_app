@@ -32,7 +32,7 @@ import { Hono } from "hono";
 import { logger as honoLogger } from "hono/logger";
 import { createYoga } from "graphql-yoga";
 import { buildSchema, type BuildSchemaOptions } from "./graphql/builder/builder.js";
-import { buildRbac } from "./graphql/rbac/rbac.js";
+import { buildRbac, type BuildRbacOptions } from "./graphql/rbac/rbac.js";
 import { buildRbacDb, type RbacDb } from "./graphql/rbac/rbacDb.js";
 import { buildAuthRoutes } from "./auth/routes.js";
 import { buildAdminRoutes } from "./admin/routes.js";
@@ -83,6 +83,13 @@ export interface CreateAppOptions {
    *    logging is enabled when a function is supplied.
    */
   logger?: boolean | ((message: string, ...rest: string[]) => void);
+  /**
+   * Tunables for the cross-request RBAC cache (effective groups + per-user
+   * enforce results). Defaults to a 30-minute TTL with bounded size; pass
+   * `{ cacheTtlMs: 0 }` to disable. Call the returned `invalidateUser`
+   * after admin mutations that change a user's groups / rights / rules.
+   */
+  rbacCache?: BuildRbacOptions;
 }
 
 export interface CreatedApp {
@@ -90,6 +97,10 @@ export interface CreatedApp {
   app: Hono<AuthEnv>;
   /** Per-request RBAC-bound DB factory; re-exported so callers can write custom routes. */
   rdbFor: (ctx: { user: User | null; batch?: Map<string, unknown> }) => RbacDb;
+  /** Drop the RBAC cache for one user (call after admin mutations to their groups / rights). */
+  invalidateRbacUser: (userId: number) => void;
+  /** Drop the entire RBAC cache (e.g. on bulk-import of access_rights). */
+  clearRbacCache: () => void;
 }
 
 /**
@@ -107,6 +118,7 @@ export function createApp(opts: CreateAppOptions): CreatedApp {
     publicDir = "./public",
     graphqlEndpoint = "/graphql",
     logger: loggerOpt = true,
+    rbacCache,
   } = opts;
   const loggingEnabled = loggerOpt !== false;
 
@@ -115,12 +127,19 @@ export function createApp(opts: CreateAppOptions): CreatedApp {
     sessions: schema.sessions,
   };
 
-  const rbac = buildRbac(db, {
-    groups: schema.groups as any,
-    userGroups: schema.userGroups as any,
-    accessRights: schema.accessRights as any,
-    recordRules: schema.recordRules as any,
-  });
+  const rbac = buildRbac(
+    db,
+    {
+      groups: schema.groups as any,
+      userGroups: schema.userGroups as any,
+      accessRights: schema.accessRights as any,
+      recordRules: schema.recordRules as any,
+    },
+    // Default to 30-minute cross-request RBAC cache with bounded size; the
+    // engine itself defaults to off, so apps that want freshness on every
+    // mutation (or run the engine directly in tests) opt out cleanly.
+    { cacheTtlMs: 30 * 60 * 1000, ...(rbacCache ?? {}) },
+  );
 
   const { schema: gqlSchema } = buildSchema(db, schema, {
     hiddenOutputColumns,
@@ -161,7 +180,16 @@ export function createApp(opts: CreateAppOptions): CreatedApp {
     app.use("*", typeof loggerOpt === "function" ? honoLogger(loggerOpt) : honoLogger());
   }
 
-  app.route("/auth", buildAuthRoutes({ db, schema: sessionSchema }));
+  app.route(
+    "/auth",
+    buildAuthRoutes({
+      db,
+      schema: sessionSchema,
+      // Drop the user's cached RBAC entries on sign-out so a re-login (or
+      // another user reusing this id later) sees a clean slate.
+      onSignout: rbac.invalidateUser,
+    }),
+  );
   app.route(
     "/admin",
     buildAdminRoutes({
@@ -189,5 +217,10 @@ export function createApp(opts: CreateAppOptions): CreatedApp {
     });
   }
 
-  return { app, rdbFor };
+  return {
+    app,
+    rdbFor,
+    invalidateRbacUser: rbac.invalidateUser,
+    clearRbacCache: rbac.clearCache,
+  };
 }

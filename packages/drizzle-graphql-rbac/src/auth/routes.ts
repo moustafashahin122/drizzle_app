@@ -40,6 +40,14 @@ function publicUser(user: User): Omit<User, "passwordHash"> {
 export interface AuthRoutesDeps {
   db: SessionDb;
   schema: SessionSchema;
+  /**
+   * Optional hook fired after a successful `/logout` with the signed-out
+   * user's id. {@link createApp} wires this to the RBAC cache's
+   * `invalidateUser` so a user's cached groups / enforce results are dropped
+   * on sign-out — the next login then re-reads from the DB. Safe to leave
+   * unset when no caches need flushing.
+   */
+  onSignout?: (userId: number) => void;
 }
 
 /**
@@ -50,7 +58,7 @@ export interface AuthRoutesDeps {
  * to remember to wrap it.
  */
 export function buildAuthRoutes(deps: AuthRoutesDeps) {
-  const { db, schema } = deps;
+  const { db, schema, onSignout } = deps;
   const app = new Hono<AuthEnv>();
   app.use("*", sessionMiddleware(db, schema));
 
@@ -114,6 +122,7 @@ export function buildAuthRoutes(deps: AuthRoutesDeps) {
     c.header("Set-Cookie", buildClearSessionCookie(), { append: true });
     if (!session) return c.json({ ok: false });
     await destroySession(db, schema, session.id);
+    onSignout?.(session.userId);
     return c.json({ ok: true });
   });
 

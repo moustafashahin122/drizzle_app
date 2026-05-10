@@ -83,6 +83,9 @@ import {
   type GraphQLFieldConfig,
   type GraphQLFieldConfigMap,
   type GraphQLInputFieldConfigMap,
+  type GraphQLResolveInfo,
+  type SelectionSetNode,
+  type FragmentDefinitionNode,
 } from "graphql";
 import {
   and,
@@ -90,6 +93,7 @@ import {
   getTableColumns,
   getTableName,
   inArray,
+  type Column,
   type SQL,
 } from "drizzle-orm";
 import {
@@ -406,6 +410,94 @@ function placeholdersFor(gqlCtx: any): DomainPlaceholders {
 }
 
 /**
+ * Walk a selection set (resolving fragment spreads + inline fragments) and
+ * collect the underlying field names the client asked for. Aliases are
+ * ignored — we want the source field name to map back to a column / relation.
+ */
+function collectRequestedFieldNames(
+  selectionSet: SelectionSetNode,
+  fragments: Record<string, FragmentDefinitionNode>,
+  out: Set<string>,
+): void {
+  for (const sel of selectionSet.selections) {
+    if (sel.kind === "Field") {
+      const name = sel.name.value;
+      if (!name.startsWith("__")) out.add(name);
+    } else if (sel.kind === "InlineFragment") {
+      if (sel.selectionSet) collectRequestedFieldNames(sel.selectionSet, fragments, out);
+    } else if (sel.kind === "FragmentSpread") {
+      const frag = fragments[sel.name.value];
+      if (frag) collectRequestedFieldNames(frag.selectionSet, fragments, out);
+    }
+  }
+}
+
+/**
+ * Derive a Drizzle `select()` projection from a GraphQL selection set on
+ * `meta`'s object type, so the SQL only fetches columns the client actually
+ * needs. Always retains:
+ *  - primary-key columns (needed for dedup / dataloader bucketing / inverse
+ *    relations that target the PK);
+ *  - the local FK columns of any requested relation field (the relation
+ *    resolver reads them off the parent row at traversal time).
+ *
+ * Returns `undefined` (caller falls back to selecting all columns) when no
+ * usable selection set is available — e.g. when called from a context where
+ * `info` was not threaded through.
+ */
+function projectionForSelection(
+  meta: TableMeta,
+  info: GraphQLResolveInfo | undefined,
+): Record<string, Column> | undefined {
+  if (!info) return undefined;
+  const requested = new Set<string>();
+  for (const fn of info.fieldNodes) {
+    if (fn.selectionSet) {
+      collectRequestedFieldNames(fn.selectionSet, info.fragments ?? {}, requested);
+    }
+  }
+  if (!requested.size) return undefined;
+
+  const proj: Record<string, Column> = {};
+  // Primary key columns are unconditionally projected.
+  for (const [k, c] of Object.entries(meta.columns)) {
+    if ((c as any).primary) proj[k] = c;
+  }
+
+  const relByName = new Map(meta.relations.map((r) => [r.fieldName, r]));
+
+  for (const f of requested) {
+    const col = meta.columns[f];
+    if (col) {
+      proj[f] = col;
+      continue;
+    }
+    const rel = relByName.get(f);
+    if (rel?.fields?.length) {
+      // Local-side columns the relation resolver will read off the parent row.
+      // For "one" relations these are the FK columns; for "many" inverse
+      // relations they're the local PK/unique columns (typically already in
+      // the projection via the PK pass above).
+      for (const lc of rel.fields) {
+        const k = jsKeyOf(meta.columns, lc);
+        if (k) proj[k] = lc;
+      }
+    }
+  }
+  return proj;
+}
+
+/** Build a Drizzle SELECT chain projecting only the columns implied by `info`. */
+function selectProjected(
+  db: DrizzleLike,
+  meta: TableMeta,
+  info: GraphQLResolveInfo | undefined,
+): any {
+  const proj = projectionForSelection(meta, info);
+  return proj ? db.select(proj).from(meta.table) : db.select().from(meta.table);
+}
+
+/**
  * Translate the JSON `where` arg on a list/single/update/delete/many-relation
  * resolver into a Drizzle SQL fragment, or `undefined` when no usable where
  * was supplied. Throws a `GraphQLError`-friendly `Error` on malformed domains.
@@ -464,7 +556,7 @@ function buildRelationField(
           offset: { type: GraphQLInt },
         }
       : undefined,
-    resolve: async (parent, args, context) => {
+    resolve: async (parent, args, context, info) => {
       const localCols = rel.fields;
       const refCols = rel.references;
       if (!localCols?.length || !refCols?.length) return isMany ? [] : null;
@@ -497,7 +589,7 @@ function buildRelationField(
         const joinSql = conds.length === 1 ? conds[0] : and(...conds);
         const where = combineWhere(joinSql, userWhere);
         const rows = await applyListArgs(
-          db.select().from(refMeta.table as any),
+          selectProjected(db, refMeta, info),
           args,
           refMeta.columns,
           where,
@@ -505,12 +597,17 @@ function buildRelationField(
         return isMany ? rows : rows[0] ?? null;
       }
 
+      // Cache key includes the projected columns so two siblings that select
+      // different subfields don't share a loader (otherwise the second caller
+      // would see a row missing its requested columns).
+      const projection = projectionForSelection(refMeta, info);
+      const projKeys = projection ? Object.keys(projection).sort().join(",") : "*";
       const cacheKey = `${getTableName(parentMeta.table)}.${rel.fieldName}|${
         isMany ? "many" : "one"
-      }|${JSON.stringify(args?.where ?? null)}|${JSON.stringify(args?.orderBy ?? null)}`;
+      }|${JSON.stringify(args?.where ?? null)}|${JSON.stringify(args?.orderBy ?? null)}|${projKeys}`;
       let loader = batch!.get(cacheKey) as RelationLoader | undefined;
       if (!loader) {
-        loader = createRelationLoader(rel, refMeta, db, isMany, args, userWhere);
+        loader = createRelationLoader(rel, refMeta, db, isMany, args, userWhere, projection);
         batch!.set(cacheKey, loader);
       }
       return loader.load(keys[0]);
@@ -548,9 +645,16 @@ function createRelationLoader(
   isMany: boolean,
   args: any,
   userWhere: SQL | undefined,
+  projection: Record<string, Column> | undefined,
 ): RelationLoader {
   const refCol = rel.references![0];
   const refKeyName = jsKeyOf(refMeta.columns, refCol);
+  // Ensure the join column is in the projection — even if the client didn't
+  // request it, the loader needs it to bucket rows back to their parents.
+  let proj = projection;
+  if (proj && refKeyName && !(refKeyName in proj)) {
+    proj = { ...proj, [refKeyName]: refCol };
+  }
   type Pending = { key: unknown; resolve: (v: unknown) => void; reject: (e: unknown) => void };
   let queue: Pending[] = [];
   let scheduled = false;
@@ -567,8 +671,11 @@ function createRelationLoader(
       const uniqueKeys = Array.from(new Set(pending.map((p) => p.key)));
       const joinSql = inArray(refCol, uniqueKeys as any[]);
       const where = combineWhere(joinSql, userWhere);
+      const baseSelect = proj
+        ? db.select(proj).from(refMeta.table as any)
+        : db.select().from(refMeta.table as any);
       const rows: any[] = await applyListArgs(
-        db.select().from(refMeta.table as any),
+        baseSelect,
         // limit/offset are dropped at the per-batch level (they were only
         // safe to apply per-parent, which the canBatch gate already excluded
         // for `many` relations; for `one` relations args is undefined).
@@ -677,11 +784,11 @@ function buildListQueryField(
   return {
     type: listType(meta),
     args: listArgsConfig(meta),
-    resolve: async (_, args, gqlCtx) => {
+    resolve: async (_, args, gqlCtx, info) => {
       const extra = guard ? await guard(gqlCtx, "read") : undefined;
       const userWhere = whereDomainToSql(args?.where, meta, ctx, gqlCtx);
       const where = combineWhere(extra, userWhere);
-      return applyListArgs(db.select().from(meta.table), args, meta.columns, where);
+      return applyListArgs(selectProjected(db, meta, info), args, meta.columns, where);
     },
   };
 }
@@ -696,12 +803,12 @@ function buildSingleQueryField(
   return {
     type: meta.objectType,
     args: { where: { type: GraphQLJSON }, orderBy: { type: meta.orderByInput } },
-    resolve: async (_, args, gqlCtx) => {
+    resolve: async (_, args, gqlCtx, info) => {
       const extra = guard ? await guard(gqlCtx, "read") : undefined;
       const userWhere = whereDomainToSql(args?.where, meta, ctx, gqlCtx);
       const where = combineWhere(extra, userWhere);
       const rows = await applyListArgs(
-        db.select().from(meta.table),
+        selectProjected(db, meta, info),
         args,
         meta.columns,
         where,
