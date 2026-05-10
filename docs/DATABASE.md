@@ -22,14 +22,21 @@ All tables are defined in `src/db.ts`.
 - **`sessions`**
   - `token` is unique
   - `expiresAt` is updated to implement sliding expiry
-- **`groups`**
-  - `isAdmin=true` bypasses RBAC checks
-- **`userGroups`**
-  - join table linking users ↔ groups
-- **`accessRights`**
-  - per-group CRUD grants by `resource`
-- **`recordRules`**
-  - row-level rules by group/resource/perm type, stored as JSON-encoded “domain”
+- **`roles`** / **`accessRights`** / **`recordRules`**
+  - RBAC config tables. Each row has a unique `xid` (external id) that
+    matches an entry in code (`src/roles.ts`, `src/accessRights.ts`,
+    `src/recordRules.ts`). On server start, `createApp` runs
+    `syncRbacFromCode` in the background to delete rows whose xid is no
+    longer in code (cascading to `user_roles`/AR/RR), then upsert each
+    code entry by xid. The code is the source of truth.
+- **`userRoles`**
+  - join table linking users ↔ `roles.id`. Written by the admin
+    dashboard at runtime; cascade-deleted when its role disappears
+    from code.
+
+> Roles, access rights, and record rules previously lived only in code
+> (no DB tables). They are now declared in code AND mirrored to DB tables
+> via xid-based sync. See `docs/AUTH_AND_RBAC.md`.
 
 ## Migrations workflows
 

@@ -4,7 +4,7 @@
 
 ### Admin seed (recommended)
 
-Creates/updates an admin user, ensures an `Administration` group with `isAdmin=true` (bypasses RBAC), and adds the user to that group.
+Creates/updates an admin user and assigns them the code-defined `admin` role (which has `isAdmin: true` and bypasses RBAC).
 
 ```bash
 npm run seed:admin
@@ -18,7 +18,7 @@ Overrides:
 
 ### Demo RBAC seed
 
-Creates/updates two demo users and RBAC rules demonstrating record-level filtering on todos (demo user sees only their own assigned todos).
+Creates/updates two demo users and assigns `demo1` to the code-defined `demo` role, demonstrating record-level filtering on todos (demo user sees only their own assigned todos). The role's grants and record rule live in `src/accessRights.ts` and `src/recordRules.ts`.
 
 ```bash
 npx tsx src/scripts/seed-demo.ts

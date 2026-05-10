@@ -13,7 +13,7 @@ This app is a single-process Node.js server that serves a static frontend and a 
 - **GraphQL**: executable schema generated from the Drizzle schema namespace (`src/graphql/*`)
 - **Auth + sessions**: REST endpoints in `src/auth/routes.ts`; primitives in `src/auth/session.ts`; Hono middleware in `src/auth/middleware.ts`
 - **Admin REST**: `src/admin/routes.ts` (the dashboard talks to these, not GraphQL)
-- **RBAC**: Odoo-like groups/ACLs/record rules in `src/graphql/rbac/rbac.ts` with the per-request `RbacDb` wrapper in `src/graphql/rbac/rbacDb.ts`
+- **RBAC**: Odoo-like roles/ACLs/record rules. Roles, access rights, and record rules are declared in three TypeScript files (`src/roles.ts`, `src/accessRights.ts`, `src/recordRules.ts`); only `user_roles` membership is in the DB. Engine + per-request `RbacDb` wrapper live in the framework package (`packages/drizzle-graphql-rbac/src/graphql/rbac/`).
 
 ## Request flow
 
@@ -38,7 +38,8 @@ This app is a single-process Node.js server that serves a static frontend and a 
 - `src/auth/session.ts`: token, cookie, session-resolution primitives
 - `src/auth/middleware.ts`: Hono session middleware + `requireAuth` gate
 - `src/admin/routes.ts`: `/admin/users` REST endpoints (RBAC-enforced)
-- `src/graphql/rbac/rbac.ts`: RBAC engine (groups, ACLs, record rules / domains)
+- `src/roles.ts` / `src/accessRights.ts` / `src/recordRules.ts`: code-defined RBAC config
+- `packages/drizzle-graphql-rbac/src/graphql/rbac/rbac.ts`: RBAC engine (consumes the in-code config + `user_roles` membership, emits ACL grants and record-rule SQL)
 - `src/graphql/rbac/rbacDb.ts`: RBAC-bound DB proxy (enforce at query finalization)
 
 ## Operational docs

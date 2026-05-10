@@ -1,59 +1,76 @@
 /**
  * @module graphql/rbac
  *
- * Odoo-style RBAC engine. Three concepts:
+ * RBAC engine. Reads from a code-defined config that has been *synced* to
+ * matching DB tables (`roles`, `access_rights`, `record_rules`); the engine
+ * itself consults an in-memory snapshot of those tables, refreshed when
+ * the sync routine completes.
  *
- * - **Groups** (roles), with optional `parentGroupId` inheritance. Membership is
- *   transitive: being in a child group implies being in every ancestor group.
- *   A group flagged `isAdmin` short-circuits all checks for its members.
- * - **Access rights**: per-group CRUD booleans on a resource (the table's JS
- *   schema key, e.g. `"todos"`). Union across the user's effective groups.
- *   Deny-by-default if no group grants the action.
- * - **Record rules**: per-group row-level filters on a `(resource, permType)`
- *   pair, expressed as Odoo polish-prefix domains. Domains from groups granting
- *   the action are OR-combined and AND-ed into the resolver's `where`. The
- *   domain syntax and translator live in `../domain` — this engine only
- *   orchestrates parsing, placeholder injection, and combination.
+ * - **Roles** declared via {@link defineRoles}. Each role carries an `xid`
+ *   and an optional `isAdmin` flag. There is no inheritance: each role's
+ *   grants stand alone.
+ * - **Access rights** declared via {@link defineAccessRights}: per-role CRUD
+ *   booleans on a resource (the table's JS schema key, e.g. `"todos"`).
+ *   The user's effective grant set is the union across every role they hold.
+ *   Deny-by-default if no role grants the action.
+ * - **Record rules** declared via {@link defineRecordRules}: per-role
+ *   row-level filters keyed by `(resource, action)`, expressed as
+ *   Odoo-style polish-prefix domains. Domains from roles granting the
+ *   action are OR-combined and AND-ed into the resolver's `where`.
+ *
+ * Only the user → role mapping (`userRoles` table) is written at runtime.
+ * The admin dashboard manages assignments; everything else is a code change
+ * + restart (the sync routine reconciles the DB to the code on next start).
  *
  * Placeholders: the engine injects `{ "current_user.id": ctx.user?.id ?? null }`
  * when evaluating each rule. Unauthenticated callers get `null`, which makes
  * `=`/`!=` against the placeholder produce no row matches — the safe default.
  */
-import {
-  and,
-  eq,
-  inArray,
-  or,
-  type SQL,
-} from "drizzle-orm";
+import { eq, or, type SQL } from "drizzle-orm";
 import { GraphQLError } from "graphql";
 import type {
-  groups as groupsTable,
-  userGroups as userGroupsTable,
+  roles as rolesTable,
   accessRights as accessRightsTable,
   recordRules as recordRulesTable,
+  userRoles as userRolesTable,
   User,
 } from "../../tables.js";
 import type { ColumnMap } from "../builder/filters.js";
 import { parseDomain, domainToSql } from "../domain/domain.js";
 import {
   RbacCache,
-  type CachedGroups,
+  type CachedRoles,
   type RbacCacheOptions,
 } from "./cache.js";
+import type { Action, RbacConfig } from "./config.js";
+import { buildRbacConfig } from "./config.js";
+import {
+  emptySnapshot,
+  loadRbacSnapshot,
+  syncRbacFromCode,
+  type RbacSnapshot,
+  type SyncResult,
+} from "./sync.js";
 
+export type { Action } from "./config.js";
+
+/**
+ * Tables the engine reads. Apps re-export these from their schema module via
+ * `frameworkTables`.
+ */
 export interface RbacSchema {
-  groups: typeof groupsTable;
-  userGroups: typeof userGroupsTable;
+  roles: typeof rolesTable;
   accessRights: typeof accessRightsTable;
   recordRules: typeof recordRulesTable;
+  userRoles: typeof userRolesTable;
 }
 
 export interface RbacDb {
   select: (...args: any[]) => any;
+  insert: (...args: any[]) => any;
+  update: (...args: any[]) => any;
+  delete: (...args: any[]) => any;
 }
-
-export type Action = "create" | "read" | "update" | "delete";
 
 export interface RbacContext {
   user: User | null;
@@ -64,92 +81,12 @@ export interface RbacContext {
 const forbidden = (msg: string) =>
   new GraphQLError(msg, { extensions: { code: "FORBIDDEN" } });
 
-const ACTION_TO_PERM: Record<Action, "canCreate" | "canRead" | "canUpdate" | "canDelete"> = {
-  create: "canCreate",
-  read: "canRead",
-  update: "canUpdate",
-  delete: "canDelete",
-};
-
-/**
- * Tunables for {@link buildRbac}'s cross-request cache. Aliased from
- * {@link RbacCacheOptions} in `./cache.js`; re-exported here so the public
- * RBAC surface is one import.
- */
 export type BuildRbacOptions = RbacCacheOptions;
-
-/**
- * Resolve the user's effective group set: direct memberships plus every
- * ancestor reachable through `parentGroupId`. BFS with a visited set so a
- * cycle (parent_group_id pointing back at a descendant) terminates instead of
- * looping forever — the PRD calls this out as a required mitigation.
- */
-async function resolveEffectiveGroups(
-  db: RbacDb,
-  schema: RbacSchema,
-  userId: number,
-): Promise<CachedGroups> {
-  const direct: { groupId: number }[] = await db
-    .select({ groupId: schema.userGroups.groupId })
-    .from(schema.userGroups)
-    .where(eq(schema.userGroups.userId, userId));
-  if (!direct.length) return { ids: [], isAdmin: false };
-
-  const visited = new Set<number>();
-  let frontier = direct.map((r) => r.groupId);
-  let isAdmin = false;
-  while (frontier.length) {
-    const fresh = frontier.filter((id) => !visited.has(id));
-    for (const id of fresh) visited.add(id);
-    if (!fresh.length) break;
-    const rows: { id: number; parentGroupId: number | null; isAdmin: boolean }[] = await db
-      .select({
-        id: schema.groups.id,
-        parentGroupId: schema.groups.parentGroupId,
-        isAdmin: schema.groups.isAdmin,
-      })
-      .from(schema.groups)
-      .where(inArray(schema.groups.id, fresh));
-    if (rows.some((r) => r.isAdmin)) isAdmin = true;
-    frontier = rows
-      .map((r) => r.parentGroupId)
-      .filter((id): id is number => id != null);
-  }
-  return { ids: Array.from(visited), isAdmin };
-}
-
-async function getEffectiveGroups(
-  db: RbacDb,
-  schema: RbacSchema,
-  ctx: RbacContext,
-  cache: RbacCache<SQL>,
-): Promise<CachedGroups> {
-  if (!ctx.user) return { ids: [], isAdmin: false };
-  const userId = ctx.user.id;
-  const requestKey = `__rbac_groups:${userId}`;
-  // Layer 1: per-request memo — cheapest, always coherent within a request.
-  const cachedReq = ctx.batch?.get(requestKey) as CachedGroups | undefined;
-  if (cachedReq) return cachedReq;
-  // Layer 2: cross-request TTL+LRU cache — survives between requests, bounded.
-  const cachedGlobal = cache.getGroups(userId);
-  if (cachedGlobal) {
-    ctx.batch?.set(requestKey, cachedGlobal);
-    return cachedGlobal;
-  }
-  const out = await resolveEffectiveGroups(db, schema, userId);
-  ctx.batch?.set(requestKey, out);
-  cache.setGroups(userId, out);
-  return out;
-}
-
-// ---------------------------------------------------------------------------
-// Engine
-// ---------------------------------------------------------------------------
 
 /**
  * Hook passed to {@link buildSchema} as `options.rbac.enforce`. Throws
  * `FORBIDDEN` if the action is denied; otherwise returns an optional SQL
- * fragment to AND into the resolver's where (the union of matching record
+ * fragment to AND into the resolver's where (the OR of matching record
  * rules' domains).
  *
  * Admins bypass entirely — they get `{ where: undefined }` and never throw.
@@ -164,40 +101,88 @@ export interface RbacEnforce {
 }
 
 /**
- * Build the {@link RbacEnforce} hook bound to a Drizzle DB and the four RBAC
- * tables (`groups`, `userGroups`, `accessRights`, `recordRules`).
- *
- * The returned `enforce` function is the value passed to {@link buildSchema}'s
- * `options.rbac.enforce`. It performs three steps per call:
- *
- * 1. Resolve the caller's effective group set (direct + transitive via
- *    `parentGroupId`); admins short-circuit with no filter.
- * 2. Look up granting `accessRights` rows for `(resource, action)` across those
- *    groups. No granting row → `FORBIDDEN`.
- * 3. Collect `recordRules` for granting groups, parse each Odoo-style domain
- *    to SQL ({@link parseDomain} + {@link domainToSql}), AND rules within a
- *    group, OR across groups. A granting group with no rule means
- *    unrestricted access (returns `{}`).
- *
- * @param db Drizzle handle (any dialect; only `select()` is used).
- * @param schema The four RBAC tables, typically a slice of the project schema.
- * @returns `{ enforce }` — pass `enforce` to `buildSchema({ rbac: { enforce } })`.
+ * Result of {@link buildRbac}.
+ */
+export interface BuiltRbac {
+  /** The `enforce` hook to pass to `buildSchema` and `buildRbacDb`. */
+  enforce: RbacEnforce;
+  /** Drop a single user's cached entries. */
+  invalidateUser: (userId: number) => void;
+  /** Drop every cached entry. */
+  clearCache: () => void;
+  /**
+   * Run a sync against the DB, then refresh the engine's in-memory snapshot
+   * and clear the cache. Call after creation if you need to be sure the
+   * engine is in sync before serving traffic; otherwise let `createApp`
+   * fire it for you in the background.
+   */
+  sync: () => Promise<SyncResult>;
+  /** Re-read the snapshot from the DB (without running sync). */
+  refreshSnapshot: () => Promise<void>;
+  /** The current snapshot — exposed for tests / debugging. */
+  getSnapshot: () => RbacSnapshot;
+}
+
+/**
+ * Build the {@link RbacEnforce} hook bound to a Drizzle DB and the framework
+ * tables. The engine starts with an empty snapshot (deny-all); call
+ * {@link BuiltRbac.sync} (or let `createApp`'s background sync do it) to
+ * reconcile the DB with the code config and load the snapshot.
  */
 export function buildRbac(
   db: RbacDb,
   schema: RbacSchema,
+  config: RbacConfig,
   options: BuildRbacOptions = {},
-): { enforce: RbacEnforce; invalidateUser: (userId: number) => void; clearCache: () => void } {
+): BuiltRbac {
+  const resolved = buildRbacConfig(config);
   const cache = new RbacCache<SQL>(options);
+  let snapshot: RbacSnapshot = emptySnapshot();
+
+  const userRolesTab = schema.userRoles;
+
+  /**
+   * Resolve the caller's effective role-id set straight from `user_roles`.
+   * Roles whose row no longer exists in the snapshot are dropped (the FK
+   * prevents stale ids in practice, but the snapshot may briefly lag).
+   */
+  const resolveRoles = async (userId: number): Promise<CachedRoles> => {
+    const rows: { roleId: number }[] = await db
+      .select({ roleId: userRolesTab.roleId })
+      .from(userRolesTab)
+      .where(eq(userRolesTab.userId, userId));
+    const roleIds: number[] = [];
+    let isAdmin = false;
+    for (const { roleId } of rows) {
+      const meta = snapshot.rolesById.get(roleId);
+      if (!meta) continue;
+      roleIds.push(roleId);
+      if (meta.isAdmin) isAdmin = true;
+    }
+    return { roleIds, isAdmin };
+  };
+
+  const getRoles = async (ctx: RbacContext): Promise<CachedRoles> => {
+    if (!ctx.user) return { roleIds: [], isAdmin: false };
+    const userId = ctx.user.id;
+    const requestKey = `__rbac_roles:${userId}`;
+    const cachedReq = ctx.batch?.get(requestKey) as CachedRoles | undefined;
+    if (cachedReq) return cachedReq;
+    const cachedGlobal = cache.getRoles(userId);
+    if (cachedGlobal) {
+      ctx.batch?.set(requestKey, cachedGlobal);
+      return cachedGlobal;
+    }
+    const out = await resolveRoles(userId);
+    ctx.batch?.set(requestKey, out);
+    cache.setRoles(userId, out);
+    return out;
+  };
 
   const enforce: RbacEnforce = async (ctx, resource, action, columns) => {
     if (!ctx.user) throw forbidden("Not authenticated");
     const userId = ctx.user.id;
 
-    // Layered cache for the full enforce result — depends only on (user,
-    // resource, action) and the RBAC tables, so safe to share across requests
-    // up to TTL. Layer 1: per-request memo (cheapest, perfectly coherent).
-    // Layer 2: cross-request TTL+LRU cache (bounded; staleness up to TTL).
     const requestKey = `__rbac_enforce:${userId}:${resource}:${action}`;
     const cachedReq = ctx.batch?.get(requestKey) as
       | { where?: SQL }
@@ -226,93 +211,59 @@ export function buildRbac(
       throw forbidden(msg);
     };
 
-    const { ids, isAdmin } = await getEffectiveGroups(db, schema, ctx, cache);
+    const { roleIds, isAdmin } = await getRoles(ctx);
     if (isAdmin) return memo({});
-    if (!ids.length) denyAndThrow(`Access denied on '${resource}'`);
+    if (!roleIds.length) denyAndThrow(`Access denied on '${resource}'`);
 
-    const permCol = ACTION_TO_PERM[action];
-    const granting: { groupId: number }[] = await db
-      .select({ groupId: schema.accessRights.groupId })
-      .from(schema.accessRights)
-      .where(
-        and(
-          eq(schema.accessRights.resource, resource),
-          inArray(schema.accessRights.groupId, ids),
-          eq(schema.accessRights[permCol], true),
-        ),
-      );
-    if (!granting.length) {
+    // Roles whose access-rights row grants this (resource, action).
+    const grantingRoleIds: number[] = [];
+    for (const id of roleIds) {
+      const perResource = snapshot.accessByRole.get(id);
+      if (perResource?.get(resource)?.has(action)) grantingRoleIds.push(id);
+    }
+    if (!grantingRoleIds.length) {
       denyAndThrow(`Access denied on '${resource}' for '${action}'`);
     }
 
-    // Record rules: only those owned by groups that *also* grant the action
-    // contribute. A group with read=true and no rule grants unrestricted read;
-    // a group with read=true and a rule grants read filtered by that rule.
-    // Effective filter is the OR of those per-group filters.
-    const grantingIds = granting.map((g) => g.groupId);
-    const rules: { groupId: number; domain: string }[] = await db
-      .select({
-        groupId: schema.recordRules.groupId,
-        domain: schema.recordRules.domain,
-      })
-      .from(schema.recordRules)
-      .where(
-        and(
-          eq(schema.recordRules.resource, resource),
-          eq(schema.recordRules.permType, action),
-          inArray(schema.recordRules.groupId, grantingIds),
-        ),
-      );
-    if (!rules.length) return memo({});
-
-    const rulesByGroup = new Map<number, SQL[]>();
-    for (const r of rules) {
-      let parsed: unknown;
-      try {
-        parsed = JSON.parse(r.domain);
-      } catch {
-        throw new Error(`rbac: invalid JSON in record_rules.id (group ${r.groupId})`);
+    // Record rules: only those owned by roles that *also* grant the action
+    // contribute. A granting role with no rule means unrestricted access on
+    // that role's grant; if any granting role is unrestricted, the effective
+    // filter collapses to none.
+    const placeholders = { "current_user.id": ctx.user?.id ?? null };
+    const perRole: SQL[] = [];
+    let anyUnrestricted = false;
+    for (const id of grantingRoleIds) {
+      const domain = snapshot.rulesByRole.get(id)?.get(resource)?.get(action);
+      if (!domain) {
+        anyUnrestricted = true;
+        continue;
       }
-      if (!Array.isArray(parsed)) {
-        throw new Error(`rbac: record rule domain must be a JSON array`);
-      }
-      const sql = domainToSql(parseDomain(parsed), columns, {
-        "current_user.id": ctx.user?.id ?? null,
-      });
-      if (!sql) continue;
-      let arr = rulesByGroup.get(r.groupId);
-      if (!arr) rulesByGroup.set(r.groupId, (arr = []));
-      arr.push(sql);
+      const parsed = parseDomain(domain);
+      const sql = domainToSql(parsed, columns, placeholders);
+      if (sql) perRole.push(sql);
+      else anyUnrestricted = true;
     }
-
-    // A group with rules: AND its rules together (rules are *additional*
-    // restrictions on that group's grant). Across groups: OR — being in any
-    // qualifying group is enough.
-    const groupsWithRules = new Set(rulesByGroup.keys());
-    const groupsWithoutRules = grantingIds.filter((id) => !groupsWithRules.has(id));
-
-    // If any granting group has no rule, that group grants unrestricted access
-    // → no row filter needed.
-    if (groupsWithoutRules.length) return memo({});
-
-    const perGroup: SQL[] = [];
-    for (const arr of rulesByGroup.values()) {
-      perGroup.push(arr.length === 1 ? arr[0] : and(...arr)!);
-    }
-    if (!perGroup.length) return memo({});
-    const combined = perGroup.length === 1 ? perGroup[0] : or(...perGroup)!;
+    if (anyUnrestricted) return memo({});
+    if (!perRole.length) return memo({});
+    const combined = perRole.length === 1 ? perRole[0] : or(...perRole)!;
     return memo({ where: combined });
   };
 
   return {
     enforce,
-    /**
-     * Drop every cached entry for a user — call after mutations that change
-     * group membership, access rights, or record rules for that user, and on
-     * sign-out so a re-login picks up any out-of-band changes immediately.
-     */
     invalidateUser: (userId: number) => cache.invalidateUser(userId),
-    /** Drop every cached RBAC entry process-wide. */
     clearCache: () => cache.clear(),
+    sync: async () => {
+      const result = await syncRbacFromCode(db, schema, resolved);
+      snapshot = await loadRbacSnapshot(db, schema);
+      cache.clear();
+      return result;
+    },
+    refreshSnapshot: async () => {
+      snapshot = await loadRbacSnapshot(db, schema);
+      cache.clear();
+    },
+    getSnapshot: () => snapshot,
   };
 }
+

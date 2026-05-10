@@ -3,9 +3,9 @@
  *
  * Cross-request RBAC cache. Keeps two bounded TTL+LRU stores:
  *
- * - **Effective groups** per user (`userId → { ids, isAdmin }`) — the result of
- *   walking direct memberships plus every ancestor reachable through
- *   `parentGroupId`.
+ * - **Effective roles** per user (`userId → { roleIds, isAdmin }`) — the
+ *   role row ids the user is assigned in the `userRoles` table, plus a
+ *   precomputed `isAdmin` flag if any of those roles is admin-flagged.
  * - **Enforce result** per `(userId, resource, action)` — either the granted
  *   record-rule SQL fragment (or `undefined` for unrestricted) or a
  *   `__forbidden` marker carrying the denial message so cached denials throw
@@ -14,12 +14,14 @@
  * Both stores share one TTL (`cacheTtlMs`). Bounded `maxEntries` keeps memory
  * predictable; eviction is LRU on read so the hot working set stays warm.
  *
- * Coherence model: entries are valid up to TTL. Callers that mutate RBAC
- * tables out-of-band (admin tooling, sign-out, etc.) should call
- * {@link RbacCache.invalidateUser} so the next request rereads from the DB.
+ * Coherence model: entries are valid up to TTL. Callers that mutate a user's
+ * role assignments out-of-band (the admin dashboard, sign-out, etc.) should
+ * call {@link RbacCache.invalidateUser} so the next request rereads from the
+ * DB. Role/access/rule definitions are code-defined and can only change on
+ * process restart, so they don't need invalidation.
  */
-export interface CachedGroups {
-  ids: number[];
+export interface CachedRoles {
+  roleIds: number[];
   isAdmin: boolean;
 }
 
@@ -31,17 +33,18 @@ export interface RbacCacheOptions {
   /**
    * TTL in milliseconds for cross-request RBAC caches. `0` (the default)
    * disables cross-request caching — `RbacCache.enabled` returns `false`
-   * and every read is a miss. Callers that mutate RBAC tables out-of-band
-   * should either keep this `0` or call `invalidateUser` after the mutation.
+   * and every read is a miss. Callers that mutate user-role membership
+   * out-of-band should either keep this `0` or call `invalidateUser` after
+   * the mutation.
    * @default 0
    */
   cacheTtlMs?: number;
   /**
-   * Max entries in the per-user effective-groups cache (LRU eviction beyond
-   * this). Each entry is small (an array of group ids).
+   * Max entries in the per-user effective-roles cache (LRU eviction beyond
+   * this). Each entry is small (an array of role keys).
    * @default 5000
    */
-  groupsCacheMax?: number;
+  rolesCacheMax?: number;
   /**
    * Max entries in the per-`(user,resource,action)` enforce-result cache (LRU
    * eviction beyond this). One entry per distinct triple a user actually
@@ -94,22 +97,18 @@ export class TtlLruCache<V> {
 }
 
 /**
- * Two-store RBAC cache (effective groups + enforce result), each backed by a
+ * Two-store RBAC cache (effective roles + enforce result), each backed by a
  * {@link TtlLruCache}. When TTL is `0` both stores are `null` and every
  * accessor is a no-op miss — callers can use the same instance whether or not
  * caching is enabled.
- *
- * Type parameter `S` is the SQL fragment type the consumer's `enforce`
- * returns (typically `drizzle-orm.SQL`); kept generic here so the cache
- * module has no Drizzle dependency.
  */
 export class RbacCache<S = unknown> {
-  private readonly groups: TtlLruCache<CachedGroups> | null;
+  private readonly roles: TtlLruCache<CachedRoles> | null;
   private readonly enforce: TtlLruCache<EnforceEntry<S>> | null;
 
   constructor(options: RbacCacheOptions = {}) {
     const ttl = options.cacheTtlMs ?? 0;
-    this.groups = ttl > 0 ? new TtlLruCache<CachedGroups>(options.groupsCacheMax ?? 5000, ttl) : null;
+    this.roles = ttl > 0 ? new TtlLruCache<CachedRoles>(options.rolesCacheMax ?? 5000, ttl) : null;
     this.enforce = ttl > 0
       ? new TtlLruCache<EnforceEntry<S>>(options.enforceCacheMax ?? 20000, ttl)
       : null;
@@ -117,14 +116,14 @@ export class RbacCache<S = unknown> {
 
   /** `true` when cross-request caching is on (TTL > 0). */
   get enabled(): boolean {
-    return this.groups !== null;
+    return this.roles !== null;
   }
 
-  getGroups(userId: number): CachedGroups | undefined {
-    return this.groups?.get(String(userId));
+  getRoles(userId: number): CachedRoles | undefined {
+    return this.roles?.get(String(userId));
   }
-  setGroups(userId: number, value: CachedGroups): void {
-    this.groups?.set(String(userId), value);
+  setRoles(userId: number, value: CachedRoles): void {
+    this.roles?.set(String(userId), value);
   }
 
   private enforceKey(userId: number, resource: string, action: string): string {
@@ -142,9 +141,9 @@ export class RbacCache<S = unknown> {
     this.enforce?.set(this.enforceKey(userId, resource, action), value);
   }
 
-  /** Drop every entry for one user (groups + every (resource, action) triple). */
+  /** Drop every entry for one user (roles + every (resource, action) triple). */
   invalidateUser(userId: number): void {
-    this.groups?.delete(String(userId));
+    this.roles?.delete(String(userId));
     if (!this.enforce) return;
     const prefix = `${userId}:`;
     for (const k of this.enforce.keys()) {
@@ -154,7 +153,7 @@ export class RbacCache<S = unknown> {
 
   /** Drop the entire cache. */
   clear(): void {
-    this.groups?.clear();
+    this.roles?.clear();
     this.enforce?.clear();
   }
 }

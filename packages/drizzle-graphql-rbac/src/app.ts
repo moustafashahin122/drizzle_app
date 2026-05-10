@@ -5,26 +5,30 @@
  *
  * 1. {@link buildSchema} — auto-generated GraphQL CRUD over the user's Drizzle
  *    schema (todos, plus the framework tables).
- * 2. {@link buildRbac} — RBAC engine reading `groups` / `accessRights` /
- *    `recordRules`.
+ * 2. {@link buildRbac} — RBAC engine driven by the in-code role / access /
+ *    record-rule configs and the persisted `userRoles` membership table.
  * 3. {@link buildAuthRoutes} — REST `/auth/{register,login,logout,me}`.
- * 4. {@link buildAdminRoutes} — REST `/admin/users` (RBAC-enforced).
+ * 4. {@link buildAdminRoutes} — REST `/admin/users` (RBAC-enforced) plus
+ *    `/admin/users/:id/roles` for managing role membership.
  * 5. A Yoga GraphQL handler at `POST /graphql` that consumes the same
  *    session middleware so resolvers see the authenticated user.
  *
- * The caller supplies the Drizzle `db` and a schema namespace whose
- * properties include — at minimum — the framework tables. Anything else in
- * the namespace becomes a GraphQL resource automatically.
+ * The caller supplies the Drizzle `db`, a schema namespace whose properties
+ * include — at minimum — the framework tables, and the RBAC config (three
+ * tiny TypeScript files: roles, access rights, record rules).
  *
  * @example
  * import { createApp } from "drizzle-graphql-rbac";
  * import { serve } from "@hono/node-server";
  * import * as schema from "./db.js";
+ * import { roles } from "./roles.js";
+ * import { accessRights } from "./accessRights.js";
+ * import { recordRules } from "./recordRules.js";
  *
- * const app = createApp({
+ * const { app } = createApp({
  *   db: schema.db,
  *   schema,
- *   hiddenOutputColumns: { users: ["passwordHash"] },
+ *   rbac: { roles, accessRights, recordRules },
  * });
  * serve({ fetch: app.fetch, port: 3000 });
  */
@@ -33,22 +37,45 @@ import { logger as honoLogger } from "hono/logger";
 import { createYoga } from "graphql-yoga";
 import { buildSchema, type BuildSchemaOptions } from "./graphql/builder/builder.js";
 import { buildRbac, type BuildRbacOptions } from "./graphql/rbac/rbac.js";
+import type { RbacConfig } from "./graphql/rbac/config.js";
+import { mergeFrameworkRbac } from "./frameworkRbac.js";
 import { buildRbacDb, type RbacDb } from "./graphql/rbac/rbacDb.js";
 import { buildAuthRoutes } from "./auth/routes.js";
 import { buildAdminRoutes } from "./admin/routes.js";
 import { sessionMiddleware, type AuthEnv } from "./auth/middleware.js";
 import type { SessionDb, SessionSchema } from "./auth/session.js";
-import type { User, Session, users as usersTableType } from "./tables.js";
+import type {
+  User,
+  Session,
+  users as usersTableType,
+  userRoles as userRolesTableType,
+  roles as rolesTableType,
+  accessRights as accessRightsTableType,
+  recordRules as recordRulesTableType,
+} from "./tables.js";
 
 export interface CreateAppOptions {
   /** A Drizzle DB instance (any dialect). */
   db: SessionDb;
   /**
-   * The full schema namespace: framework tables (users, sessions, groups,
-   * userGroups, accessRights, recordRules) plus any app-specific tables.
-   * Pass via `import * as schema from "./db.js"`.
+   * The full schema namespace: framework tables (users, sessions, userRoles)
+   * plus any app-specific tables. Pass via `import * as schema from "./db.js"`.
    */
-  schema: Record<string, unknown> & SessionSchema & { users: typeof usersTableType };
+  schema: Record<string, unknown> & SessionSchema & {
+    users: typeof usersTableType;
+    userRoles: typeof userRolesTableType;
+    roles: typeof rolesTableType;
+    accessRights: typeof accessRightsTableType;
+    recordRules: typeof recordRulesTableType;
+  };
+  /**
+   * The code-defined RBAC config — roles, access rights, and record rules.
+   * Conventionally three small files in the host app: `src/roles.ts`,
+   * `src/accessRights.ts`, `src/recordRules.ts`. The framework re-exports
+   * `defineRoles` / `defineAccessRights` / `defineRecordRules` helpers for
+   * IDE autocomplete; they are identity functions at runtime.
+   */
+  rbac: RbacConfig;
   /**
    * Forwarded to {@link buildSchema}. Use this to hide sensitive output
    * columns; defaults to hiding `users.passwordHash`.
@@ -84,10 +111,10 @@ export interface CreateAppOptions {
    */
   logger?: boolean | ((message: string, ...rest: string[]) => void);
   /**
-   * Tunables for the cross-request RBAC cache (effective groups + per-user
+   * Tunables for the cross-request RBAC cache (effective roles + per-user
    * enforce results). Defaults to a 30-minute TTL with bounded size; pass
    * `{ cacheTtlMs: 0 }` to disable. Call the returned `invalidateUser`
-   * after admin mutations that change a user's groups / rights / rules.
+   * after admin mutations that change a user's role assignments.
    */
   rbacCache?: BuildRbacOptions;
 }
@@ -97,10 +124,19 @@ export interface CreatedApp {
   app: Hono<AuthEnv>;
   /** Per-request RBAC-bound DB factory; re-exported so callers can write custom routes. */
   rdbFor: (ctx: { user: User | null; batch?: Map<string, unknown> }) => RbacDb;
-  /** Drop the RBAC cache for one user (call after admin mutations to their groups / rights). */
+  /** Drop the RBAC cache for one user (call after admin mutations to their role assignments). */
   invalidateRbacUser: (userId: number) => void;
-  /** Drop the entire RBAC cache (e.g. on bulk-import of access_rights). */
+  /** Drop the entire RBAC cache. */
   clearRbacCache: () => void;
+  /**
+   * Resolves once the RBAC config has been synced from code to DB and the
+   * engine snapshot has loaded. Awaits in tests; in production the server
+   * starts listening immediately and the sync runs in the background, so
+   * the very first requests may be denied (deny-all default) until the
+   * sync completes — usually a few milliseconds against SQLite. Awaiting
+   * this is optional.
+   */
+  rbacReady: Promise<void>;
 }
 
 /**
@@ -111,6 +147,7 @@ export function createApp(opts: CreateAppOptions): CreatedApp {
   const {
     db,
     schema,
+    rbac: rbacConfig,
     hiddenOutputColumns = { users: ["passwordHash"] },
     typeNames,
     extraQueryFields,
@@ -127,14 +164,20 @@ export function createApp(opts: CreateAppOptions): CreatedApp {
     sessions: schema.sessions,
   };
 
+  // Merge framework-owned roles (currently just `admin`) into the
+  // user-supplied config. Apps should not redefine `admin`; if they do,
+  // mergeFrameworkRbac throws.
+  const mergedRbac = mergeFrameworkRbac(rbacConfig);
+
   const rbac = buildRbac(
     db,
     {
-      groups: schema.groups as any,
-      userGroups: schema.userGroups as any,
-      accessRights: schema.accessRights as any,
-      recordRules: schema.recordRules as any,
+      roles: schema.roles,
+      accessRights: schema.accessRights,
+      recordRules: schema.recordRules,
+      userRoles: schema.userRoles,
     },
+    mergedRbac,
     // Default to 30-minute cross-request RBAC cache with bounded size; the
     // engine itself defaults to off, so apps that want freshness on every
     // mutation (or run the engine directly in tests) opt out cleanly.
@@ -196,7 +239,11 @@ export function createApp(opts: CreateAppOptions): CreatedApp {
       db,
       schema: sessionSchema,
       usersTable: schema.users,
+      userRolesTable: schema.userRoles,
+      rolesTable: schema.roles,
       rdbFor,
+      enforce: rbac.enforce,
+      onRolesChanged: rbac.invalidateUser,
     }),
   );
 
@@ -217,10 +264,31 @@ export function createApp(opts: CreateAppOptions): CreatedApp {
     });
   }
 
+  // Kick off the RBAC sync in the background. The server's `app.fetch` is
+  // returned immediately; sync runs via `queueMicrotask` so the host's
+  // `serve(...)` call can begin listening right away. Tests can await
+  // `rbacReady` to make sure the snapshot is loaded before issuing requests.
+  const rbacReady = new Promise<void>((resolve, reject) => {
+    queueMicrotask(() => {
+      rbac
+        .sync()
+        .then(() => resolve())
+        .catch((err) => {
+          // eslint-disable-next-line no-console
+          console.error("[rbac] background sync failed:", err);
+          reject(err);
+        });
+    });
+  });
+  // Don't crash the process if nothing awaits the promise; the error has
+  // already been logged above.
+  rbacReady.catch(() => {});
+
   return {
     app,
     rdbFor,
     invalidateRbacUser: rbac.invalidateUser,
     clearRbacCache: rbac.clearCache,
+    rbacReady,
   };
 }

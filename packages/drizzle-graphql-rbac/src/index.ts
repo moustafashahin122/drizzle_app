@@ -3,9 +3,10 @@
  *
  * Public surface of the framework. The most common entry point is
  * {@link createApp} — it returns a Hono app with REST auth, REST admin user
- * CRUD, an auto-generated GraphQL endpoint, and RBAC wired through all
- * three. Everything else here is exposed for power users who want to
- * compose a custom pipeline.
+ * CRUD + role membership, an auto-generated GraphQL endpoint, and RBAC
+ * wired through all three. Roles, access rights, and record rules are
+ * declared in code (see {@link defineRoles} / {@link defineAccessRights} /
+ * {@link defineRecordRules}); only user-role assignments live in the DB.
  */
 
 // One-call composition root.
@@ -16,18 +17,18 @@ export type { CreateAppOptions, CreatedApp } from "./app.js";
 export {
   users,
   sessions,
-  groups,
-  userGroups,
+  roles,
   accessRights,
   recordRules,
+  userRoles,
   frameworkTables,
 } from "./tables.js";
 export type {
   User,
   NewUser,
   Session,
-  Group,
-  UserGroup,
+  UserRole,
+  Role,
   AccessRight,
   RecordRule,
 } from "./tables.js";
@@ -73,10 +74,57 @@ export type {
 export { buildRbacDb, RbacDb } from "./graphql/rbac/rbacDb.js";
 export type { RbacDbDeps } from "./graphql/rbac/rbacDb.js";
 
+// Framework-owned RBAC entries (the built-in `admin` role) + helper to
+// merge them into a user config when wiring the engine directly.
+export {
+  FRAMEWORK_ROLES,
+  FRAMEWORK_ACCESS_RIGHTS,
+  FRAMEWORK_RECORD_RULES,
+  FRAMEWORK_XID_PREFIX,
+  mergeFrameworkRbac,
+} from "./frameworkRbac.js";
+
+// Code-defined RBAC config helpers + types.
+export {
+  defineRoles,
+  defineAccessRights,
+  defineRecordRules,
+  buildRbacConfig,
+} from "./graphql/rbac/config.js";
+export type {
+  RbacConfig,
+  RolesConfig,
+  AccessRightsConfig,
+  RecordRulesConfig,
+  ResolvedRbacConfig,
+  ResolvedRole,
+  ResolvedAccessRight,
+  ResolvedRecordRule,
+  RoleDef,
+  ResourceAccessDef,
+  RecordRuleDef,
+  Domain,
+} from "./graphql/rbac/config.js";
+
+// RBAC sync (DB ↔ code reconciliation) — exposed for seed scripts and
+// tests that want to populate the DB before issuing requests.
+export {
+  syncRbacFromCode,
+  loadRbacSnapshot,
+  syncAndSnapshot,
+  emptySnapshot,
+} from "./graphql/rbac/sync.js";
+export type {
+  SyncResult,
+  RbacSnapshot,
+  SyncSchema,
+  SyncDb,
+} from "./graphql/rbac/sync.js";
+
 // RBAC cache — exposed for advanced consumers building a custom enforce.
 export { RbacCache, TtlLruCache } from "./graphql/rbac/cache.js";
 export type {
-  CachedGroups,
+  CachedRoles,
   EnforceEntry,
   RbacCacheOptions,
 } from "./graphql/rbac/cache.js";

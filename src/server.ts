@@ -1,10 +1,14 @@
 import { serve } from "@hono/node-server";
 import { createApp } from "drizzle-graphql-rbac";
 import * as schema from "./db.js";
+import { roles } from "./roles.js";
+import { accessRights } from "./accessRights.js";
+import { recordRules } from "./recordRules.js";
 
 const { app } = createApp({
   db: schema.db,
   schema,
+  rbac: { roles, accessRights, recordRules },
   hiddenOutputColumns: { users: ["passwordHash"] },
   publicDir: "./public",
 });

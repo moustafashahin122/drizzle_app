@@ -4,7 +4,7 @@
 
 ### 1.1 Purpose
 
-Build a flexible and extensible **Role-Based Access Control (RBAC)** system that controls access to data and actions within the framework, similar to Odoo’s security architecture (groups, access rights, record rules).
+Build a flexible and extensible **Role-Based Access Control (RBAC)** system that controls access to data and actions within the framework, similar to Odoo's security architecture (roles, access rights, record rules).
 
 ### 1.2 Goals
 
@@ -26,12 +26,16 @@ Build a flexible and extensible **Role-Based Access Control (RBAC)** system that
 Odoo RBAC consists of:
 
 * Users
-* Groups (Roles)
+* Roles (called "groups" in Odoo)
 * Access Rights (CRUD per model)
 * Record Rules (row-level security)
-* Implied groups (hierarchical roles)
+* Implied roles (hierarchical inheritance)
 
-This system generalizes the same concept.
+This system generalizes the same concept, but moves the role catalog,
+access rights, and record rules **into TypeScript code** (three small files
+per app) rather than the database. Only the `user_roles` join table is
+persisted, so the admin dashboard can move users between roles at runtime
+without a code change.
 
 ---
 
@@ -39,79 +43,91 @@ This system generalizes the same concept.
 
 ### 3.1 Core Components
 
-* User
-* Role (Group)
-* Permission (Access Rights)
-* Policy (Record Rules / ABAC layer)
-* Resource (Model / Entity)
+* User (DB)
+* Role (code — `defineRoles`)
+* Permission / Access Rights (code — `defineAccessRights`)
+* Policy / Record Rules (code — `defineRecordRules`)
+* User → Role assignment (DB — `user_roles`)
+* Resource (Drizzle table JS key, e.g. `"todos"`)
 
 ---
 
 ## 4. Data Model
 
-### 4.1 User
+### 4.1 User (DB)
 
 * id
 * name
 * email
-* roles: List<Role>
 * active
+* createdAt
+* (roles via `user_roles`)
 
----
+### 4.2 User → Role (DB)
 
-### 4.2 Role (Group)
+`user_roles` is the only role-related table.
 
-* id
-* name
-* parent_role_id (optional inheritance)
-* permissions: List<Permission>
+| Field    | Description                          |
+| -------- | ------------------------------------ |
+| id       | unique                               |
+| user_id  | FK → users.id                        |
+| role_key | string id of a role from the code config |
 
----
+Role keys aren't foreign-keyed; rows referencing a role that no longer
+exists in code are simply ignored when computing effective access.
 
-### 4.3 Permission (Access Control List)
+### 4.3 Role (code)
 
-Defines CRUD access on a resource.
+Declared in `src/roles.ts` with `defineRoles({ ... })`.
 
-| Field      | Description      |
-| ---------- | ---------------- |
-| id         | unique           |
-| role_id    | FK               |
-| resource   | model/table name |
-| can_create | bool             |
-| can_read   | bool             |
-| can_update | bool             |
-| can_delete | bool             |
-
----
-
-### 4.4 Record Rule (Policy Engine)
-
-Row-level security rules.
-
-| Field             | Description               |
-| ----------------- | ------------------------- |
-| id                | unique                    |
-| role_id           | FK                        |
-| resource          | model                     |
-| domain_expression | rule logic                |
-| perm_type         | create/read/update/delete |
-
-Example:
-
-```json
-{
-  "resource": "invoice",
-  "perm_type": "read",
-  "domain": "user_id = current_user.id"
-}
+```ts
+defineRoles({
+  admin: { isAdmin: true },
+  user:  {},
+  demo:  { parent: "user" },
+});
 ```
 
----
+* key (object key) — string id
+* `isAdmin` (optional) — short-circuits every check for members
+* `parent` (optional) — inherits the parent's grants transitively
 
-### 4.5 Role Inheritance
+### 4.4 Access Rights (code)
 
-* Roles may inherit from parent roles
-* Effective permissions = union(parent + child)
+Declared in `src/accessRights.ts` with `defineAccessRights({ ... })`.
+
+```ts
+defineAccessRights({
+  demo: {
+    todos: { create: true, read: true, update: true, delete: true },
+  },
+});
+```
+
+The shape is `role -> resource -> { create?, read?, update?, delete? }`.
+A role with a missing entry has no grant on that resource. Effective
+grants are the union of the role's own + every ancestor's.
+
+### 4.5 Record Rules (code)
+
+Declared in `src/recordRules.ts` with `defineRecordRules({ ... })`.
+
+```ts
+const own = [["assigneeId", "=", "current_user.id"]];
+defineRecordRules({
+  demo: { todos: { read: own, update: own, delete: own } },
+});
+```
+
+Shape: `role -> resource -> action -> domain` (Odoo-style polish-prefix
+array). Multiple rules contributed by ancestor roles are AND-ed within
+a role; across roles the engine OR-s them.
+
+### 4.6 Role Inheritance
+
+* Roles may declare a `parent` role
+* Effective grants = union(self + ancestors)
+* Cycles are detected and throw at config-build time
 
 ---
 
@@ -119,9 +135,8 @@ Example:
 
 ### Step 1: Identify user context
 
-* user_id
-* roles
-* tenant/company
+* user_id (from session)
+* role keys from `user_roles`, expanded via the `parent` chain
 
 ### Step 2: ACL check
 
@@ -144,27 +159,30 @@ filtered_records = apply_domain_filters(user_roles, resource)
 
 ### 6.1 Check Permission
 
-```python
-has_access(user, resource, action) -> bool
+```ts
+enforce(ctx, resource, action, columns) -> { where?: SQL }
 ```
 
 ### 6.2 Filter Records
 
-```python
-apply_rules(user, resource, queryset) -> queryset
+`rbacDb` automatically AND-injects the record-rule SQL into resolvers'
+where clauses; manual callers can use the SQL fragment from `enforce`.
+
+### 6.3 Assign Role (admin REST)
+
+```
+POST   /admin/users/:id/roles      { roleKey }
+DELETE /admin/users/:id/roles/:key
 ```
 
-### 6.3 Assign Role
+### 6.4 Define Role (code)
 
-```python
-assign_role(user_id, role_id)
+```ts
+// src/roles.ts
+export const roles = defineRoles({ ... });
 ```
 
-### 6.4 Create Role
-
-```python
-create_role(name, permissions, parent_role=None)
-```
+Roles cannot be created at runtime; the config is loaded once at startup.
 
 ---
 
@@ -172,19 +190,17 @@ create_role(name, permissions, parent_role=None)
 
 Operators:
 
-* =
-* !=
-* in
-* not in
-* >
-* <
-* AND
-* OR
+* `=`, `!=`
+* `in`, `not in`
+* `>`, `<`, `>=`, `<=`
+* `like`, `ilike`, `not like`, `not ilike`
+* `=`/`!=` against `null` (is null / is not null)
+* `AND`, `OR`, `NOT` combinators
 
 Example:
 
 ```
-[ ("state", "!=", "draft")]
+[ ["state", "!=", "draft"] ]
 ```
 
 ---
@@ -194,8 +210,7 @@ Example:
 * Deny by default
 * Enforce at service/DB layer
 * No client-side trust
-* Prevent role inheritance cycles
-
+* Prevent role inheritance cycles (rejected at config-build time)
 
 ---
 
@@ -203,7 +218,7 @@ Example:
 
 * Permission check < 5ms average
 * DB-level filtering where possible
-* Cached role resolution
+* Cached role resolution (TTL+LRU on `(userId)` and `(userId, resource, action)`)
 * Lazy evaluation of policies
 
 ---
@@ -244,7 +259,7 @@ Track permission decisions
 * 100% endpoint coverage
 * Zero unauthorized access incidents
 * <10% request overhead
-* Simple role configuration without code changes
+* Simple role configuration in three small files per app
 
 ---
 
@@ -254,14 +269,14 @@ Track permission decisions
 | ------------------ | --------------------- |
 | Complex rules      | caching + grouping    |
 | Performance issues | DB filtering          |
-| Misconfiguration   | validation tools      |
+| Misconfiguration   | validation at startup |
 | Circular roles     | graph cycle detection |
 
 ---
 
 ## 14. Future Improvements
 
-* UI role editor
+* UI role editor (config-aware, not DB-driven)
 * Role graph visualization
 * AI-assisted role suggestions
 * Permission simulation tool

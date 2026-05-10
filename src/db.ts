@@ -6,10 +6,10 @@ import {
   frameworkTables,
   users,
   sessions,
-  groups,
-  userGroups,
+  roles,
   accessRights,
   recordRules,
+  userRoles,
 } from "drizzle-graphql-rbac";
 
 // Re-export framework tables so the rest of the demo can keep importing
@@ -17,19 +17,16 @@ import {
 export {
   users,
   sessions,
-  groups,
-  userGroups,
+  roles,
   accessRights,
   recordRules,
+  userRoles,
 } from "drizzle-graphql-rbac";
 export type {
   User,
   NewUser,
   Session,
-  Group,
-  UserGroup,
-  AccessRight,
-  RecordRule,
+  UserRole,
 } from "drizzle-graphql-rbac";
 
 // Demo-specific table — the only one this app owns.

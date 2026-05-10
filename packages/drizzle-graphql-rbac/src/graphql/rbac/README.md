@@ -1,73 +1,81 @@
 # `graphql/rbac` — Odoo-style access control
 
-Three-layer access control:
+Three-layer access control, declared in code and synced to DB tables by `xid`:
 
-1. **Groups** (roles) with optional `parentGroupId` inheritance. Membership is
-   transitive — being in a child group implies being in every ancestor. A
-   group flagged `isAdmin` short-circuits all checks.
-2. **Access rights** — per-group CRUD booleans on a resource (a table's JS
-   schema key, e.g. `"todos"`). Union across the user's effective groups.
-   Deny-by-default if no group grants the action.
-3. **Record rules** — per-group row-level filters on `(resource, permType)`,
-   expressed as Odoo polish-prefix domains. Domains from groups granting the
+1. **Roles** with optional `isAdmin` short-circuit. There is no inheritance —
+   each role's grants stand alone.
+2. **Access rights** — per-role CRUD booleans on a resource (a table's JS
+   schema key, e.g. `"todos"`). Union across the user's roles. Deny-by-default
+   if no role grants the action.
+3. **Record rules** — per-role row-level filters on `(resource, action)`,
+   expressed as Odoo polish-prefix domains. Domains from roles granting the
    action are OR-combined and AND-ed into the resolver's `where`.
+
+All three are declared in TypeScript with `xid`-bearing entries; `syncRbacFromCode`
+materializes them into the matching DB tables on server start. The user → role
+assignment lives in the `user_roles` table (FK to `roles.id`).
 
 ## Files
 
 | File             | Role                                                                                        |
 |------------------|---------------------------------------------------------------------------------------------|
-| `rbac.ts`        | Engine: group resolution, record-rule combination, `enforce` factory. Delegates domain parsing/translation to `../domain`. |
+| `config.ts`      | `defineRoles` / `defineAccessRights` / `defineRecordRules` helpers + `buildRbacConfig` validation (xid uniqueness, unknown role refs, unknown action keys, missing xids). |
+| `sync.ts`        | `syncRbacFromCode` (DB ↔ code reconciliation by `xid`) + `loadRbacSnapshot` (engine snapshot loader). |
+| `rbac.ts`        | Engine: snapshot-driven `enforce` factory. Delegates domain parsing/translation to `../domain`. |
+| `cache.ts`       | Two-store TTL+LRU cache (effective roles + per-`(user,resource,action)` enforce result).    |
 | `rbacDb.ts`      | Per-request Drizzle wrapper that runs `enforce` automatically on chained calls.             |
 | `rbac.test.ts`   | Engine tests: domains, leaf operators, ACL semantics, record-rule combination.              |
 | `rbacDb.test.ts` | Wrapper tests: where-injection, gated insert, bypass passthrough, raw escape hatch.         |
+| `sync.test.ts`   | Sync tests: insert / update / cascade-delete / idempotency.                                  |
 
 ## Public API
 
 ```ts
 import { buildRbac } from "./graphql/rbac/rbac.js";
 import { buildRbacDb, RbacDb } from "./graphql/rbac/rbacDb.js";
-// Domain syntax helpers live in their own module:
+import {
+  defineRoles,
+  defineAccessRights,
+  defineRecordRules,
+} from "./graphql/rbac/config.js";
+import {
+  syncRbacFromCode,
+  loadRbacSnapshot,
+  syncAndSnapshot,
+} from "./graphql/rbac/sync.js";
+// Domain syntax helpers:
 import { parseDomain, domainToSql } from "./graphql/domain/domain.js";
-import type {
-  RbacContext,
-  RbacEnforce,
-  RbacSchema,
-  Action,
-} from "./graphql/rbac/rbac.js";
 ```
 
-- `buildRbac(db, { groups, userGroups, accessRights, recordRules })` →
-  `{ enforce }`. Pass `enforce` to `buildSchema({ rbac: { enforce } })` so
-  every auto-CRUD resolver checks access before hitting the DB.
-- `buildRbacDb({ db, schema, enforce, bypassResources? })` →
-  `(ctx) => RbacDb`. Per-request factory; the returned wrapper runs `enforce`
-  on every `select` / `update` / `delete` / `insert` call and AND-injects the
-  record-rule SQL into the user's `where`.
-- `parseDomain` / `domainToSql` — re-exported from `../domain`. The engine
-  passes `{ "current_user.id": ctx.user?.id ?? null }` as the placeholder map
-  on every call. See `../domain/README.md` for the full syntax reference.
+- `defineRoles({...})` / `defineAccessRights({...})` / `defineRecordRules({...})`
+  are identity helpers that exist for IDE autocomplete on role keys. Each
+  entry **must** include a string `xid`.
+- `buildRbac(db, { roles, accessRights, recordRules, userRoles }, config)` →
+  `{ enforce, invalidateUser, clearCache, sync, refreshSnapshot, getSnapshot }`.
+  The engine starts with an empty snapshot (deny-all); call `sync()` (or let
+  `createApp` do it for you in the background) to reconcile and load.
+- `syncRbacFromCode(db, schema, resolved)` reconciles the DB (delete missing
+  xids, upsert by xid, content-compare on update) and returns counts.
+- `loadRbacSnapshot(db, schema)` reads the four tables into the runtime
+  snapshot the engine consults.
 
-Example rule: `[["assigneeId", "=", "current_user.id"]]` — read only my own
-todos.
+Example rule: `[["assigneeId", "=", "current_user.id"]]` — read only my own todos.
 
 ## Engine semantics (`enforce`)
 
 For a single `(resource, action)` call:
 
-1. Resolve the caller's effective group set (BFS through `parentGroupId`,
-   visited-set guard against cycles). Admin → return `{}` (no filter, no
-   throw).
-2. Look up granting `accessRights` rows for `(resource, action)` across those
-   groups. None → throw `FORBIDDEN`.
-3. Collect `recordRules` for the granting groups. Within a group, rules AND
-   together (additional restrictions on that group's grant). Across groups,
-   per-group filters OR (being in any qualifying group is enough).
-4. **A granting group with no rule grants unrestricted access** — if any such
-   group exists, the engine returns `{}`. This is intentional and matches
-   Odoo: "no rule" means "no row restriction".
+1. Resolve the caller's role-id set from `user_roles`. If any of those roles
+   has `isAdmin: true` in the snapshot → return `{}` (no filter, no throw).
+2. Find roles whose `access_rights` row in the snapshot grants `(resource, action)`.
+   None → throw `FORBIDDEN`.
+3. Collect record rules for the granting roles (one rule per role per
+   `(resource, action)`, by the unique index). Per-role filters OR together;
+   a granting role with no rule means unrestricted access — if any granting
+   role is unrestricted, the engine returns `{}`.
 
-The per-request `batch` map caches the effective group lookup so a single
-GraphQL request doesn't repeat the BFS for every resolver.
+The per-request `batch` map caches the role-id lookup so a single GraphQL
+request doesn't repeat the read for every resolver.
 
 ## `RbacDb` chain semantics
 

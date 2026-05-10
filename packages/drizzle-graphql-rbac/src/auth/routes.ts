@@ -43,7 +43,7 @@ export interface AuthRoutesDeps {
   /**
    * Optional hook fired after a successful `/logout` with the signed-out
    * user's id. {@link createApp} wires this to the RBAC cache's
-   * `invalidateUser` so a user's cached groups / enforce results are dropped
+   * `invalidateUser` so a user's cached roles / enforce results are dropped
    * on sign-out — the next login then re-reads from the DB. Safe to leave
    * unset when no caches need flushing.
    */
