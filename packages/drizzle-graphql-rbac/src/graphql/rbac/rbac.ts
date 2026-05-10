@@ -33,7 +33,7 @@ import type {
   accessRights as accessRightsTable,
   recordRules as recordRulesTable,
   User,
-} from "../../db.js";
+} from "../../tables.js";
 import type { ColumnMap } from "../builder/filters.js";
 import { parseDomain, domainToSql } from "../domain/domain.js";
 

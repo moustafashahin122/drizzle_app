@@ -12,7 +12,7 @@
  */
 import { randomBytes } from "node:crypto";
 import { and, eq, gt } from "drizzle-orm";
-import type { sessions as sessionsTable, users as usersTable, User, Session } from "../db.js";
+import type { sessions as sessionsTable, users as usersTable, User, Session } from "../tables.js";
 
 const SESSION_DAYS = 7;
 const SESSION_MS = SESSION_DAYS * 86_400_000;

@@ -5,9 +5,11 @@
  * joining `demo1` into the group, and the RBAC entries that scope the group
  * to "see only the todos assigned to me":
  *
- *   - Access right: `Demo` group can read `todos`.
- *   - Record rule:  `Demo` group's read on `todos` is filtered by
- *                   `[["assigneeId", "=", "current_user.id"]]`.
+ *   - Access right: `Demo` group can create/read/update/delete `todos`.
+ *   - Record rule:  `Demo` group's read/update/delete on `todos` is filtered
+ *                   by `[["assigneeId", "=", "current_user.id"]]` so members
+ *                   only see and mutate the rows they own. (Create has no
+ *                   record-rule check — see `rbacDb.ts`.)
  *
  * `demo2` is intentionally not in the group, so it has no `todos` access at
  * all — useful to contrast against `demo1`.
@@ -123,8 +125,16 @@ const demoGroupId = await ensureGroup(DEMO_GROUP_NAME);
 
 await ensureMembership(demo1Id, demoGroupId);
 
-await ensureAccessRight(demoGroupId, "todos", { canRead: true });
-await ensureRecordRule(demoGroupId, "todos", "read", [["assigneeId", "=", "current_user.id"]]);
+await ensureAccessRight(demoGroupId, "todos", {
+  canCreate: true,
+  canRead: true,
+  canUpdate: true,
+  canDelete: true,
+});
+const ownTodos = [["assigneeId", "=", "current_user.id"]];
+await ensureRecordRule(demoGroupId, "todos", "read", ownTodos);
+await ensureRecordRule(demoGroupId, "todos", "update", ownTodos);
+await ensureRecordRule(demoGroupId, "todos", "delete", ownTodos);
 
 console.log("");
 console.log(`demo1 credentials: demo1@example.com / ${DEMO_PASSWORD}  (in '${DEMO_GROUP_NAME}' group — sees only todos assigned to them)`);

@@ -72,8 +72,8 @@
         query { todos(orderBy: { id: ASC }) { id title completed } }
       `;
       const M_CREATE = `
-        mutation($title: String!) {
-          insertIntoTodos(values: [{ title: $title, completed: false }]) {
+        mutation($title: String!, $assigneeId: Int) {
+          insertIntoTodos(values: [{ title: $title, completed: false, assigneeId: $assigneeId }]) {
             id title completed
           }
         }
@@ -153,7 +153,7 @@
         e.preventDefault();
         const title = input.value.trim();
         if (!title) return;
-        await gql(M_CREATE, { title });
+        await gql(M_CREATE, { title, assigneeId: me.id });
         input.value = "";
         load();
       };

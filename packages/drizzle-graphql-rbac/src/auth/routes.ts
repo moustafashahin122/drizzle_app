@@ -20,7 +20,7 @@
 import { Hono } from "hono";
 import bcrypt from "bcryptjs";
 import { eq } from "drizzle-orm";
-import type { User } from "../db.js";
+import type { User } from "../tables.js";
 import {
   buildClearSessionCookie,
   buildSessionCookie,

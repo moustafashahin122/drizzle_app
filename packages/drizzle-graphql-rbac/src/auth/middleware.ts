@@ -7,7 +7,7 @@
  * authenticated routes.
  */
 import type { MiddlewareHandler } from "hono";
-import type { User, Session } from "../db.js";
+import type { User, Session } from "../tables.js";
 import {
   extractBearerToken,
   parseSessionCookie,

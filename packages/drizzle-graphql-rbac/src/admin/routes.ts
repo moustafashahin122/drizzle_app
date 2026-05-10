@@ -21,7 +21,7 @@ import { Hono } from "hono";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import bcrypt from "bcryptjs";
 import { asc, eq } from "drizzle-orm";
-import type { User, users as usersTableType } from "../db.js";
+import type { User, users as usersTableType } from "../tables.js";
 import type { RbacDb } from "../graphql/rbac/rbacDb.js";
 import { requireAuth, sessionMiddleware, type AuthEnv } from "../auth/middleware.js";
 import type { SessionDb, SessionSchema } from "../auth/session.js";

@@ -1,7 +1,12 @@
 {
-  "name": "drizzle-todo-app",
+  "name": "drizzle-todo-demo",
   "version": "1.0.0",
+  "description": "Reference app demonstrating drizzle-graphql-rbac.",
   "type": "module",
+  "private": true,
+  "workspaces": [
+    "packages/*"
+  ],
   "scripts": {
     "db:push": "drizzle-kit push",
     "db:generate": "drizzle-kit generate",
@@ -9,7 +14,7 @@
     "db:studio": "drizzle-kit studio",
     "dev": "tsx watch src/server.ts",
     "start": "tsx src/server.ts",
-    "test": "node --import tsx --test src/graphql/builder/*.test.ts src/graphql/rbac/*.test.ts src/graphql/domain/*.test.ts src/auth/*.test.ts src/admin/*.test.ts",
+    "test": "npm test --workspace drizzle-graphql-rbac",
     "seed:admin": "tsx src/scripts/seed-admin.ts"
   },
   "dependencies": {
@@ -17,6 +22,7 @@
     "@types/bcryptjs": "^2.4.6",
     "bcryptjs": "^3.0.3",
     "better-sqlite3": "^11.7.0",
+    "drizzle-graphql-rbac": "*",
     "drizzle-orm": "^0.38.3",
     "graphql": "^16.10.0",
     "graphql-yoga": "^5.10.4",
