@@ -6,9 +6,8 @@ import { sqliteTable, integer, text } from "drizzle-orm/sqlite-core";
 import { eq } from "drizzle-orm";
 import { graphql, type GraphQLSchema } from "graphql";
 
-import { buildSchema } from "./builder.js";
-import { buildRbac, parseDomain, domainToSql } from "./rbac.js";
-import type { ColumnMap } from "./filters.js";
+import { buildSchema } from "../builder/builder.js";
+import { buildRbac } from "./rbac.js";
 
 // Self-contained schema mirror — keeps the test independent of src/db.ts and
 // the on-disk todo.db.
@@ -122,51 +121,6 @@ const userCtx = (id: number, name = "u") => ({
 async function run(query: string, contextValue: any) {
   return graphql({ schema, source: query, contextValue });
 }
-
-// ---------------------------------------------------------------------------
-// Domain parser unit tests
-// ---------------------------------------------------------------------------
-
-describe("rbac — domain parser", () => {
-  it("parses a single leaf as the root", () => {
-    const node = parseDomain([["state", "=", "draft"]]);
-    assert.deepEqual(node, { kind: "leaf", field: "state", op: "=", value: "draft" });
-  });
-
-  it("implicit AND across top-level leaves", () => {
-    const node = parseDomain([
-      ["a", "=", 1],
-      ["b", "=", 2],
-    ]);
-    assert.equal(node.kind, "and");
-  });
-
-  it("'|' takes the next two sub-expressions in prefix order", () => {
-    const node = parseDomain([
-      "|",
-      ["a", "=", 1],
-      ["b", "=", 2],
-    ]);
-    assert.equal(node.kind, "or");
-  });
-
-  it("'!' negates a single sub-expression", () => {
-    const node = parseDomain(["!", ["a", "=", 1]]);
-    assert.equal(node.kind, "not");
-  });
-
-  it("rejects truncated operator", () => {
-    assert.throws(() => parseDomain(["&", ["a", "=", 1]]), /truncated/);
-  });
-
-  it("substitutes current_user.id placeholder via domainToSql", () => {
-    const node = parseDomain([["owner_id", "=", "current_user.id"]]);
-    const cols = { owner_id: todos.ownerId } as unknown as ColumnMap;
-    const sql = domainToSql(node, cols, { id: 42 } as any);
-    // We can't easily inspect the SQL params without a query; assert it built.
-    assert.ok(sql);
-  });
-});
 
 // ---------------------------------------------------------------------------
 // Engine end-to-end via the built GraphQL schema

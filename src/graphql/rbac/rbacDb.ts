@@ -31,7 +31,7 @@ import {
   Table,
   type SQL,
 } from "drizzle-orm";
-import { combineWhere, type ColumnMap } from "./filters.js";
+import { combineWhere, type ColumnMap } from "../builder/filters.js";
 import type { Action, RbacContext, RbacEnforce } from "./rbac.js";
 
 export interface RbacDbDeps {

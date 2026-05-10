@@ -11,36 +11,19 @@
  *   Deny-by-default if no group grants the action.
  * - **Record rules**: per-group row-level filters on a `(resource, permType)`
  *   pair, expressed as Odoo polish-prefix domains. Domains from groups granting
- *   the action are OR-combined and AND-ed into the resolver's `where`.
+ *   the action are OR-combined and AND-ed into the resolver's `where`. The
+ *   domain syntax and translator live in `../domain` — this engine only
+ *   orchestrates parsing, placeholder injection, and combination.
  *
- * Domain syntax
- * -------------
- * `[ "&" | "|" | "!", [field, op, value], ... ]` — operators are prefix and
- * consume the next 1 (`!`) or 2 (`&`, `|`) sub-expressions; the implicit
- * combinator across remaining top-level items is `&` (AND), matching Odoo.
- * Operators: `=`, `!=`, `>`, `>=`, `<`, `<=`, `in`, `not in`, `like`, `ilike`,
- * `not like`, `not ilike`, `=?` (eq-or-null).
- *
- * Placeholders: any string value equal to `current_user.id` is substituted with
- * the runtime user id. Unauthenticated callers get `null`, which makes
- * `=`/`!=` against it produce no row matches — the safe default.
+ * Placeholders: the engine injects `{ "current_user.id": ctx.user?.id ?? null }`
+ * when evaluating each rule. Unauthenticated callers get `null`, which makes
+ * `=`/`!=` against the placeholder produce no row matches — the safe default.
  */
 import {
   and,
   eq,
-  getTableName,
-  gt,
-  gte,
-  ilike,
   inArray,
-  like,
-  lt,
-  lte,
-  ne,
-  not,
-  notInArray,
   or,
-  type Column,
   type SQL,
 } from "drizzle-orm";
 import { GraphQLError } from "graphql";
@@ -50,8 +33,9 @@ import type {
   accessRights as accessRightsTable,
   recordRules as recordRulesTable,
   User,
-} from "../db.js";
-import type { ColumnMap } from "./filters.js";
+} from "../../db.js";
+import type { ColumnMap } from "../builder/filters.js";
+import { parseDomain, domainToSql } from "../domain/domain.js";
 
 export interface RbacSchema {
   groups: typeof groupsTable;
@@ -139,126 +123,6 @@ async function getEffectiveGroups(
   const out = await resolveEffectiveGroups(db, schema, ctx.user.id);
   ctx.batch?.set(cacheKey, out);
   return out;
-}
-
-// ---------------------------------------------------------------------------
-// Odoo domain parser
-// ---------------------------------------------------------------------------
-
-type Leaf = [string, string, unknown];
-type DomainNode =
-  | { kind: "leaf"; field: string; op: string; value: unknown }
-  | { kind: "and" | "or"; children: DomainNode[] }
-  | { kind: "not"; child: DomainNode };
-
-/**
- * Parse a JSON-encoded Odoo domain (an array of leaves and prefix operators)
- * into a tree. Implicit AND across remaining top-level items.
- *
- * @throws if the domain is malformed (unknown operator, leaf shape wrong, or
- *         operators consume past the end of the token list).
- */
-export function parseDomain(domain: unknown[]): DomainNode {
-  let i = 0;
-
-  const parseOne = (): DomainNode => {
-    if (i >= domain.length) throw new Error("rbac: domain truncated mid-operator");
-    const tok = domain[i++];
-    if (tok === "&" || tok === "|") {
-      const a = parseOne();
-      const b = parseOne();
-      return { kind: tok === "&" ? "and" : "or", children: [a, b] };
-    }
-    if (tok === "!") {
-      const a = parseOne();
-      return { kind: "not", child: a };
-    }
-    if (Array.isArray(tok) && tok.length === 3) {
-      const [field, op, value] = tok as Leaf;
-      if (typeof field !== "string" || typeof op !== "string") {
-        throw new Error(`rbac: malformed leaf ${JSON.stringify(tok)}`);
-      }
-      return { kind: "leaf", field, op, value };
-    }
-    throw new Error(`rbac: unrecognized domain token ${JSON.stringify(tok)}`);
-  };
-
-  const top: DomainNode[] = [];
-  while (i < domain.length) top.push(parseOne());
-  if (top.length === 0) throw new Error("rbac: empty domain");
-  if (top.length === 1) return top[0];
-  return { kind: "and", children: top };
-}
-
-const substitute = (value: unknown, user: User | null): unknown => {
-  if (value === "current_user.id") return user?.id ?? null;
-  if (Array.isArray(value)) return value.map((v) => substitute(v, user));
-  return value;
-};
-
-/**
- * Translate a parsed domain tree into a Drizzle SQL fragment against `columns`.
- *
- * Returns `undefined` for a tree that contributes no usable predicates — e.g.
- * a leaf referencing an unknown column. The caller treats `undefined` as "this
- * rule grants nothing", which combined with the OR-of-rules semantics means a
- * malformed rule does *not* widen access.
- */
-export function domainToSql(
-  node: DomainNode,
-  columns: ColumnMap,
-  user: User | null,
-): SQL | undefined {
-  if (node.kind === "and" || node.kind === "or") {
-    const parts = node.children
-      .map((c) => domainToSql(c, columns, user))
-      .filter((p): p is SQL => !!p);
-    if (!parts.length) return undefined;
-    if (parts.length === 1) return parts[0];
-    return node.kind === "and" ? and(...parts) : or(...parts);
-  }
-  if (node.kind === "not") {
-    const inner = domainToSql(node.child, columns, user);
-    return inner ? not(inner) : undefined;
-  }
-  if (node.kind !== "leaf") return undefined;
-
-  const col = columns[node.field] as Column | undefined;
-  if (!col) return undefined;
-  const value = substitute(node.value, user);
-
-  switch (node.op) {
-    case "=":
-      return value === null ? undefined : eq(col, value as any);
-    case "!=":
-    case "<>":
-      return value === null ? undefined : ne(col, value as any);
-    case ">":
-      return gt(col, value as any);
-    case ">=":
-      return gte(col, value as any);
-    case "<":
-      return lt(col, value as any);
-    case "<=":
-      return lte(col, value as any);
-    case "in":
-      return Array.isArray(value) && value.length ? inArray(col, value as any[]) : undefined;
-    case "not in":
-      return Array.isArray(value) && value.length ? notInArray(col, value as any[]) : undefined;
-    case "like":
-      return like(col, value as any);
-    case "ilike":
-      return ilike(col, value as any);
-    case "not like":
-      return not(like(col, value as any));
-    case "not ilike":
-      return not(ilike(col, value as any));
-    case "=?":
-      // Odoo: "equal or null" — useful when the placeholder may resolve to null.
-      return value === null ? undefined : eq(col, value as any);
-    default:
-      throw new Error(`rbac: unsupported domain operator '${node.op}'`);
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -356,7 +220,9 @@ export function buildRbac(db: RbacDb, schema: RbacSchema): { enforce: RbacEnforc
       if (!Array.isArray(parsed)) {
         throw new Error(`rbac: record rule domain must be a JSON array`);
       }
-      const sql = domainToSql(parseDomain(parsed), columns, ctx.user);
+      const sql = domainToSql(parseDomain(parsed), columns, {
+        "current_user.id": ctx.user?.id ?? null,
+      });
       if (!sql) continue;
       let arr = rulesByGroup.get(r.groupId);
       if (!arr) rulesByGroup.set(r.groupId, (arr = []));

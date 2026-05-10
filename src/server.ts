@@ -11,9 +11,9 @@ import {
   parseSessionCookie,
   resolveSessionFromToken,
   type AuthContext,
-} from "./graphql/auth.js";
-import { buildRbac } from "./graphql/rbac.js";
-import { buildRbacDb, type RbacDb } from "./graphql/rbacDb.js";
+} from "./graphql/auth/auth.js";
+import { buildRbac } from "./graphql/rbac/rbac.js";
+import { buildRbacDb, type RbacDb } from "./graphql/rbac/rbacDb.js";
 import * as dbModule from "./db.js";
 
 const auth = buildAuthExtensions(dbModule.db, {

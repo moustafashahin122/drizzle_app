@@ -33,8 +33,8 @@ const userError = (message: string) =>
   new GraphQLError(message, { extensions: { code: "BAD_USER_INPUT" } });
 const authError = (message: string) =>
   new GraphQLError(message, { extensions: { code: "UNAUTHENTICATED" } });
-import type { sessions as sessionsTable, users as usersTable, User, Session } from "../db.js";
-import type { RbacDb } from "./rbacDb.js";
+import type { sessions as sessionsTable, users as usersTable, User, Session } from "../../db.js";
+import type { RbacDb } from "../rbac/rbacDb.js";
 
 const SESSION_DAYS = 7;
 const SESSION_MS = SESSION_DAYS * 86_400_000;

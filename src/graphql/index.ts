@@ -15,6 +15,6 @@
  *
  * const { schema } = buildSchema(db, dbSchema);
  */
-export { buildSchema } from "./builder.js";
-export type { BuildSchemaOptions, DrizzleLike } from "./builder.js";
-export { GraphQLJSON, GraphQLBigIntStr } from "./scalars.js";
+export { buildSchema } from "./builder/builder.js";
+export type { BuildSchemaOptions, DrizzleLike } from "./builder/builder.js";
+export { GraphQLJSON, GraphQLBigIntStr } from "./builder/scalars.js";

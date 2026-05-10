@@ -6,7 +6,7 @@ import { graphql, type GraphQLSchema } from "graphql";
 import { sqliteTable, integer, text } from "drizzle-orm/sqlite-core";
 import { sql } from "drizzle-orm";
 
-import { buildSchema } from "./builder.js";
+import { buildSchema } from "../builder/builder.js";
 import { buildAuthExtensions, resolveSessionFromHeader, type AuthContext } from "./auth.js";
 
 // Mirror src/db.ts so tests don't share the on-disk file.
