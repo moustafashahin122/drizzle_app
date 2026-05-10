@@ -82,6 +82,18 @@ export function buildRbacDb(deps: RbacDbDeps): (ctx: RbacContext) => RbacDb {
   return (ctx) => new RbacDb(resolved, ctx);
 }
 
+/**
+ * Per-request Drizzle wrapper that runs RBAC `enforce` automatically on
+ * `select` / `update` / `delete` / `insert` and AND-injects record-rule SQL
+ * into the user's `where` (except `insert`, which is ACL-only). Constructed
+ * by {@link buildRbacDb}; resolvers receive an instance via `ctx.db`.
+ *
+ * Method chains mirror the Drizzle builder API (`.from`, `.where`, `.set`,
+ * `.values`, `.returning`, `.limit`, `.offset`, `.orderBy`, joins). The chain
+ * is finalized — and RBAC actually runs — only when the caller awaits it
+ * (`then` / `catch` / `finally`). Use {@link RbacDb.raw} to bypass the
+ * wrapper entirely.
+ */
 export class RbacDb {
   /** Escape hatch: the raw, unwrapped Drizzle db. */
   readonly raw: any;

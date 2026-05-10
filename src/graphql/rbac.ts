@@ -282,6 +282,26 @@ export interface RbacEnforce {
   ): Promise<{ where?: SQL }>;
 }
 
+/**
+ * Build the {@link RbacEnforce} hook bound to a Drizzle DB and the four RBAC
+ * tables (`groups`, `userGroups`, `accessRights`, `recordRules`).
+ *
+ * The returned `enforce` function is the value passed to {@link buildSchema}'s
+ * `options.rbac.enforce`. It performs three steps per call:
+ *
+ * 1. Resolve the caller's effective group set (direct + transitive via
+ *    `parentGroupId`); admins short-circuit with no filter.
+ * 2. Look up granting `accessRights` rows for `(resource, action)` across those
+ *    groups. No granting row → `FORBIDDEN`.
+ * 3. Collect `recordRules` for granting groups, parse each Odoo-style domain
+ *    to SQL ({@link parseDomain} + {@link domainToSql}), AND rules within a
+ *    group, OR across groups. A granting group with no rule means
+ *    unrestricted access (returns `{}`).
+ *
+ * @param db Drizzle handle (any dialect; only `select()` is used).
+ * @param schema The four RBAC tables, typically a slice of the project schema.
+ * @returns `{ enforce }` — pass `enforce` to `buildSchema({ rbac: { enforce } })`.
+ */
 export function buildRbac(db: RbacDb, schema: RbacSchema): { enforce: RbacEnforce } {
   const enforce: RbacEnforce = async (ctx, resource, action, columns) => {
     if (!ctx.user) throw forbidden("Not authenticated");
