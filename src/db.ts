@@ -1,29 +1,25 @@
+/**
+ * @module app/db
+ *
+ * Production Drizzle handle backed by the on-disk `todo.db`. Imports the
+ * schema declarations from `./schema.js` (kept connection-free so tests
+ * can build their own handle) and re-exports them for callers that want
+ * one-stop access to `{ db, users, todos, ... }`.
+ */
 import Database from "better-sqlite3";
 import { drizzle } from "drizzle-orm/better-sqlite3";
-import { sqliteTable, integer, text } from "drizzle-orm/sqlite-core";
-import { sql } from "drizzle-orm";
-import { frameworkTables, users } from "drizzle-graphql-rbac/tables";
 import { logger } from "drizzle-graphql-rbac";
+import * as schema from "./schema.js";
+
+export * from "./schema.js";
 
 const dbLog = logger.child({ component: "app.db" });
 
-export { users, sessions } from "drizzle-graphql-rbac/tables";
-export type { User, NewUser, Session } from "drizzle-graphql-rbac/tables";
-
-export const todos = sqliteTable("todos", {
-  id: integer("id").primaryKey({ autoIncrement: true }),
-  title: text("title").notNull(),
-  completed: integer("completed", { mode: "boolean" }).notNull().default(false),
-  createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
-  assigneeId: integer("assignee_id").references(() => users.id),
-});
-export type Todo = typeof todos.$inferSelect;
-export type NewTodo = typeof todos.$inferInsert;
-
 const sqlite = new Database("todo.db");
 sqlite.pragma("foreign_keys = ON");
+
 export const db = drizzle(sqlite, {
-  schema: { ...frameworkTables, todos },
+  schema,
   logger: {
     logQuery: (query, params) => dbLog.debug({ query, params }, "drizzle query"),
   },

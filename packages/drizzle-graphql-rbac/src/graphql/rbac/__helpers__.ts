@@ -1,15 +1,30 @@
 /**
- * Shared fixtures for RBAC tests.
+ * Domain-specific test fixtures for the RBAC module.
  *
- * Provides a tiny `users` + `todos` schema, a fresh-DB factory, a seeded
- * cast of three users (two `user`-role, one `manager`), and context helpers.
- * Tests build their own RBAC config and pass it to `seed`.
+ * Tables (`users`, `todos`) are declared once, the schema is applied to the
+ * framework's shared singleton sqlite handle at module load, and the
+ * drizzle wrapper is exported so every test file in this directory works
+ * against the same connection. Per-test rollback is handled by
+ * `transactionCase` (see `../../testing/`).
+ *
+ * Seeding helpers (`seedUserManager`, `seedReaderAdmin`) are intended to be
+ * called from each suite's `setUpClass` — that runs inside the suite-level
+ * SAVEPOINT, so each file's reference data is rolled back when its tests
+ * end and the next file starts with an empty schema.
  */
 import Database from "better-sqlite3";
 import { drizzle } from "drizzle-orm/better-sqlite3";
 import { sqliteTable, integer, text } from "drizzle-orm/sqlite-core";
 
+import {
+  applySchemaSql,
+  getSharedSqlite,
+  transactionCase,
+} from "../../testing/index.js";
 import type { BuiltRbac } from "./rbac.js";
+
+// Re-export so test files keep their existing import.
+export { transactionCase };
 
 export const users = sqliteTable("users", {
   id: integer("id").primaryKey({ autoIncrement: true }),
@@ -24,21 +39,41 @@ export const todos = sqliteTable("todos", {
 
 export const allTables = { users, todos };
 
-const createTablesSql = `
-  CREATE TABLE users (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL);
-  CREATE TABLE todos (
+// Apply schema to the shared handle on first import. `IF NOT EXISTS` keeps
+// this idempotent if multiple files reach into the same singleton in one
+// process (the default `node --test` mode forks per file, but we don't
+// want to rely on that for correctness).
+applySchemaSql(`
+  CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL);
+  CREATE TABLE IF NOT EXISTS todos (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     title TEXT NOT NULL,
     owner_id INTEGER REFERENCES users(id)
   );
-`;
+`);
 
-export type Db = ReturnType<typeof drizzle>;
+/** Shared sqlite + drizzle. Test files import these directly; no per-file DB. */
+export const sqlite = getSharedSqlite();
+export const db = drizzle(sqlite);
+export type Db = typeof db;
 
+/**
+ * Escape hatch: build a fully isolated DB (separate sqlite handle and
+ * schema). Use only for tests that need a different schema or rbac config
+ * and therefore cannot share the singleton — e.g., the alt-config
+ * mutation test in `rbac.test.ts`.
+ */
 export function freshDb(): { sqlite: Database.Database; db: Db } {
-  const sqlite = new Database(":memory:");
-  sqlite.exec(createTablesSql);
-  return { sqlite, db: drizzle(sqlite) };
+  const s = new Database(":memory:");
+  s.exec(`
+    CREATE TABLE users (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL);
+    CREATE TABLE todos (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      title TEXT NOT NULL,
+      owner_id INTEGER REFERENCES users(id)
+    );
+  `);
+  return { sqlite: s, db: drizzle(s) };
 }
 
 export const ctxFor = (id: number, name = "u") => ({
@@ -61,11 +96,11 @@ export const anonCtx = () => ({
  *  - Bob   owns bob-1
  *  - Carol owns carol-1
  */
-export async function insertCast(db: Db) {
-  const [alice] = await db.insert(users).values({ name: "Alice" }).returning();
-  const [bob]   = await db.insert(users).values({ name: "Bob" }).returning();
-  const [carol] = await db.insert(users).values({ name: "Carol" }).returning();
-  await db.insert(todos).values([
+export async function insertCast(targetDb: Db = db) {
+  const [alice] = await targetDb.insert(users).values({ name: "Alice" }).returning();
+  const [bob]   = await targetDb.insert(users).values({ name: "Bob" }).returning();
+  const [carol] = await targetDb.insert(users).values({ name: "Carol" }).returning();
+  await targetDb.insert(todos).values([
     { title: "alice-1", ownerId: alice.id },
     { title: "alice-2", ownerId: alice.id },
     { title: "bob-1",   ownerId: bob.id   },
@@ -75,8 +110,8 @@ export async function insertCast(db: Db) {
 }
 
 /** Cast where Alice + Bob are `user` and Carol is `manager`. */
-export async function seedUserManager(db: Db, rbac: BuiltRbac) {
-  const cast = await insertCast(db);
+export async function seedUserManager(rbac: BuiltRbac, targetDb: Db = db) {
+  const cast = await insertCast(targetDb);
   rbac.assignRole(cast.alice.id, "user");
   rbac.assignRole(cast.bob.id,   "user");
   rbac.assignRole(cast.carol.id, "manager");
@@ -84,21 +119,10 @@ export async function seedUserManager(db: Db, rbac: BuiltRbac) {
 }
 
 /** Cast where Alice is `reader`, Bob is `admin`, Carol has no role. */
-export async function seedReaderAdmin(db: Db, rbac: BuiltRbac) {
-  const cast = await insertCast(db);
+export async function seedReaderAdmin(rbac: BuiltRbac, targetDb: Db = db) {
+  const cast = await insertCast(targetDb);
   rbac.assignRole(cast.alice.id, "reader");
   rbac.assignRole(cast.bob.id,   "admin");
   // Carol intentionally unassigned — used as the no-role actor in deny tests.
   return cast;
-}
-
-/**
- * Sweep role memberships from process memory so a `beforeEach` can reset
- * cleanly between tests. The 1..1000 range comfortably covers the SQLite
- * autoincrement ids generated by `seedBaseCast` across a single test file.
- */
-export function clearAllMemberships(rbac: BuiltRbac, max = 1000) {
-  for (let id = 1; id < max; id++) {
-    for (const key of rbac.listUserRoles(id)) rbac.revokeRole(id, key);
-  }
 }

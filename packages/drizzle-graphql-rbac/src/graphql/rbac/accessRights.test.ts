@@ -6,16 +6,15 @@
  * outright. Cross-row narrowing is intentionally absent from this file —
  * that contract lives in `recordRules.test.ts`.
  *
- * Cast and conventions come from `__helpers__.ts`:
- *   - Alice and Bob hold role `user`
- *   - Carol holds role `manager`
- *   - Seeded todos: alice-1, alice-2 (Alice), bob-1 (Bob), carol-1 (Carol)
+ * Cast (from `__helpers__.ts`): Alice + Bob hold role `user`, Carol holds
+ * `manager`. Per-test isolation is provided by `transactionCase` SAVEPOINT
+ * rollback, so per-test inserts (e.g. a role-less actor) vanish automatically.
  */
-import { describe, it, before, beforeEach } from "node:test";
+import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { eq } from "drizzle-orm";
 
-import { buildRbac, type BuiltRbac } from "./rbac.js";
+import { buildRbac } from "./rbac.js";
 import { buildRbacDb } from "./rbacDb.js";
 import {
   defineRoles,
@@ -25,14 +24,13 @@ import {
 
 import {
   allTables,
+  db,
   todos,
   users,
   anonCtx,
   ctxFor,
-  clearAllMemberships,
-  freshDb,
   seedUserManager,
-  type Db,
+  transactionCase,
 } from "./__helpers__.js";
 
 const aclConfig = {
@@ -48,28 +46,17 @@ const aclConfig = {
   recordRules: defineRecordRules({}), // intentionally empty
 };
 
-let sqlite: ReturnType<typeof freshDb>["sqlite"];
-let db: Db;
-let rbac: BuiltRbac;
-let rdbFor: ReturnType<typeof buildRbacDb>;
-
-before(() => {
-  const f = freshDb();
-  sqlite = f.sqlite;
-  db = f.db;
-  rbac = buildRbac(aclConfig);
-  rdbFor = buildRbacDb({ db, schema: allTables, enforce: rbac.enforce });
-});
-
-beforeEach(() => {
-  sqlite.exec(`DELETE FROM todos; DELETE FROM users;`);
-  clearAllMemberships(rbac);
+const tc = transactionCase(async () => {
+  const rbac = buildRbac(aclConfig);
+  const rdbFor = buildRbacDb({ db, schema: allTables, enforce: rbac.enforce });
+  const cast = await seedUserManager(rbac);
+  return { db, rbac, rdbFor, cast };
 });
 
 describe("access rights — verb-level gating with no record rules", () => {
   describe("user role — has read/create/update, lacks delete", () => {
     it("can read every row in the table (no record rule narrows)", async () => {
-      const { alice, bob, carol } = await seedUserManager(db, rbac);
+      const { rdbFor, cast: { alice, bob, carol } } = tc;
       const rdb = rdbFor(ctxFor(alice.id));
       const rows = await rdb.select().from(todos);
 
@@ -84,7 +71,7 @@ describe("access rights — verb-level gating with no record rules", () => {
     });
 
     it("can create a todo; row persists with the supplied FK", async () => {
-      const { alice } = await seedUserManager(db, rbac);
+      const { db, rdbFor, cast: { alice } } = tc;
       const rdb = rdbFor(ctxFor(alice.id));
       const out = await rdb
         .insert(todos)
@@ -105,9 +92,7 @@ describe("access rights — verb-level gating with no record rules", () => {
     });
 
     it("can update ANY row — without a record rule, ACL does not row-scope", async () => {
-      // Alice (role=user) edits Bob's row. With no record rule this is allowed
-      // by design — this test pins that contract so future regressions are caught.
-      const { alice, bob } = await seedUserManager(db, rbac);
+      const { db, rdbFor, cast: { alice, bob } } = tc;
       const rdb = rdbFor(ctxFor(alice.id));
       const updated = await rdb
         .update(todos)
@@ -130,7 +115,7 @@ describe("access rights — verb-level gating with no record rules", () => {
     });
 
     it("cannot delete any row — verb flag missing → Access denied; DB untouched", async () => {
-      const { alice } = await seedUserManager(db, rbac);
+      const { db, rdbFor, cast: { alice } } = tc;
       const rdb = rdbFor(ctxFor(alice.id));
 
       // Try to delete own row — ACL denies before any row-scope check.
@@ -155,7 +140,7 @@ describe("access rights — verb-level gating with no record rules", () => {
 
   describe("manager role — full CRUD, every verb permitted", () => {
     it("can read every row", async () => {
-      const { alice, bob, carol } = await seedUserManager(db, rbac);
+      const { rdbFor, cast: { alice, bob, carol } } = tc;
       const rdb = rdbFor(ctxFor(carol.id));
       const rows = await rdb.select().from(todos);
       assert.equal(rows.length, 4);
@@ -164,7 +149,7 @@ describe("access rights — verb-level gating with no record rules", () => {
     });
 
     it("can update a user's row (cross-owner allowed at ACL layer)", async () => {
-      const { bob, carol } = await seedUserManager(db, rbac);
+      const { db, rdbFor, cast: { bob, carol } } = tc;
       const rdb = rdbFor(ctxFor(carol.id));
       const updated = await rdb
         .update(todos)
@@ -179,7 +164,7 @@ describe("access rights — verb-level gating with no record rules", () => {
     });
 
     it("can delete a user's row; only that row disappears", async () => {
-      const { bob, carol } = await seedUserManager(db, rbac);
+      const { db, rdbFor, cast: { bob, carol } } = tc;
       const rdb = rdbFor(ctxFor(carol.id));
       const deleted = await rdb
         .delete(todos)
@@ -198,7 +183,7 @@ describe("access rights — verb-level gating with no record rules", () => {
     });
 
     it("can create a todo of their own", async () => {
-      const { carol } = await seedUserManager(db, rbac);
+      const { db, rdbFor, cast: { carol } } = tc;
       const rdb = rdbFor(ctxFor(carol.id));
       const out = await rdb
         .insert(todos)
@@ -225,8 +210,10 @@ describe("access rights — verb-level gating with no record rules", () => {
     }
 
     it("role-less authenticated user is denied on every verb; DB unchanged", async () => {
-      const { alice } = await seedUserManager(db, rbac);
-      // A 4th user, seeded but never granted any role.
+      const { db, rdbFor, cast: { alice } } = tc;
+      // Insert a 4th user with no role assignment. The savepoint rolls
+      // this row back after the test, so subsequent tests see the same
+      // 3-actor cast.
       const [dave] = await db.insert(users).values({ name: "Dave" }).returning();
       const rdb = rdbFor(ctxFor(dave.id));
 
@@ -240,7 +227,7 @@ describe("access rights — verb-level gating with no record rules", () => {
     });
 
     it("anonymous caller is rejected as Not authenticated on every verb", async () => {
-      const { alice } = await seedUserManager(db, rbac);
+      const { db, rdbFor, cast: { alice } } = tc;
       const rdb = rdbFor(anonCtx());
 
       for (const verb of VERBS) {

@@ -10,6 +10,9 @@
  * the matching CRUD grant from `accessRights.ts` will additionally have
  * their query AND-ed with this filter. Multiple roles' rules are OR-ed,
  * so a user in a less-restrictive role still sees the broader set.
+ *
+ * `manager` has no rules: with the CRUD grants from `accessRights.ts` it
+ * acts on every row. `admin` (framework) bypasses both layers.
  */
 import { defineRecordRules } from "drizzle-graphql-rbac";
 
@@ -18,6 +21,10 @@ const ownTodos = [["assigneeId", "=", "current_user.id"]];
 export const recordRules = defineRecordRules({
   demo: {
     todos: {
+      // `create` narrows the inserted row — demo can only assign todos to
+      // themselves; an insert with another assigneeId is rejected as
+      // "rbac: insert blocked by record rule".
+      create: { domain: ownTodos },
       read:   { domain: ownTodos },
       update: { domain: ownTodos },
       delete: { domain: ownTodos },

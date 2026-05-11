@@ -13,11 +13,9 @@ import { defineAccessRights } from "drizzle-graphql-rbac";
 
 export const accessRights = defineAccessRights({
   demo: {
-    todos: {
-      create: true,
-      read: true,
-      update: true,
-      delete: true,
-    },
+    todos: { create: true, read: true, update: true, delete: true },
+  },
+  manager: {
+    todos: { create: true, read: true, update: true, delete: true },
   },
 });

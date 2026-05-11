@@ -14,7 +14,8 @@
     "db:studio": "drizzle-kit studio",
     "dev": "tsx watch src/server.ts",
     "start": "tsx src/server.ts",
-    "test": "npm test --workspace drizzle-graphql-rbac",
+    "test:app": "node --import tsx --test src/*.test.ts",
+    "test": "npm run test:app && npm test --workspace drizzle-graphql-rbac",
     "seed:admin": "tsx src/scripts/seed-admin.ts"
   },
   "dependencies": {

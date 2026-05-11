@@ -11,13 +11,14 @@
  *   - the `bypassResources` opt-out
  *   - the `.raw` escape hatch
  *
- * Cast comes from `__helpers__.ts`: Alice(reader), Bob(admin), Carol(no role).
+ * Cast: Alice(reader), Bob(admin), Carol(no role). Per-test isolation via
+ * `transactionCase` SAVEPOINT rollback.
  */
-import { describe, it, before, beforeEach } from "node:test";
+import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { eq } from "drizzle-orm";
 
-import { buildRbac, type BuiltRbac } from "./rbac.js";
+import { buildRbac } from "./rbac.js";
 import { buildRbacDb } from "./rbacDb.js";
 import {
   defineRoles,
@@ -27,12 +28,11 @@ import {
 
 import {
   allTables,
+  db,
   todos,
   ctxFor,
-  clearAllMemberships,
-  freshDb,
   seedReaderAdmin,
-  type Db,
+  transactionCase,
 } from "./__helpers__.js";
 
 const own = [["ownerId", "=", "current_user.id"]];
@@ -49,27 +49,16 @@ const rbacConfig = {
   }),
 };
 
-let sqlite: ReturnType<typeof freshDb>["sqlite"];
-let db: Db;
-let rdbFor: ReturnType<typeof buildRbacDb>;
-let rbac: BuiltRbac;
-
-before(() => {
-  const f = freshDb();
-  sqlite = f.sqlite;
-  db = f.db;
-  rbac = buildRbac(rbacConfig);
-  rdbFor = buildRbacDb({ db, schema: allTables, enforce: rbac.enforce });
-});
-
-beforeEach(() => {
-  sqlite.exec(`DELETE FROM todos; DELETE FROM users;`);
-  clearAllMemberships(rbac);
+const tc = transactionCase(async () => {
+  const rbac = buildRbac(rbacConfig);
+  const rdbFor = buildRbacDb({ db, schema: allTables, enforce: rbac.enforce });
+  const cast = await seedReaderAdmin(rbac);
+  return { db, rbac, rdbFor, cast };
 });
 
 describe("rbacDb — proxy-specific contracts", () => {
   it("admin role short-circuits enforcement at the rdb layer (sees every row)", async () => {
-    const { alice, bob, carol } = await seedReaderAdmin(db, rbac);
+    const { rdbFor, cast: { alice, bob, carol } } = tc;
     const rdb = rdbFor(ctxFor(bob.id));
     const rows = await rdb.select().from(todos);
 
@@ -84,7 +73,7 @@ describe("rbacDb — proxy-specific contracts", () => {
   });
 
   it("forwards orderBy and limit through the proxy, preserving order and length", async () => {
-    const { bob } = await seedReaderAdmin(db, rbac);
+    const { rdbFor, cast: { bob } } = tc;
     const rdb = rdbFor(ctxFor(bob.id));
     const rows = await rdb.select().from(todos).orderBy(todos.id).limit(2);
 
@@ -97,7 +86,7 @@ describe("rbacDb — proxy-specific contracts", () => {
   });
 
   it("bypassResources allows a role-less user to read all rows verbatim", async () => {
-    const { alice, bob, carol } = await seedReaderAdmin(db, rbac);
+    const { db, rbac, cast: { alice, bob, carol } } = tc;
     const bypassRdbFor = buildRbacDb({
       db,
       schema: allTables,
@@ -118,7 +107,7 @@ describe("rbacDb — proxy-specific contracts", () => {
   });
 
   it("rdb.raw is the unwrapped db — reads and writes skip enforcement", async () => {
-    const { alice, carol } = await seedReaderAdmin(db, rbac);
+    const { db, rdbFor, cast: { alice, carol } } = tc;
     const rdb = rdbFor(ctxFor(carol.id)); // Carol has no role; raw must still work
 
     // Read through .raw bypasses enforcement.

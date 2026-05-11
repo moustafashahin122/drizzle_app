@@ -7,16 +7,16 @@
  * exercised through real `graphql(...)` calls so the public contract is what
  * gets validated.
  *
- * Cast and tables come from `__helpers__.ts`. The cast used here is
- * Alice(reader) / Bob(admin) / Carol(no role).
+ * Cast: Alice(reader), Bob(admin), Carol(no role). Per-test isolation via
+ * `transactionCase` SAVEPOINT rollback — see `__helpers__.ts`.
  */
-import { describe, it, before, beforeEach } from "node:test";
+import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { eq } from "drizzle-orm";
-import { graphql, type GraphQLSchema } from "graphql";
+import { graphql } from "graphql";
 
 import { buildSchema } from "../builder/builder.js";
-import { buildRbac, type BuiltRbac } from "./rbac.js";
+import { buildRbac } from "./rbac.js";
 import {
   defineRoles,
   defineAccessRights,
@@ -25,14 +25,14 @@ import {
 
 import {
   allTables,
+  db,
   todos,
   users,
   anonCtx,
   ctxFor,
-  clearAllMemberships,
   freshDb,
   seedReaderAdmin,
-  type Db,
+  transactionCase,
 } from "./__helpers__.js";
 
 const ownRows = [["ownerId", "=", "current_user.id"]];
@@ -49,10 +49,20 @@ const baseConfig = {
   }),
 };
 
+const tc = transactionCase(async () => {
+  const rbac = buildRbac(baseConfig);
+  const schema = buildSchema(db, allTables, { rbac: { enforce: rbac.enforce } }).schema;
+  const cast = await seedReaderAdmin(rbac);
+  const run = (source: string, contextValue: any, variableValues?: Record<string, unknown>) =>
+    graphql({ schema, source, contextValue, variableValues });
+  return { db, rbac, schema, run, cast };
+});
+
 /**
- * Builds an isolated DB + RBAC + GraphQL schema for tests that need a config
- * different from `baseConfig`. Each test that uses this owns its own DB so
- * it cannot leak state into the shared baseline.
+ * Self-contained alt-config harness for tests that need a different rbac
+ * config than the shared baseline (e.g. reader+update). Lives outside the
+ * shared transactionCase because the config itself is part of the contract
+ * under test.
  */
 function makeIsolated(cfg: Parameters<typeof buildRbac>[0]) {
   const { db: d } = freshDb();
@@ -63,54 +73,24 @@ function makeIsolated(cfg: Parameters<typeof buildRbac>[0]) {
   return { db: d, rbac: r, schema: sch, run };
 }
 
-let sqlite: ReturnType<typeof freshDb>["sqlite"];
-let db: Db;
-let schema: GraphQLSchema;
-let rbac: BuiltRbac;
-
-before(() => {
-  const f = freshDb();
-  sqlite = f.sqlite;
-  db = f.db;
-  rbac = buildRbac(baseConfig);
-  schema = buildSchema(db, allTables, { rbac: { enforce: rbac.enforce } }).schema;
-});
-
-beforeEach(() => {
-  sqlite.exec(`DELETE FROM todos; DELETE FROM users;`);
-  clearAllMemberships(rbac);
-});
-
-async function run(query: string, contextValue: any, variableValues?: Record<string, unknown>) {
-  return graphql({ schema, source: query, contextValue, variableValues });
-}
-
 describe("rbac — enforcement (GraphQL layer)", () => {
   describe("deny paths", () => {
-    // Each case captures how to build a context FROM the seeded cast — that
-    // avoids the autoincrement trap where DELETE doesn't reset SQLite's
-    // primary-key counter, so hardcoded ids drift after the first test runs.
-    const cases: Array<{
-      label: string;
-      ctx: (cast: { carol: { id: number } }) => any;
-      error: RegExp;
-    }> = [
+    const cases: Array<{ label: string; getCtx: () => any; error: RegExp }> = [
       {
         label: "unauthenticated caller (user=null)",
-        ctx: () => anonCtx(),
+        getCtx: () => anonCtx(),
         error: /Not authenticated/,
       },
       {
         label: "authenticated user with no role memberships",
-        ctx: (cast) => ctxFor(cast.carol.id),
+        getCtx: () => ctxFor(tc.cast.carol.id),
         error: /Access denied/,
       },
     ];
 
     for (const c of cases) {
       it(c.label, async () => {
-        const cast = await seedReaderAdmin(db, rbac);
-        const r = await run(`{ todos { id title } }`, c.ctx(cast));
+        const r = await tc.run(`{ todos { id title } }`, c.getCtx());
         assert.equal(r.data?.todos ?? null, null, "data.todos should be null on deny");
         assert.equal(r.errors?.length, 1);
         assert.match(r.errors![0].message, c.error);
@@ -119,7 +99,7 @@ describe("rbac — enforcement (GraphQL layer)", () => {
   });
 
   it("admin bypasses ACL and record rules — sees every todo verbatim", async () => {
-    const { alice, bob, carol } = await seedReaderAdmin(db, rbac);
+    const { run, cast: { alice, bob, carol } } = tc;
     // ownerId is promoted to a relation on the output type, so traverse it.
     const r = await run(
       `{ todos { id title ownerId { id name } } }`,
@@ -145,7 +125,7 @@ describe("rbac — enforcement (GraphQL layer)", () => {
   });
 
   it("reader sees only own rows; record rule filters out other owners", async () => {
-    const { alice, bob, carol } = await seedReaderAdmin(db, rbac);
+    const { run, cast: { alice, bob, carol } } = tc;
     const r = await run(
       `{ todos { id title ownerId { id } } }`,
       ctxFor(alice.id),
@@ -173,7 +153,7 @@ describe("rbac — enforcement (GraphQL layer)", () => {
   });
 
   it("reader cannot create todos and the table remains unchanged (no canCreate)", async () => {
-    const { alice } = await seedReaderAdmin(db, rbac);
+    const { db, run, cast: { alice } } = tc;
     const before = await db.select().from(todos);
     assert.equal(before.length, 4);
 
@@ -191,8 +171,8 @@ describe("rbac — enforcement (GraphQL layer)", () => {
   });
 
   it("update record rule narrows mutation scope to the reader's own rows", async () => {
-    // Reader needs `update` here, so build an isolated config rather than
-    // mutating baseConfig (which other tests rely on).
+    // Reader needs `update` here — build an alt-config schema rather than
+    // mutating the shared baseline. Self-contained: its own DB + rbac.
     const own = [["ownerId", "=", "current_user.id"]];
     const iso = makeIsolated({
       roles: defineRoles({ reader: {} }),
@@ -223,7 +203,7 @@ describe("rbac — enforcement (GraphQL layer)", () => {
       { w: [["title", "=", "bob-1"]] },
     );
     assert.equal(r.errors, undefined);
-    assert.deepEqual((r.data as any).updateTodos, [], "no rows must be returned for cross-owner update");
+    assert.deepEqual((r.data as any).updateTodos, [], "no rows returned for cross-owner update");
 
     // Isolation: bob's row untouched, AND alice's own row (not targeted) also untouched.
     const [bob] = await iso.db.select().from(todos).where(eq(todos.title, "bob-1"));
@@ -235,7 +215,7 @@ describe("rbac — enforcement (GraphQL layer)", () => {
 
   describe("config validation (unit)", () => {
     it("rejects unknown role on assignRole", () => {
-      assert.throws(() => rbac.assignRole(1, "ghost"), /unknown role/);
+      assert.throws(() => tc.rbac.assignRole(1, "ghost"), /unknown role/);
     });
 
     it("rejects empty roles config at build time", () => {

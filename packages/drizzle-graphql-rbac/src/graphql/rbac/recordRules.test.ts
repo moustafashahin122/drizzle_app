@@ -14,12 +14,14 @@
  *   - record rules are intersected with the user-supplied `where` (AND, not OR)
  *
  * Cast comes from `__helpers__.ts`: Alice + Bob are `user`, Carol is `manager`.
+ * Per-test isolation is provided by `transactionCase` SAVEPOINT rollback,
+ * not by a DB rebuild — see `__helpers__.ts` for details.
  */
-import { describe, it, before, beforeEach } from "node:test";
+import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { eq } from "drizzle-orm";
 
-import { buildRbac, type BuiltRbac } from "./rbac.js";
+import { buildRbac } from "./rbac.js";
 import { buildRbacDb } from "./rbacDb.js";
 import {
   defineRoles,
@@ -29,12 +31,11 @@ import {
 
 import {
   allTables,
+  db,
   todos,
   ctxFor,
-  clearAllMemberships,
-  freshDb,
   seedUserManager,
-  type Db,
+  transactionCase,
 } from "./__helpers__.js";
 
 const own = [["ownerId", "=", "current_user.id"]];
@@ -63,28 +64,22 @@ const rrConfig = {
   }),
 };
 
-let sqlite: ReturnType<typeof freshDb>["sqlite"];
-let db: Db;
-let rbac: BuiltRbac;
-let rdbFor: ReturnType<typeof buildRbacDb>;
-
-before(() => {
-  const f = freshDb();
-  sqlite = f.sqlite;
-  db = f.db;
-  rbac = buildRbac(rrConfig);
-  rdbFor = buildRbacDb({ db, schema: allTables, enforce: rbac.enforce });
-});
-
-beforeEach(() => {
-  sqlite.exec(`DELETE FROM todos; DELETE FROM users;`);
-  clearAllMemberships(rbac);
+const tc = transactionCase(async () => {
+  const rbac = buildRbac(rrConfig);
+  const rdbFor = buildRbacDb({ db, schema: allTables, enforce: rbac.enforce });
+  const cast = await seedUserManager(rbac);
+  return { db, rbac, rdbFor, cast };
 });
 
 describe("record rules — row-level scoping with full ACL grants", () => {
   describe("user role — scoped to own rows on read/update/delete", () => {
     it("reads only own rows; rows owned by Bob and Carol are excluded", async () => {
-      const { alice, bob, carol } = await seedUserManager(db, rbac);
+      const { rdbFor, cast: { alice, bob, carol } } = tc;
+      // The following instantiates a "row-level RBAC database" (rdb) for Alice,
+      // meaning all subsequent queries through `rdb` automatically enforce Alice's permissions
+      // and record rules. The provided context (`ctxFor(alice.id)`) represents Alice as the current user;
+      // rdbFor binds this context to the RBAC engine, so only rows Alice is allowed to see
+      // (per the record rules config) are returned by .select().from(...).
       const rdb = rdbFor(ctxFor(alice.id));
       const rows = await rdb.select().from(todos);
 
@@ -95,25 +90,19 @@ describe("record rules — row-level scoping with full ACL grants", () => {
     });
 
     it("user-supplied where AND-s with the scope rule (no escape via where)", async () => {
-      const { alice } = await seedUserManager(db, rbac);
+      const { rdbFor, cast: { alice } } = tc;
       const rdb = rdbFor(ctxFor(alice.id));
 
-      // Targeting Bob's row with an explicit where still yields [] — the
-      // scope predicate AND-s in and excludes it.
-      const hostile = await rdb
-        .select()
-        .from(todos)
-        .where(eq(todos.title, "bob-1"));
+      const hostile = await rdb.select().from(todos).where(eq(todos.title, "bob-1"));
       assert.deepEqual(hostile, []);
 
-      // Sanity: the same caller still sees their own rows.
       const own = await rdb.select().from(todos);
       assert.equal(own.length, 2);
       assert.ok(own.every((r: any) => r.ownerId === alice.id));
     });
 
     it("can update an own row; readback confirms persistence and FK preservation", async () => {
-      const { alice } = await seedUserManager(db, rbac);
+      const { db, rdbFor, cast: { alice } } = tc;
       const rdb = rdbFor(ctxFor(alice.id));
       const updated = await rdb
         .update(todos)
@@ -129,13 +118,12 @@ describe("record rules — row-level scoping with full ACL grants", () => {
       assert.equal(hit.title, "alice-1-renamed");
       assert.equal(hit.ownerId, alice.id);
 
-      // Sibling untouched.
       const [aliceTwo] = await db.select().from(todos).where(eq(todos.title, "alice-2"));
       assert.equal(aliceTwo.ownerId, alice.id);
     });
 
     it("cross-owner update returns []; target row and own rows untouched", async () => {
-      const { alice, bob } = await seedUserManager(db, rbac);
+      const { db, rdbFor, cast: { alice, bob } } = tc;
       const rdb = rdbFor(ctxFor(alice.id));
       const updated = await rdb
         .update(todos)
@@ -145,20 +133,17 @@ describe("record rules — row-level scoping with full ACL grants", () => {
 
       assert.deepEqual(updated, [], "scope rule must silently narrow cross-owner updates to []");
 
-      // Target row intact.
       const [bobRow] = await db.select().from(todos).where(eq(todos.title, "bob-1"));
       assert.equal(bobRow.title, "bob-1");
       assert.equal(bobRow.ownerId, bob.id);
 
-      // Alice's own rows also unmodified — the narrowing did not accidentally
-      // touch any row that *was* in scope.
       const aliceRows = await db.select().from(todos).where(eq(todos.ownerId, alice.id));
       assert.equal(aliceRows.length, 2);
       assert.deepEqual(aliceRows.map((r) => r.title).sort(), ["alice-1", "alice-2"]);
     });
 
     it("can delete an own row; total count drops by exactly one", async () => {
-      const { alice } = await seedUserManager(db, rbac);
+      const { db, rdbFor, cast: { alice } } = tc;
       const rdb = rdbFor(ctxFor(alice.id));
       const deleted = await rdb
         .delete(todos)
@@ -172,14 +157,13 @@ describe("record rules — row-level scoping with full ACL grants", () => {
       assert.equal(all.length, 3);
       assert.ok(all.every((r) => r.title !== "alice-1"));
 
-      // Alice's other row still present.
       const [aliceTwo] = await db.select().from(todos).where(eq(todos.title, "alice-2"));
       assert.equal(aliceTwo.title, "alice-2");
       assert.equal(aliceTwo.ownerId, alice.id);
     });
 
     it("cross-owner delete returns []; target row and total count unchanged", async () => {
-      const { alice, bob } = await seedUserManager(db, rbac);
+      const { db, rdbFor, cast: { alice, bob } } = tc;
       const rdb = rdbFor(ctxFor(alice.id));
       const deleted = await rdb
         .delete(todos)
@@ -197,7 +181,7 @@ describe("record rules — row-level scoping with full ACL grants", () => {
     });
 
     it("can create a new own row (no record rule constrains create)", async () => {
-      const { alice } = await seedUserManager(db, rbac);
+      const { rdbFor, cast: { alice } } = tc;
       const rdb = rdbFor(ctxFor(alice.id));
       const out = await rdb
         .insert(todos)
@@ -208,7 +192,6 @@ describe("record rules — row-level scoping with full ACL grants", () => {
       assert.equal(out[0].title, "alice-3");
       assert.equal(out[0].ownerId, alice.id);
 
-      // Newly inserted row is visible to its owner through the read rule.
       const ownRows = await rdb.select().from(todos);
       assert.equal(ownRows.length, 3);
       assert.ok(ownRows.some((r: any) => r.id === out[0].id && r.title === "alice-3"));
@@ -217,7 +200,7 @@ describe("record rules — row-level scoping with full ACL grants", () => {
 
   describe("manager role — no record rule, unrestricted row access", () => {
     it("reads every row, all three owners represented", async () => {
-      const { alice, bob, carol } = await seedUserManager(db, rbac);
+      const { rdbFor, cast: { alice, bob, carol } } = tc;
       const rdb = rdbFor(ctxFor(carol.id));
       const rows = await rdb.select().from(todos);
 
@@ -232,8 +215,7 @@ describe("record rules — row-level scoping with full ACL grants", () => {
     });
 
     it("can update a user's row; the user's read view reflects the change", async () => {
-      const { alice, carol } = await seedUserManager(db, rbac);
-
+      const { rdbFor, cast: { alice, carol } } = tc;
       const carolRdb = rdbFor(ctxFor(carol.id));
       const updated = await carolRdb
         .update(todos)
@@ -241,9 +223,8 @@ describe("record rules — row-level scoping with full ACL grants", () => {
         .where(eq(todos.title, "alice-1"))
         .returning();
       assert.equal(updated.length, 1);
-      assert.equal(updated[0].ownerId, alice.id, "ownerId preserved by title-only set");
+      assert.equal(updated[0].ownerId, alice.id);
 
-      // The owning user — still scoped to own rows — now sees the new title.
       const aliceRdb = rdbFor(ctxFor(alice.id));
       const aliceView = await aliceRdb.select().from(todos);
       const titles = aliceView.map((r: any) => r.title).sort();
@@ -251,7 +232,7 @@ describe("record rules — row-level scoping with full ACL grants", () => {
     });
 
     it("can delete a user's row; only that row disappears", async () => {
-      const { bob, carol } = await seedUserManager(db, rbac);
+      const { db, rdbFor, cast: { bob, carol } } = tc;
       const rdb = rdbFor(ctxFor(carol.id));
       const deleted = await rdb
         .delete(todos)
@@ -269,7 +250,7 @@ describe("record rules — row-level scoping with full ACL grants", () => {
     });
 
     it("can create their own row", async () => {
-      const { carol } = await seedUserManager(db, rbac);
+      const { db, rdbFor, cast: { carol } } = tc;
       const rdb = rdbFor(ctxFor(carol.id));
       const out = await rdb
         .insert(todos)
@@ -285,34 +266,26 @@ describe("record rules — row-level scoping with full ACL grants", () => {
 
   describe("cross-actor isolation", () => {
     it("a manager edit to Bob's row is invisible to Alice's read view", async () => {
-      const { alice, carol } = await seedUserManager(db, rbac);
-
-      // Manager renames Bob's row.
-      const carolRdb = rdbFor(ctxFor(carol.id));
-      await carolRdb
+      const { rdbFor, cast: { alice, carol } } = tc;
+      await rdbFor(ctxFor(carol.id))
         .update(todos)
         .set({ title: "bob-1-renamed-by-manager" })
         .where(eq(todos.title, "bob-1"));
 
-      // Alice's scoped view still contains only her two rows; Bob's renamed
-      // row is not pulled in by the manager's mutation.
-      const aliceRdb = rdbFor(ctxFor(alice.id));
-      const rows = await aliceRdb.select().from(todos);
+      const rows = await rdbFor(ctxFor(alice.id)).select().from(todos);
       assert.equal(rows.length, 2);
       assert.deepEqual(rows.map((r: any) => r.title).sort(), ["alice-1", "alice-2"]);
       assert.ok(rows.every((r: any) => r.ownerId === alice.id));
     });
 
     it("Alice and Bob (same role) see disjoint row sets", async () => {
-      const { alice, bob } = await seedUserManager(db, rbac);
-
+      const { rdbFor, cast: { alice, bob } } = tc;
       const aliceRows = await rdbFor(ctxFor(alice.id)).select().from(todos);
       const bobRows   = await rdbFor(ctxFor(bob.id)).select().from(todos);
 
       assert.deepEqual(aliceRows.map((r: any) => r.title).sort(), ["alice-1", "alice-2"]);
       assert.deepEqual(bobRows.map((r: any) => r.title).sort(), ["bob-1"]);
 
-      // No id overlap between the two views.
       const aliceIds = new Set(aliceRows.map((r: any) => r.id));
       assert.ok(bobRows.every((r: any) => !aliceIds.has(r.id)));
     });

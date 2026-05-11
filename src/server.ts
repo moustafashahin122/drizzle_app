@@ -1,20 +1,12 @@
 import { serve } from "@hono/node-server";
 import { inArray } from "drizzle-orm";
 import { createApp, logger } from "drizzle-graphql-rbac";
-import * as schema from "./db.js";
-import { roles } from "./roles.js";
-import { accessRights } from "./accessRights.js";
-import { recordRules } from "./recordRules.js";
+import { db, users } from "./db.js";
+import { appConfig } from "./appConfig.js";
 
 const log = logger.child({ component: "app.server" });
 
-const { app, rbac } = createApp({
-  db: schema.db,
-  schema,
-  rbac: { roles, accessRights, recordRules },
-  hiddenOutputColumns: { users: ["passwordHash"] },
-  publicDir: "./public",
-});
+const { app, rbac } = createApp({ db, ...appConfig });
 
 // In-memory RBAC: re-seed role assignments from a small email → roles map on
 // every startup. Keeps the dev experience working with the seed scripts.
@@ -24,10 +16,10 @@ const bootstrap: Record<string, string[]> = {
 };
 const bootstrapEmails = Object.keys(bootstrap);
 if (bootstrapEmails.length) {
-  const rows = await schema.db
-    .select({ id: schema.users.id, email: schema.users.email })
-    .from(schema.users)
-    .where(inArray(schema.users.email, bootstrapEmails));
+  const rows = await db
+    .select({ id: users.id, email: users.email })
+    .from(users)
+    .where(inArray(users.email, bootstrapEmails));
   for (const { id, email } of rows) {
     for (const key of bootstrap[email] ?? []) {
       if (rbac.hasRole(key)) {

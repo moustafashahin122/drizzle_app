@@ -1,7 +1,7 @@
 import type { Config } from "drizzle-kit";
 
 export default {
-  schema: "./src/db.ts",
+  schema: "./src/schema.ts",
   out: "./drizzle",
   dialect: "sqlite",
   dbCredentials: { url: "todo.db" },
