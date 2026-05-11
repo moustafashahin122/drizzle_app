@@ -1,5 +1,5 @@
 /**
- * @module graphql/util
+ * @module graphql/builder/util
  *
  * Small helpers shared by more than one builder module. Anything here should be
  * trivially testable in isolation and have no opinion about GraphQL or Drizzle
@@ -18,6 +18,7 @@ import {
   type DomainPlaceholders,
 } from "../domain/domain.js";
 import type { DrizzleLike, TableMeta } from "./types.js";
+import { isPrimary } from "./drizzle-internals.js";
 
 /**
  * Reverse-lookup the JS key of a Drizzle column inside a `{ jsKey: Column }` map.
@@ -98,7 +99,7 @@ export function projectionForSelection(
   const proj: Record<string, Column> = {};
   // Primary key columns are unconditionally projected.
   for (const [k, c] of Object.entries(meta.columns)) {
-    if ((c as any).primary) proj[k] = c;
+    if (isPrimary(c)) proj[k] = c;
   }
 
   const relByName = new Map(meta.relations.map((r) => [r.fieldName, r]));

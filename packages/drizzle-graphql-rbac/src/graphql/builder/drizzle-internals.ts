@@ -34,3 +34,8 @@ export function isPrimary(col: Column): boolean {
 export function getColumnName(col: Column): string {
   return (col as any).name as string;
 }
+
+/** Drizzle's per-dialect column-type tag (e.g. "SQLiteInteger", "PgReal"). Used to disambiguate numeric subtypes for GraphQL type mapping. */
+export function getColumnType(col: Column): string | undefined {
+  return (col as any).columnType;
+}

@@ -1,5 +1,5 @@
 /**
- * @module graphql/builder-relations
+ * @module graphql/builder/builder-relations
  *
  * Summary
  * -------

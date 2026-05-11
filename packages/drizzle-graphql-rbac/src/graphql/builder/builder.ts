@@ -70,6 +70,7 @@ import { buildTableMeta } from "./builder-types.js";
 import { addRootFields } from "./builder-resolvers.js";
 import type { DomainContext } from "../domain/domain.js";
 import type { DrizzleLike, TableMeta } from "./types.js";
+import type { RbacContext } from "../rbac/rbac.js";
 
 export type { DrizzleLike } from "./types.js";
 export type { BatchCache } from "./builder-relations.js";
@@ -92,7 +93,7 @@ export interface BuildSchemaOptions {
    * gate those). Use for fields like `passwordHash` that must not leak in
    * query responses but still need to be writable internally.
    */
-  hiddenOutputColumns?: Record<string, string[]>;
+  hiddenOutputColumns?: Record<string, readonly string[]>;
   /**
    * Extra root Query fields to merge into the schema. Receives the map of
    * generated object types keyed by JS schema key, so callers can compose
@@ -125,7 +126,7 @@ export interface BuildSchemaOptions {
    */
   rbac?: {
     enforce: (
-      ctx: any,
+      ctx: RbacContext,
       resource: string,
       action: "create" | "read" | "update" | "delete",
       columns: ColumnMap,
@@ -135,7 +136,7 @@ export interface BuildSchemaOptions {
      * insert into `users` without the caller being authenticated). Resolvers
      * for tables in this set skip enforcement entirely.
      */
-     bypassResources?: Set<string>;
+     bypassResources?: ReadonlySet<string>;
   };
   /**
    * Maximum number of distinct foreign-key values to include in a single

@@ -1,5 +1,5 @@
 /**
- * @module graphql/scalars
+ * @module graphql/builder/scalars
  *
  * Summary
  * -------

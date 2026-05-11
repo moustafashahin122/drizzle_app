@@ -51,6 +51,19 @@ import type {
   users as usersTableType,
 } from "./tables.js";
 
+// Hono's logger may pre-color the status code with its own ANSI escapes; strip
+// them before sniffing for a three-digit status.
+// eslint-disable-next-line no-control-regex
+const ANSI_RE = /\x1b\[[0-9;]*m/g;
+
+function pickHttpStatus(parts: readonly string[]): number | null {
+  for (const p of parts) {
+    const bare = p.replace(ANSI_RE, "");
+    if (/^[1-5]\d{2}$/.test(bare)) return Number(bare);
+  }
+  return null;
+}
+
 export interface CreateAppOptions {
   /** A Drizzle DB instance (any dialect). */
   db: SessionDb;
@@ -125,19 +138,6 @@ export interface CreatedApp {
  * from the code config; memberships start empty and are added via the
  * returned `rbac` handle or the admin REST endpoints.
  */
-// Hono's logger may pre-color the status code with its own ANSI escapes; strip
-// them before sniffing for a three-digit status.
-// eslint-disable-next-line no-control-regex
-const ANSI_RE = /\x1b\[[0-9;]*m/g;
-
-function pickHttpStatus(parts: readonly string[]): number | null {
-  for (const p of parts) {
-    const bare = p.replace(ANSI_RE, "");
-    if (/^[1-5]\d{2}$/.test(bare)) return Number(bare);
-  }
-  return null;
-}
-
 export function createApp(opts: CreateAppOptions): CreatedApp {
   const {
     db,
@@ -175,6 +175,11 @@ export function createApp(opts: CreateAppOptions): CreatedApp {
 
   const rdbFor = buildRbacDb({ db, schema, enforce: rbac.enforce });
 
+  interface ServerCtx {
+    user: User | null;
+    session: Session | null;
+  }
+
   interface YogaContext {
     user: User | null;
     session: Session | null;
@@ -182,7 +187,7 @@ export function createApp(opts: CreateAppOptions): CreatedApp {
     db: RbacDb;
   }
 
-  const yoga = createYoga<{}, YogaContext>({
+  const yoga = createYoga<ServerCtx, YogaContext>({
     schema: gqlSchema,
     graphqlEndpoint,
     graphiql: true,
@@ -194,14 +199,14 @@ export function createApp(opts: CreateAppOptions): CreatedApp {
         },
       },
     ],
-    context: async ({ request }) => {
-      const stash = (request as any)._authCtx as
-        | { user: User | null; session: Session | null }
-        | undefined;
-      const user = stash?.user ?? null;
-      const session = stash?.session ?? null;
+    context: async ({ user, session }) => {
       const batch = new Map<string, unknown>();
-      return { user, session, batch, db: rdbFor({ user, batch }) };
+      return {
+        user: user ?? null,
+        session: session ?? null,
+        batch,
+        db: rdbFor({ user: user ?? null, batch }),
+      };
     },
   });
 
@@ -244,11 +249,10 @@ export function createApp(opts: CreateAppOptions): CreatedApp {
 
   app.use(graphqlEndpoint, sessionMiddleware(db, sessionSchema));
   app.all(graphqlEndpoint, async (c) => {
-    (c.req.raw as any)._authCtx = {
+    return yoga.fetch(c.req.raw, {
       user: c.get("user"),
       session: c.get("session"),
-    };
-    return yoga.fetch(c.req.raw, {});
+    });
   });
 
   if (publicDir) {

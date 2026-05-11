@@ -32,12 +32,12 @@ export const ADMIN_ROLE = "admin" as const;
  * it short-circuit every RBAC check, so it doesn't need any access-rights or
  * record-rule entries.
  */
-export const FRAMEWORK_ROLES: RolesConfig = {
+export const FRAMEWORK_ROLES = {
   [ADMIN_ROLE]: { isAdmin: true },
-};
+} as const satisfies RolesConfig;
 
-export const FRAMEWORK_ACCESS_RIGHTS: AccessRightsConfig = {};
-export const FRAMEWORK_RECORD_RULES: RecordRulesConfig = {};
+export const FRAMEWORK_ACCESS_RIGHTS = {} as const satisfies AccessRightsConfig;
+export const FRAMEWORK_RECORD_RULES = {} as const satisfies RecordRulesConfig;
 
 /**
  * Merge framework-owned RBAC entries into a user-supplied config. Throws if

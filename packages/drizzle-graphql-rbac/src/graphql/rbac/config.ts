@@ -64,15 +64,55 @@ export interface RbacConfig {
 // Define helpers (identity functions that exist for IDE autocomplete).
 // ---------------------------------------------------------------------------
 
-export function defineRoles<T extends RolesConfig>(roles: T): T {
+/**
+ * Declare role keys with optional `isAdmin` flag. Identity function whose
+ * generic captures the literal keys for IDE autocomplete on access-rights
+ * and record-rule lookups.
+ *
+ * @example
+ * export const roles = defineRoles({
+ *   manager: {},
+ *   employee: {},
+ * });
+ */
+export function defineRoles<TRoles extends RolesConfig>(roles: TRoles): TRoles {
   return roles;
 }
 
-export function defineAccessRights<T extends AccessRightsConfig>(rights: T): T {
+/**
+ * Declare per-role CRUD booleans on each resource. Identity function — its
+ * generic captures the literal shape so the keys line up with `defineRoles`
+ * output for IDE autocomplete.
+ *
+ * @example
+ * export const accessRights = defineAccessRights({
+ *   manager: {
+ *     todos: { create: true, read: true, update: true, delete: true },
+ *   },
+ *   employee: {
+ *     todos: { read: true, update: true },
+ *   },
+ * });
+ */
+export function defineAccessRights<TRights extends AccessRightsConfig>(rights: TRights): TRights {
   return rights;
 }
 
-export function defineRecordRules<T extends RecordRulesConfig>(rules: T): T {
+/**
+ * Declare per-`(role, resource, action)` row-level domains. Identity function
+ * — preserves the literal shape so keys autocomplete against the roles config.
+ *
+ * @example
+ * export const recordRules = defineRecordRules({
+ *   employee: {
+ *     todos: {
+ *       read: { domain: [["assigneeId", "=", "current_user.id"]] },
+ *       update: { domain: [["assigneeId", "=", "current_user.id"]] },
+ *     },
+ *   },
+ * });
+ */
+export function defineRecordRules<TRules extends RecordRulesConfig>(rules: TRules): TRules {
   return rules;
 }
 

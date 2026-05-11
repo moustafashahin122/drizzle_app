@@ -1,5 +1,5 @@
 /**
- * @module graphql/rbacDb
+ * @module graphql/rbac/rbacDb
  *
  * Per-request RBAC-bound Drizzle wrapper. Resolvers that use `ctx.db` instead
  * of the raw `db` get RBAC enforced automatically — no need to call

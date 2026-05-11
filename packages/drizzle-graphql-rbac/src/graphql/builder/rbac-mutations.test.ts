@@ -119,7 +119,7 @@ describe("buildSchema — insert create-rule enforcement", () => {
       { v: [{ title: "evil", ownerId: other.id }] },
     );
     assert.ok(res.errors?.length, "expected error");
-    assert.match(res.errors![0].message, /Insert blocked by record rule/);
+    assert.match(res.errors![0].message, /rbac: insert blocked by record rule/);
     // tx rolled back — nothing persisted.
     const rows = await db.select().from(todos);
     assert.equal(rows.length, 0);
@@ -140,7 +140,7 @@ describe("buildSchema — insert create-rule enforcement", () => {
       },
     );
     assert.ok(res.errors?.length);
-    assert.match(res.errors![0].message, /Insert blocked by record rule/);
+    assert.match(res.errors![0].message, /rbac: insert blocked by record rule/);
     const rows = await db.select().from(todos);
     assert.equal(rows.length, 0, "tx must roll back the whole batch");
   });
@@ -223,7 +223,7 @@ describe("buildSchema — update/delete empty-WHERE assert", () => {
       contextValue: {},
     });
     assert.ok(res.errors?.length);
-    assert.match(res.errors![0].message, /Refusing UPDATE with empty WHERE/);
+    assert.match(res.errors![0].message, /rbac: refusing UPDATE with empty WHERE/);
     // Row was not touched.
     const rows = await db2.select().from(users);
     assert.equal(rows[0].name, "X");
@@ -242,7 +242,7 @@ describe("buildSchema — update/delete empty-WHERE assert", () => {
       contextValue: {},
     });
     assert.ok(res.errors?.length);
-    assert.match(res.errors![0].message, /Refusing DELETE with empty WHERE/);
+    assert.match(res.errors![0].message, /rbac: refusing DELETE with empty WHERE/);
     const rows = await db2.select().from(users);
     assert.equal(rows.length, 1);
   });

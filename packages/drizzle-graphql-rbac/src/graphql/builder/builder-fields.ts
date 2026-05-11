@@ -1,5 +1,5 @@
 /**
- * @module graphql/builder-fields
+ * @module graphql/builder/builder-fields
  *
  * Summary
  * -------

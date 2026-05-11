@@ -1,5 +1,5 @@
 /**
- * @module graphql/types
+ * @module graphql/builder/types
  *
  * Summary
  * -------
@@ -34,10 +34,12 @@ import {
   type GraphQLOutputType,
   type GraphQLInputType,
 } from "graphql";
-import type { Column, SQL } from "drizzle-orm";
+import type { Column, SQL, Table } from "drizzle-orm";
 import type { ColumnMap } from "./filters.js";
 import type { ExtractedRelation } from "./relations.js";
 import { GraphQLBigIntStr, GraphQLJSON } from "./scalars.js";
+import { isPrimary, getColumnType } from "./drizzle-internals.js";
+import type { RbacContext } from "../rbac/rbac.js";
 
 /**
  * Structural shape of a Drizzle DB instance accepted by the builder.
@@ -66,7 +68,7 @@ export interface TableMeta {
   /** GraphQL ObjectType name (defaults to `cap(jsKey)`; mutations are named `insertInto<typeName>`, etc.). */
   typeName: string;
   /** Drizzle table reference, passed through to query builders. */
-  table: any;
+  table: Table;
   /** Map of GraphQL field name → Drizzle Column (the field name equals the Drizzle JS key). */
   columns: ColumnMap;
   /** Relations declared on this table (forward + inverse, after introspection). */
@@ -85,7 +87,7 @@ export interface TableMeta {
  * the bypass list, so resolvers should skip the call entirely.
  */
 export type Guard =
-  | ((ctx: any, action: "create" | "read" | "update" | "delete") => Promise<SQL | undefined>)
+  | ((ctx: RbacContext, action: "create" | "read" | "update" | "delete") => Promise<SQL | undefined>)
   | null;
 
 /**
@@ -105,11 +107,11 @@ export type Guard =
  * columnToBaseType(todos.completed); // → GraphQLBoolean
  */
 export function columnToBaseType(col: Column): GraphQLOutputType & GraphQLInputType {
-  if ((col as any).primary) return GraphQLID;
+  if (isPrimary(col)) return GraphQLID;
   switch (col.dataType) {
     case "number":
       // SQLiteInteger / PgInteger / MySqlInt etc — use Int unless it looks like a real number.
-      if (/real|double|float|decimal|numeric/i.test((col as any).columnType ?? ""))
+      if (/real|double|float|decimal|numeric/i.test(getColumnType(col) ?? ""))
         return GraphQLFloat;
       return GraphQLInt;
     case "bigint":

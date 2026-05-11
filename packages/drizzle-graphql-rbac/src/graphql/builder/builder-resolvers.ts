@@ -1,5 +1,5 @@
 /**
- * @module graphql/builder-resolvers
+ * @module graphql/builder/builder-resolvers
  *
  * Summary
  * -------
@@ -10,6 +10,7 @@
  * transactional post-check for INSERTs gated by a create-domain record rule).
  */
 import {
+  GraphQLError,
   GraphQLInt,
   GraphQLList,
   GraphQLNonNull,
@@ -156,7 +157,9 @@ function buildInsertMutationField(
       // row fails, the throw rolls the tx back.
       if (!pkEntries.length) {
         // No primary key to re-fetch by — refuse rather than silently accept.
-        throw new Error("Insert blocked by record rule");
+        throw new GraphQLError("rbac: insert blocked by record rule", {
+          extensions: { code: "FORBIDDEN" },
+        });
       }
       // Drizzle's `db.transaction(...)` callback dispatch differs by driver:
       // better-sqlite3 invokes it synchronously and refuses a promise return
@@ -189,7 +192,9 @@ function buildInsertMutationField(
               .limit(1)
               .all();
             if (!matched.length) {
-              throw new Error("Insert blocked by record rule");
+              throw new GraphQLError("rbac: insert blocked by record rule", {
+                extensions: { code: "FORBIDDEN" },
+              });
             }
           }
           return inserted;
@@ -208,7 +213,9 @@ function buildInsertMutationField(
             .where(matchWhere)
             .limit(1);
           if (!matched.length) {
-            throw new Error("Insert blocked by record rule");
+            throw new GraphQLError("rbac: insert blocked by record rule", {
+              extensions: { code: "FORBIDDEN" },
+            });
           }
         }
         return inserted;
@@ -237,8 +244,9 @@ function buildUpdateMutationField(
       // `where` is a nullable arg — a missing user filter combined with no
       // RBAC restriction would otherwise emit an unbounded UPDATE.
       if (!combined) {
-        throw new Error(
-          "Refusing UPDATE with empty WHERE — RBAC misconfiguration",
+        throw new GraphQLError(
+          "rbac: refusing UPDATE with empty WHERE — misconfiguration",
+          { extensions: { code: "FORBIDDEN" } },
         );
       }
       return db.update(meta.table).set(args.set).where(combined).returning();
@@ -262,8 +270,9 @@ function buildDeleteMutationField(
       const combined = combineWhere(extra, userWhere);
       // Same defensive guard as update — refuse an unbounded DELETE.
       if (!combined) {
-        throw new Error(
-          "Refusing DELETE with empty WHERE — RBAC misconfiguration",
+        throw new GraphQLError(
+          "rbac: refusing DELETE with empty WHERE — misconfiguration",
+          { extensions: { code: "FORBIDDEN" } },
         );
       }
       return db.delete(meta.table).where(combined).returning();

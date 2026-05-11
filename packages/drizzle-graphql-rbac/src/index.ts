@@ -43,14 +43,6 @@ export {
 } from "./auth/session.js";
 export type { SessionDb, SessionSchema } from "./auth/session.js";
 
-// REST admin primitives.
-export { buildAdminRoutes } from "./admin/routes.js";
-export type { AdminRoutesDeps } from "./admin/routes.js";
-
-// GraphQL builder + custom scalars + validation rules.
-export { buildSchema, GraphQLJSON, GraphQLBigIntStr, depthLimit } from "./graphql/index.js";
-export type { BuildSchemaOptions, DrizzleLike } from "./graphql/index.js";
-
 // CSRF primitives + constants (callers may need to set/read these directly).
 export {
   CSRF_COOKIE_NAME,
@@ -60,6 +52,14 @@ export {
   parseCookieValue,
 } from "./auth/session.js";
 export { csrfProtection } from "./auth/middleware.js";
+
+// REST admin primitives.
+export { buildAdminRoutes } from "./admin/routes.js";
+export type { AdminRoutesDeps } from "./admin/routes.js";
+
+// GraphQL builder + custom scalars + validation rules.
+export { buildSchema, GraphQLJSON, GraphQLBigIntStr, depthLimit } from "./graphql/index.js";
+export type { BuildSchemaOptions, DrizzleLike } from "./graphql/index.js";
 
 // RBAC engine.
 export { buildRbac } from "./graphql/rbac/rbac.js";

@@ -1,5 +1,5 @@
 /**
- * @module graphql/builder-types
+ * @module graphql/builder/builder-types
  *
  * Summary
  * -------
