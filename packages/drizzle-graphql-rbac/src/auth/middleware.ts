@@ -11,10 +11,34 @@ import type { User, Session } from "../tables.js";
 import {
   extractBearerToken,
   parseSessionCookie,
+  parseCookieValue,
   resolveSessionFromToken,
+  CSRF_COOKIE_NAME,
+  CSRF_HEADER_NAME,
   type SessionDb,
   type SessionSchema,
 } from "./session.js";
+
+const MUTATING_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
+
+/**
+ * Double-submit CSRF check. On mutating requests we require the
+ * `X-CSRF-Token` header to equal the non-HttpOnly `csrf_token` cookie. If
+ * the request has no session cookie at all, we allow it through so initial
+ * login / register can succeed.
+ */
+export const csrfProtection: MiddlewareHandler<AuthEnv> = async (c, next) => {
+  if (!MUTATING_METHODS.has(c.req.method)) return next();
+  const cookieHeader = c.req.header("cookie");
+  const hasSession = parseSessionCookie(cookieHeader) != null;
+  if (!hasSession) return next();
+  const cookieToken = parseCookieValue(cookieHeader, CSRF_COOKIE_NAME);
+  const headerToken = c.req.header(CSRF_HEADER_NAME) ?? null;
+  if (!cookieToken || !headerToken || cookieToken !== headerToken) {
+    return c.json({ error: "CSRF token missing or invalid" }, 403);
+  }
+  await next();
+};
 
 export interface AuthVariables {
   user: User | null;

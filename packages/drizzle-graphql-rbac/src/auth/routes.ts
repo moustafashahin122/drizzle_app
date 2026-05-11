@@ -19,17 +19,29 @@
  */
 import { Hono } from "hono";
 import bcrypt from "bcryptjs";
+import { randomBytes } from "node:crypto";
 import { eq } from "drizzle-orm";
 import type { User } from "../tables.js";
 import {
+  buildClearCsrfCookie,
   buildClearSessionCookie,
+  buildCsrfCookie,
   buildSessionCookie,
   destroySession,
   issueSession,
   type SessionDb,
   type SessionSchema,
 } from "./session.js";
-import { requireAuth, sessionMiddleware, type AuthEnv } from "./middleware.js";
+import { csrfProtection, requireAuth, sessionMiddleware, type AuthEnv } from "./middleware.js";
+
+const BCRYPT_ROUNDS = 12;
+// Pre-computed dummy hash so /auth/login does a bcrypt compare for unknown
+// emails too — equalizes timing and frustrates user-enumeration.
+const DUMMY_HASH = bcrypt.hashSync("dummy-password-for-timing", BCRYPT_ROUNDS);
+
+function newCsrfToken(): string {
+  return randomBytes(32).toString("hex");
+}
 
 /** Strip the password hash before serializing to JSON. */
 function publicUser(user: User): Omit<User, "passwordHash"> {
@@ -53,6 +65,7 @@ export function buildAuthRoutes(deps: AuthRoutesDeps) {
   const { db, schema } = deps;
   const app = new Hono<AuthEnv>();
   app.use("*", sessionMiddleware(db, schema));
+  app.use("*", csrfProtection);
 
   app.post("/register", async (c) => {
     const body = await c.req.json().catch(() => ({}));
@@ -63,7 +76,7 @@ export function buildAuthRoutes(deps: AuthRoutesDeps) {
       return c.json({ error: "name, email and password are required" }, 400);
     }
 
-    const passwordHash = await bcrypt.hash(password, 10);
+    const passwordHash = await bcrypt.hash(password, BCRYPT_ROUNDS);
     let user: User;
     try {
       const [row] = await db
@@ -80,6 +93,7 @@ export function buildAuthRoutes(deps: AuthRoutesDeps) {
 
     const { token } = await issueSession(db, schema, user.id);
     c.header("Set-Cookie", buildSessionCookie(token), { append: true });
+    c.header("Set-Cookie", buildCsrfCookie(newCsrfToken()), { append: true });
     return c.json({ user: publicUser(user) }, 201);
   });
 
@@ -97,6 +111,9 @@ export function buildAuthRoutes(deps: AuthRoutesDeps) {
       .where(eq(schema.users.email, email))
       .limit(1);
     if (!user || !user.active) {
+      // Compare against a dummy hash so the timing for unknown / inactive
+      // emails matches the success path.
+      bcrypt.compareSync(password, DUMMY_HASH);
       return c.json({ error: "Invalid credentials" }, 401);
     }
     const ok = await bcrypt.compare(password, user.passwordHash);
@@ -106,12 +123,14 @@ export function buildAuthRoutes(deps: AuthRoutesDeps) {
 
     const { token } = await issueSession(db, schema, user.id);
     c.header("Set-Cookie", buildSessionCookie(token), { append: true });
+    c.header("Set-Cookie", buildCsrfCookie(newCsrfToken()), { append: true });
     return c.json({ user: publicUser(user as User) });
   });
 
   app.post("/logout", async (c) => {
     const session = c.get("session");
     c.header("Set-Cookie", buildClearSessionCookie(), { append: true });
+    c.header("Set-Cookie", buildClearCsrfCookie(), { append: true });
     if (!session) return c.json({ ok: false });
     await destroySession(db, schema, session.id);
     return c.json({ ok: true });

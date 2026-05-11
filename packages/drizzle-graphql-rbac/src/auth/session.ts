@@ -39,12 +39,42 @@ export const newExpiresAt = () => new Date(Date.now() + SESSION_MS).toISOString(
 
 /** Build the `Set-Cookie` header value for the session cookie. */
 export function buildSessionCookie(token: string): string {
-  return `${SESSION_COOKIE_NAME}=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${SESSION_DAYS * 86400}`;
+  return `${SESSION_COOKIE_NAME}=${token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${SESSION_DAYS * 86400}`;
 }
 
 /** Header value that clears the session cookie (Max-Age=0). */
 export function buildClearSessionCookie(): string {
-  return `${SESSION_COOKIE_NAME}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0`;
+  return `${SESSION_COOKIE_NAME}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0`;
+}
+
+export const CSRF_COOKIE_NAME = "csrf_token";
+export const CSRF_HEADER_NAME = "x-csrf-token";
+
+/** Build a CSRF cookie (NOT HttpOnly so client JS can echo it in a header). */
+export function buildCsrfCookie(token: string): string {
+  return `${CSRF_COOKIE_NAME}=${token}; SameSite=Strict; Path=/; Max-Age=${SESSION_DAYS * 86400}`;
+}
+
+/** Header value that clears the CSRF cookie. */
+export function buildClearCsrfCookie(): string {
+  return `${CSRF_COOKIE_NAME}=; SameSite=Strict; Path=/; Max-Age=0`;
+}
+
+/** Extract a named cookie value from a Cookie header. */
+export function parseCookieValue(
+  cookieHeader: string | null | undefined,
+  name: string,
+): string | null {
+  if (!cookieHeader) return null;
+  for (const part of cookieHeader.split(";")) {
+    const eq = part.indexOf("=");
+    if (eq < 0) continue;
+    const k = part.slice(0, eq).trim();
+    if (k !== name) continue;
+    const value = part.slice(eq + 1).trim();
+    return value || null;
+  }
+  return null;
 }
 
 /** Extract the session token from a `Cookie` header. */

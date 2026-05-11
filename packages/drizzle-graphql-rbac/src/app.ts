@@ -35,6 +35,7 @@ import { Hono } from "hono";
 import { logger as honoLogger } from "hono/logger";
 import { createYoga } from "graphql-yoga";
 import { buildSchema, type BuildSchemaOptions } from "./graphql/builder/builder.js";
+import { depthLimit } from "./graphql/index.js";
 import { buildRbac, type BuiltRbac } from "./graphql/rbac/rbac.js";
 import type { RbacConfig } from "./graphql/rbac/config.js";
 import { mergeFrameworkRbac } from "./frameworkRbac.js";
@@ -43,6 +44,7 @@ import { buildAuthRoutes } from "./auth/routes.js";
 import { buildAdminRoutes } from "./admin/routes.js";
 import { sessionMiddleware, type AuthEnv } from "./auth/middleware.js";
 import type { SessionDb, SessionSchema } from "./auth/session.js";
+import { logger } from "./logger.js";
 import type {
   User,
   Session,
@@ -93,6 +95,15 @@ export interface CreateAppOptions {
    *  - A function: passed to Hono's `logger(fn)`.
    */
   logger?: boolean | ((message: string, ...rest: string[]) => void);
+  /**
+   * Maximum nesting depth allowed in a GraphQL operation. Queries deeper
+   * than this are rejected at validation time with a `GraphQLError`. Defends
+   * against denial-of-service via deeply recursive selections through the
+   * auto-generated relation fields (e.g. `todos { assigneeId { todos { ... } } }`).
+   *
+   * @default 10
+   */
+  graphqlMaxDepth?: number;
 }
 
 export interface CreatedApp {
@@ -110,6 +121,19 @@ export interface CreatedApp {
  * from the code config; memberships start empty and are added via the
  * returned `rbac` handle or the admin REST endpoints.
  */
+// Hono's logger may pre-color the status code with its own ANSI escapes; strip
+// them before sniffing for a three-digit status.
+// eslint-disable-next-line no-control-regex
+const ANSI_RE = /\x1b\[[0-9;]*m/g;
+
+function pickHttpStatus(parts: readonly string[]): number | null {
+  for (const p of parts) {
+    const bare = p.replace(ANSI_RE, "");
+    if (/^[1-5]\d{2}$/.test(bare)) return Number(bare);
+  }
+  return null;
+}
+
 export function createApp(opts: CreateAppOptions): CreatedApp {
   const {
     db,
@@ -122,8 +146,10 @@ export function createApp(opts: CreateAppOptions): CreatedApp {
     publicDir = "./public",
     graphqlEndpoint = "/graphql",
     logger: loggerOpt = true,
+    graphqlMaxDepth = 10,
   } = opts;
   const loggingEnabled = loggerOpt !== false;
+  const log = logger.child({ component: "framework.app" });
 
   const sessionSchema: SessionSchema = {
     users: schema.users,
@@ -157,6 +183,13 @@ export function createApp(opts: CreateAppOptions): CreatedApp {
     graphqlEndpoint,
     graphiql: true,
     logging: loggingEnabled,
+    plugins: [
+      {
+        onValidate({ addValidationRule }) {
+          addValidationRule(depthLimit(graphqlMaxDepth));
+        },
+      },
+    ],
     context: async ({ request }) => {
       const stash = (request as any)._authCtx as
         | { user: User | null; session: Session | null }
@@ -171,8 +204,21 @@ export function createApp(opts: CreateAppOptions): CreatedApp {
   const app = new Hono<AuthEnv>();
 
   if (loggingEnabled) {
-    app.use("*", typeof loggerOpt === "function" ? honoLogger(loggerOpt) : honoLogger());
+    const httpLog = logger.child({ component: "framework.app.http" });
+    const sink =
+      typeof loggerOpt === "function"
+        ? loggerOpt
+        : (message: string, ...rest: string[]) => {
+            const raw = rest.length ? `${message} ${rest.join(" ")}` : message;
+            const line = raw.replace(ANSI_RE, "");
+            const status = pickHttpStatus(rest);
+            if (status != null && status >= 500) httpLog.error(line);
+            else if (status != null && status >= 400) httpLog.warn(line);
+            else httpLog.info(line);
+          };
+    app.use("*", honoLogger(sink));
   }
+  log.debug({ graphqlEndpoint, publicDir: publicDir ?? null }, "app composed");
 
   app.route(
     "/auth",

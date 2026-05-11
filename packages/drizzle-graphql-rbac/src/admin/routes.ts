@@ -27,7 +27,7 @@ import type { User, users as usersTableType } from "../tables.js";
 import type { RbacDb } from "../graphql/rbac/rbacDb.js";
 import type { BuiltRbac } from "../graphql/rbac/rbac.js";
 import type { ColumnMap } from "../graphql/builder/filters.js";
-import { requireAuth, sessionMiddleware, type AuthEnv } from "../auth/middleware.js";
+import { csrfProtection, requireAuth, sessionMiddleware, type AuthEnv } from "../auth/middleware.js";
 import type { SessionDb, SessionSchema } from "../auth/session.js";
 
 function publicUser(user: User): Omit<User, "passwordHash"> {
@@ -64,6 +64,7 @@ export function buildAdminRoutes(deps: AdminRoutesDeps) {
   const usersColumns = getTableColumns(usersTable) as ColumnMap;
   const app = new Hono<AuthEnv>();
   app.use("*", sessionMiddleware(db, schema));
+  app.use("*", csrfProtection);
   app.use("*", requireAuth);
 
   const rdbForReq = (c: any): RbacDb =>
@@ -103,7 +104,7 @@ export function buildAdminRoutes(deps: AdminRoutesDeps) {
 
     try {
       const rdb = rdbForReq(c);
-      const passwordHash = await bcrypt.hash(password, 10);
+      const passwordHash = await bcrypt.hash(password, 12);
       const [row] = await rdb
         .insert(usersTable)
         .values({ name, email, passwordHash, active })
@@ -128,7 +129,7 @@ export function buildAdminRoutes(deps: AdminRoutesDeps) {
     if (typeof body.email === "string") set.email = body.email.trim();
     if (typeof body.active === "boolean") set.active = body.active;
     if (typeof body.password === "string" && body.password.length > 0) {
-      set.passwordHash = await bcrypt.hash(body.password, 10);
+      set.passwordHash = await bcrypt.hash(body.password, 12);
     }
     if (!Object.keys(set).length) {
       return c.json({ error: "No editable fields supplied" }, 400);

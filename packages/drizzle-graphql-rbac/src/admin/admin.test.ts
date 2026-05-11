@@ -8,7 +8,19 @@ import bcrypt from "bcryptjs";
 
 import { buildAdminRoutes } from "./routes.js";
 import { buildAuthRoutes } from "../auth/routes.js";
-import { parseSessionCookie } from "../auth/session.js";
+import { parseSessionCookie, CSRF_COOKIE_NAME } from "../auth/session.js";
+
+function cookieFromList(list: string[], name: string): string | null {
+  for (const raw of list) {
+    const first = raw.split(";")[0]?.trim() ?? "";
+    const eq = first.indexOf("=");
+    if (eq < 0) continue;
+    if (first.slice(0, eq).trim() !== name) continue;
+    const v = first.slice(eq + 1).trim();
+    return v || null;
+  }
+  return null;
+}
 import { buildRbac, type BuiltRbac } from "../graphql/rbac/rbac.js";
 import { buildRbacDb } from "../graphql/rbac/rbacDb.js";
 import {
@@ -91,25 +103,36 @@ beforeEach(() => {
   }
 });
 
-async function loginAs(email: string, password: string): Promise<string> {
+async function loginAs(email: string, password: string): Promise<{ token: string; csrf: string }> {
   const res = await authApp.request("/login", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ email, password }),
   });
-  const cookie = res.headers.get("set-cookie");
-  const token = parseSessionCookie(cookie);
-  if (!token) throw new Error(`login failed: ${res.status} ${cookie}`);
-  return token;
+  const list: string[] =
+    typeof (res.headers as any).getSetCookie === "function"
+      ? (res.headers as any).getSetCookie()
+      : res.headers.get("set-cookie")
+        ? [res.headers.get("set-cookie")!]
+        : [];
+  const token = cookieFromList(list, "sid") ?? parseSessionCookie(res.headers.get("set-cookie"));
+  const csrf = cookieFromList(list, CSRF_COOKIE_NAME);
+  if (!token || !csrf) {
+    throw new Error(`login failed: ${res.status} ${res.headers.get("set-cookie")}`);
+  }
+  return { token, csrf };
 }
 
 async function admin(
-  token: string,
+  auth: { token: string; csrf: string },
   method: string,
   path: string,
   body?: unknown,
 ): Promise<{ status: number; body: any }> {
-  const headers: Record<string, string> = { cookie: `sid=${token}` };
+  const headers: Record<string, string> = {
+    cookie: `sid=${auth.token}; csrf_token=${auth.csrf}`,
+    "x-csrf-token": auth.csrf,
+  };
   let init: RequestInit = { method, headers };
   if (body !== undefined) {
     headers["content-type"] = "application/json";

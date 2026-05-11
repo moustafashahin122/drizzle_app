@@ -10,6 +10,10 @@
  * {@link defineRecordRules}).
  */
 
+// Shared pino logger. Consumers may also construct their own pino instance.
+export { logger } from "./logger.js";
+export type { Logger } from "./logger.js";
+
 // One-call composition root.
 export { createApp } from "./app.js";
 export type { CreateAppOptions, CreatedApp } from "./app.js";
@@ -43,9 +47,19 @@ export type { SessionDb, SessionSchema } from "./auth/session.js";
 export { buildAdminRoutes } from "./admin/routes.js";
 export type { AdminRoutesDeps } from "./admin/routes.js";
 
-// GraphQL builder + custom scalars.
-export { buildSchema, GraphQLJSON, GraphQLBigIntStr } from "./graphql/index.js";
+// GraphQL builder + custom scalars + validation rules.
+export { buildSchema, GraphQLJSON, GraphQLBigIntStr, depthLimit } from "./graphql/index.js";
 export type { BuildSchemaOptions, DrizzleLike } from "./graphql/index.js";
+
+// CSRF primitives + constants (callers may need to set/read these directly).
+export {
+  CSRF_COOKIE_NAME,
+  CSRF_HEADER_NAME,
+  buildCsrfCookie,
+  buildClearCsrfCookie,
+  parseCookieValue,
+} from "./auth/session.js";
+export { csrfProtection } from "./auth/middleware.js";
 
 // RBAC engine.
 export { buildRbac } from "./graphql/rbac/rbac.js";
