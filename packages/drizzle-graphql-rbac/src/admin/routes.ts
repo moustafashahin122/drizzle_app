@@ -27,7 +27,7 @@ import type { User, users as usersTableType } from "../tables.js";
 import type { RbacDb } from "../graphql/rbac/rbacDb.js";
 import type { BuiltRbac } from "../graphql/rbac/rbac.js";
 import type { ColumnMap } from "../graphql/builder/filters.js";
-import { csrfProtection, requireAuth, requireAdmin, sessionMiddleware, type AuthEnv } from "../auth/middleware.js";
+import { requireAuth, requireAdmin, sessionMiddleware, type AuthEnv } from "../auth/middleware.js";
 import type { SudoDb, SessionSchema } from "../auth/session.js";
 
 function publicUser(user: User): Omit<User, "passwordHash"> {
@@ -64,7 +64,6 @@ export function buildAdminRoutes(deps: AdminRoutesDeps) {
   const usersColumns = getTableColumns(usersTable) as ColumnMap;
   const app = new Hono<AuthEnv>();
   app.use("*", sessionMiddleware(db, schema));
-  app.use("*", csrfProtection);
   app.use("*", requireAuth);
   // Every /admin route is admin-only. The per-endpoint `users` permission
   // checks below are kept as defense-in-depth, but this top-level gate is the

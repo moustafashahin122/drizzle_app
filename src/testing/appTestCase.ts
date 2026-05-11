@@ -133,8 +133,8 @@ export interface AppTestCtx<Seed> {
   schema: typeof schema;
   /**
    * Insert a session row for `userId` and return a Bearer token. Use the
-   * returned string as `Authorization: Bearer <token>` to skip CSRF and
-   * cookie plumbing in HTTP tests.
+   * returned string as `Authorization: Bearer <token>` to skip cookie
+   * plumbing in HTTP tests.
    */
   mintToken: (userId: number) => Promise<string>;
   /**

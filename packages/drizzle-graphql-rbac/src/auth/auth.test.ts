@@ -9,8 +9,6 @@ import { buildAuthRoutes, __resetRateLimitForTests } from "./routes.js";
 import {
   resolveSessionFromToken,
   parseSessionCookie,
-  parseCookieValue,
-  CSRF_COOKIE_NAME,
   SESSION_COOKIE_NAME,
 } from "./session.js";
 
@@ -80,7 +78,6 @@ async function call(
   body: any;
   setCookie: string | null;
   setCookieList: string[];
-  csrf: string | null;
 }> {
   const headers = { ...(init.headers ?? {}) } as Record<string, string>;
   let body: BodyInit | undefined;
@@ -103,13 +100,12 @@ async function call(
     body: json,
     setCookie: res.headers.get("set-cookie"),
     setCookieList,
-    csrf: cookieFromList(setCookieList, CSRF_COOKIE_NAME),
   };
 }
 
-/** Build Cookie + X-CSRF-Token headers for an authenticated request. */
-function authedHeaders(token: string, csrf: string): Record<string, string> {
-  return { cookie: `sid=${token}; csrf_token=${csrf}`, "x-csrf-token": csrf };
+/** Build a Cookie header for an authenticated request. */
+function authedHeaders(token: string): Record<string, string> {
+  return { cookie: `sid=${token}` };
 }
 
 describe("auth REST — register / login / me / logout", () => {
@@ -122,7 +118,6 @@ describe("auth REST — register / login / me / logout", () => {
     assert.ok(!("passwordHash" in r.body.user), "leaked passwordHash");
     const token = cookieFromList(r.setCookieList, "sid");
     assert.ok(token && token.length >= 32, `expected session cookie, got ${r.setCookie}`);
-    assert.ok(r.csrf && r.csrf.length >= 32, "expected csrf_token cookie");
   });
 
   it("rejects missing fields", async () => {
@@ -146,7 +141,6 @@ describe("auth REST — register / login / me / logout", () => {
     assert.equal(ok.status, 200);
     assert.equal(ok.body.user.name, "Alice");
     assert.ok(cookieFromList(ok.setCookieList, "sid"));
-    assert.ok(ok.csrf);
 
     const bad = await call("POST", "/login", {
       body: { email: "alice@x.com", password: "WRONG" },
@@ -178,12 +172,11 @@ describe("auth REST — register / login / me / logout", () => {
       body: { email: "alice@x.com", password: "secret123" },
     });
     const token = cookieFromList(login.setCookieList, "sid")!;
-    const csrf = login.csrf!;
 
     const before = await resolveSessionFromToken(db, { users, sessions }, token);
     assert.ok(before.user);
 
-    const out = await call("POST", "/logout", { headers: authedHeaders(token, csrf) });
+    const out = await call("POST", "/logout", { headers: authedHeaders(token) });
     assert.equal(out.status, 200);
     assert.equal(out.body.ok, true);
     assert.match(out.setCookie ?? "", /Max-Age=0/);
@@ -192,16 +185,6 @@ describe("auth REST — register / login / me / logout", () => {
     assert.equal(after.user, null);
   });
 
-  it("rejects mutating requests without a CSRF token (double-submit)", async () => {
-    const login = await call("POST", "/login", {
-      body: { email: "alice@x.com", password: "secret123" },
-    });
-    const token = cookieFromList(login.setCookieList, "sid")!;
-    // Cookie present (so middleware enforces CSRF) but no header / no csrf cookie.
-    const r = await call("POST", "/logout", { headers: { cookie: `sid=${token}` } });
-    assert.equal(r.status, 403);
-    assert.match(r.body.error, /CSRF/);
-  });
 });
 
 describe("session helpers", () => {
@@ -393,25 +376,19 @@ describe("auth cookies — Secure flag is env-gated", () => {
           });
           assert.equal(login.status, 200);
 
-          // Pick the cookies under inspection based on the flow. For "login"
-          // it's the freshly-issued sid/csrf cookies; for "logout" it's the
-          // clearing (Max-Age=0) cookies that the /logout response writes.
+          // Pick the cookie under inspection based on the flow. For "login"
+          // it's the freshly-issued sid cookie; for "logout" it's the
+          // clearing (Max-Age=0) cookie that the /logout response writes.
           let sidCookie: string | undefined;
-          let csrfCookie: string | undefined;
           if (c.flow === "login") {
             sidCookie = login.setCookieList.find((s) =>
               s.startsWith(`${SESSION_COOKIE_NAME}=`),
             );
-            csrfCookie = login.setCookieList.find((s) =>
-              s.startsWith(`${CSRF_COOKIE_NAME}=`),
-            );
           } else {
             const token = cookieFromList(login.setCookieList, SESSION_COOKIE_NAME)!;
-            const csrf = login.csrf!;
             const out = await call("POST", "/logout", {
               headers: {
-                cookie: `${SESSION_COOKIE_NAME}=${token}; ${CSRF_COOKIE_NAME}=${csrf}`,
-                "x-csrf-token": csrf,
+                cookie: `${SESSION_COOKIE_NAME}=${token}`,
                 "x-forwarded-for": c.ip,
               },
             });
@@ -419,22 +396,13 @@ describe("auth cookies — Secure flag is env-gated", () => {
             sidCookie = out.setCookieList.find(
               (s) => s.startsWith(`${SESSION_COOKIE_NAME}=`) && /Max-Age=0/.test(s),
             );
-            csrfCookie = out.setCookieList.find(
-              (s) => s.startsWith(`${CSRF_COOKIE_NAME}=`) && /Max-Age=0/.test(s),
-            );
           }
           assert.ok(sidCookie, `expected ${c.flow} sid Set-Cookie`);
-          assert.ok(csrfCookie, `expected ${c.flow} csrf Set-Cookie`);
 
-          // Both cookies must flip together — login-set and logout-clear stay
-          // symmetric, because a browser will not clear a `Secure` cookie via
-          // a non-`Secure` clear instruction.
           if (c.expectSecure) {
             assert.match(sidCookie!, SECURE_ATTR);
-            assert.match(csrfCookie!, SECURE_ATTR);
           } else {
             assert.equal(SECURE_ATTR.test(sidCookie!), false, `sid: ${sidCookie}`);
-            assert.equal(SECURE_ATTR.test(csrfCookie!), false, `csrf: ${csrfCookie}`);
           }
         } finally {
           process.env.NODE_ENV = orig;

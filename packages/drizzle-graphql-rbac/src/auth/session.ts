@@ -51,19 +51,6 @@ export function buildClearSessionCookie(): string {
   return `${SESSION_COOKIE_NAME}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0${secureSuffix()}`;
 }
 
-export const CSRF_COOKIE_NAME = "csrf_token";
-export const CSRF_HEADER_NAME = "x-csrf-token";
-
-/** Build a CSRF cookie (NOT HttpOnly so client JS can echo it in a header). */
-export function buildCsrfCookie(token: string): string {
-  return `${CSRF_COOKIE_NAME}=${token}; SameSite=Strict; Path=/; Max-Age=${SESSION_DAYS * 86400}${secureSuffix()}`;
-}
-
-/** Header value that clears the CSRF cookie. */
-export function buildClearCsrfCookie(): string {
-  return `${CSRF_COOKIE_NAME}=; SameSite=Strict; Path=/; Max-Age=0${secureSuffix()}`;
-}
-
 /** Extract a named cookie value from a Cookie header. */
 export function parseCookieValue(
   cookieHeader: string | null | undefined,
@@ -83,16 +70,7 @@ export function parseCookieValue(
 
 /** Extract the session token from a `Cookie` header. */
 export function parseSessionCookie(cookieHeader: string | null | undefined): string | null {
-  if (!cookieHeader) return null;
-  for (const part of cookieHeader.split(";")) {
-    const eq = part.indexOf("=");
-    if (eq < 0) continue;
-    const name = part.slice(0, eq).trim();
-    if (name !== SESSION_COOKIE_NAME) continue;
-    const value = part.slice(eq + 1).trim();
-    return value || null;
-  }
-  return null;
+  return parseCookieValue(cookieHeader, SESSION_COOKIE_NAME);
 }
 
 /** Extract the token from a `Bearer <token>` header value, or `null`. */

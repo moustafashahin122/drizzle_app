@@ -70,18 +70,22 @@ async function seedAndLogin(
   app: ReturnType<typeof buildApp>["app"],
   sudoDb: ReturnType<typeof buildApp>["sudoDb"],
   rbac: ReturnType<typeof buildApp>["rbac"],
+  opts: { role?: string; email?: string; name?: string } = {},
 ): Promise<string> {
+  const role = opts.role ?? "user";
+  const email = opts.email ?? "alice@x.com";
+  const name = opts.name ?? "Alice";
   const passwordHash = await bcrypt.hash("pw", 4);
   const [u] = await sudoDb
     .insert(users)
-    .values({ name: "Alice", email: "alice@x.com", passwordHash, active: true })
+    .values({ name, email, passwordHash, active: true })
     .returning();
-  rbac.assignRole(u.id, "user");
+  rbac.assignRole(u.id, role);
   const res = await app.fetch(
     new Request("http://t.local/auth/login", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ email: "alice@x.com", password: "pw" }),
+      body: JSON.stringify({ email, password: "pw" }),
     }),
   );
   const list: string[] =
@@ -151,9 +155,13 @@ describe("createApp — graphqlRequireAuth (HTTP-layer auth gate)", () => {
 describe("createApp — graphqlAllowIntrospection", () => {
   const INTROSPECTION_Q = `{ __schema { types { name } } }`;
 
-  it("allowed (default in non-production): __schema returns type names", async () => {
+  it("allowed (default in non-production): admin can introspect", async () => {
     const { app, sudoDb, rbac } = buildApp();
-    const sid = await seedAndLogin(app, sudoDb, rbac);
+    const sid = await seedAndLogin(app, sudoDb, rbac, {
+      role: "admin",
+      email: "admin@x.com",
+      name: "Admin",
+    });
     const { status, body } = await gql(app, INTROSPECTION_Q, { token: sid });
     assert.equal(status, 200);
     assert.equal(body.errors, undefined);
@@ -162,6 +170,20 @@ describe("createApp — graphqlAllowIntrospection", () => {
     // empty stub or a silent-success placeholder.
     assert.ok(names.includes("Users"), "expected Users in introspected types");
     assert.ok(names.includes("Query"), "expected Query in introspected types");
+  });
+
+  it("allowed (default in non-production): non-admin is rejected by introspection rule", async () => {
+    // Introspection reveals the full schema shape (including names of hidden
+    // columns), so even when the flag is on we only hand it to admins.
+    const { app, sudoDb, rbac } = buildApp();
+    const sid = await seedAndLogin(app, sudoDb, rbac); // default role: "user"
+    const { status, body } = await gql(app, INTROSPECTION_Q, { token: sid });
+    assert.equal(status, 200);
+    assert.equal(body.data ?? null, null);
+    assert.ok((body.errors?.length ?? 0) >= 1, "expected validation error");
+    for (const e of body.errors) {
+      assert.match(e.message, /introspection/i);
+    }
   });
 
   it("disabled: __schema is rejected at validation time with GraphQL errors[]", async () => {
@@ -210,107 +232,6 @@ describe("createApp — graphqlAllowIntrospection", () => {
         !text.toLowerCase().includes("graphiql"),
       `GraphiQL must not be served when introspection is off — got: ${text.slice(0, 120)}`,
     );
-  });
-});
-
-/**
- * Login helper that returns BOTH the sid token and the non-HttpOnly
- * `csrf_token` cookie value from the login response. Mirrors the existing
- * `seedAndLogin` shape but exposes the CSRF cookie needed for double-submit
- * tests below.
- */
-async function seedAndLoginWithCsrf(
-  app: ReturnType<typeof buildApp>["app"],
-  sudoDb: ReturnType<typeof buildApp>["sudoDb"],
-  rbac: ReturnType<typeof buildApp>["rbac"],
-): Promise<{ sid: string; csrf: string }> {
-  const passwordHash = await bcrypt.hash("pw", 4);
-  const [u] = await sudoDb
-    .insert(users)
-    .values({ name: "Alice", email: "alice@x.com", passwordHash, active: true })
-    .returning();
-  rbac.assignRole(u.id, "user");
-  const res = await app.fetch(
-    new Request("http://t.local/auth/login", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ email: "alice@x.com", password: "pw" }),
-    }),
-  );
-  const list: string[] =
-    typeof (res.headers as any).getSetCookie === "function"
-      ? (res.headers as any).getSetCookie()
-      : [res.headers.get("set-cookie") ?? ""];
-  const pairs = list.map((c) => c.split(";")[0]);
-  const sid = pairs.find((c) => c.startsWith("sid="))?.slice(4);
-  const csrf = pairs.find((c) => c.startsWith("csrf_token="))?.slice("csrf_token=".length);
-  if (!sid) throw new Error("login failed: no sid cookie");
-  if (!csrf) throw new Error("login failed: no csrf_token cookie");
-  return { sid, csrf };
-}
-
-describe("createApp — CSRF protection on /graphql", () => {
-  const Q = `{ users { id name } }`;
-
-  // Table-driven: three cookie-based CSRF cases share the same login + POST
-  // /graphql shape — only the X-CSRF-Token header varies.
-  // - setHeader=false: header is omitted entirely.
-  // - headerValue="MATCH": header value === csrf cookie value.
-  // - headerValue="WRONG": header value is a deliberately different string.
-  it("CSRF cookie-path per (setHeader, headerValue, expectStatus)", async (t) => {
-    const cases: Array<{
-      name: string;
-      setHeader: boolean;
-      headerValue: "MATCH" | "WRONG" | undefined;
-      expectStatus: 200 | 403;
-    }> = [
-      { name: "missing header",  setHeader: false, headerValue: undefined, expectStatus: 403 },
-      { name: "matching header", setHeader: true,  headerValue: "MATCH",   expectStatus: 200 },
-      { name: "mismatched",      setHeader: true,  headerValue: "WRONG",   expectStatus: 403 },
-    ];
-    for (const c of cases) {
-      await t.test(c.name, async () => {
-        const { app, sudoDb, rbac } = buildApp();
-        const { sid, csrf } = await seedAndLoginWithCsrf(app, sudoDb, rbac);
-        const headers: Record<string, string> = {
-          "content-type": "application/json",
-          cookie: `sid=${sid}; csrf_token=${csrf}`,
-        };
-        if (c.setHeader) {
-          headers["x-csrf-token"] = c.headerValue === "MATCH" ? csrf : "not-the-real-token";
-        }
-        const res = await app.fetch(
-          new Request("http://t.local/graphql", {
-            method: "POST",
-            headers,
-            body: JSON.stringify({ query: Q }),
-          }),
-        );
-        assert.equal(res.status, c.expectStatus);
-        const body = await res.json();
-        if (c.expectStatus === 403) {
-          // Pin the rejection envelope so a 403 from any other source (rate
-          // limit, auth gate, generic error handler) is distinguishable.
-          assert.deepEqual(body, { error: "CSRF token missing or invalid" });
-        } else {
-          // Strengthened: ensure the resolver actually ran and produced data,
-          // not a degenerate {data:null} 200 that would also pass status==200.
-          assert.equal(body.errors, undefined);
-          assert.ok(Array.isArray(body.data?.users), "expected data.users array");
-          assert.equal(body.data.users[0].name, "Alice");
-        }
-      });
-    }
-  });
-
-  it("bypasses CSRF for bearer-token requests with no session cookie", async () => {
-    const { app, sudoDb, rbac } = buildApp();
-    // Use the existing cookie-less login helper to grab a token usable as Bearer.
-    const sid = await seedAndLogin(app, sudoDb, rbac);
-    const { status, body } = await gql(app, Q, { token: sid });
-    assert.equal(status, 200);
-    assert.equal(body.errors, undefined);
-    assert.equal(body.data.users[0].name, "Alice");
   });
 });
 

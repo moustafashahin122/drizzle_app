@@ -23,6 +23,8 @@
     "@hono/node-server": "^1.13.7",
     "@hono/zod-validator": "^0.8.0",
     "@node-rs/argon2": "^2.0.2",
+    "@types/bcryptjs": "^2.4.6",
+    "bcryptjs": "^3.0.3",
     "better-sqlite3": "^11.7.0",
     "drizzle-graphql-rbac": "*",
     "drizzle-orm": "^0.38.3",

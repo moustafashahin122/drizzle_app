@@ -8,7 +8,7 @@ import bcrypt from "bcryptjs";
 
 import { buildAdminRoutes } from "./routes.js";
 import { buildAuthRoutes } from "../auth/routes.js";
-import { parseSessionCookie, CSRF_COOKIE_NAME } from "../auth/session.js";
+import { parseSessionCookie } from "../auth/session.js";
 
 function cookieFromList(list: string[], name: string): string | null {
   for (const raw of list) {
@@ -107,7 +107,7 @@ beforeEach(() => {
   }
 });
 
-async function loginAs(email: string, password: string): Promise<{ token: string; csrf: string }> {
+async function loginAs(email: string, password: string): Promise<{ token: string }> {
   const res = await authApp.request("/login", {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -120,22 +120,20 @@ async function loginAs(email: string, password: string): Promise<{ token: string
         ? [res.headers.get("set-cookie")!]
         : [];
   const token = cookieFromList(list, "sid") ?? parseSessionCookie(res.headers.get("set-cookie"));
-  const csrf = cookieFromList(list, CSRF_COOKIE_NAME);
-  if (!token || !csrf) {
+  if (!token) {
     throw new Error(`login failed: ${res.status} ${res.headers.get("set-cookie")}`);
   }
-  return { token, csrf };
+  return { token };
 }
 
 async function admin(
-  auth: { token: string; csrf: string },
+  auth: { token: string },
   method: string,
   path: string,
   body?: unknown,
 ): Promise<{ status: number; body: any }> {
   const headers: Record<string, string> = {
-    cookie: `sid=${auth.token}; csrf_token=${auth.csrf}`,
-    "x-csrf-token": auth.csrf,
+    cookie: `sid=${auth.token}`,
   };
   let init: RequestInit = { method, headers };
   if (body !== undefined) {

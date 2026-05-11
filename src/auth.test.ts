@@ -1,12 +1,7 @@
 /**
  * Sign-in / sign-out HTTP flow against the full Hono app (REST /auth/* +
- * CSRF middleware + session middleware). Mirrors what the browser does:
- * cookies in, CSRF header echoed back, server-side session lifecycle
- * verified via `/auth/me`.
- *
- * Regression coverage: POST /auth/logout without the X-CSRF-Token header
- * must be rejected by `csrfProtection`, otherwise the prior client bug
- * (logout swallowed silently, session never destroyed) reappears.
+ * session middleware). Mirrors what the browser does: cookies in,
+ * server-side session lifecycle verified via `/auth/me`.
  */
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
@@ -69,7 +64,6 @@ async function login(email: string, password: string) {
     body,
     cookies,
     sid: cookieValue(cookies, "sid"),
-    csrf: cookieValue(cookies, "csrf_token"),
   };
 }
 
@@ -84,11 +78,9 @@ async function me(sid: string | null) {
   return { status: res.status, body };
 }
 
-async function logout(opts: { sid: string | null; csrf: string | null; sendHeader: boolean }) {
+async function logout(opts: { sid: string | null }) {
   const headers: Record<string, string> = {};
-  if (opts.sid && opts.csrf) headers.cookie = `sid=${opts.sid}; csrf_token=${opts.csrf}`;
-  else if (opts.sid) headers.cookie = `sid=${opts.sid}`;
-  if (opts.sendHeader && opts.csrf) headers["x-csrf-token"] = opts.csrf;
+  if (opts.sid) headers.cookie = `sid=${opts.sid}`;
   const res = await tc.app.fetch(
     new Request("http://test.local/auth/logout", { method: "POST", headers }),
   );
@@ -98,7 +90,7 @@ async function logout(opts: { sid: string | null; csrf: string | null; sendHeade
 }
 
 describe("auth HTTP flow — sign in", () => {
-  it("valid credentials → 200, user payload (no passwordHash), sid + csrf_token cookies", async () => {
+  it("valid credentials → 200, user payload (no passwordHash), sid cookie", async () => {
     const r = await login(tc.seed.alice.email, PASSWORD);
     assert.equal(r.status, 200);
     assert.ok(r.body?.user, "login response includes user");
@@ -107,14 +99,10 @@ describe("auth HTTP flow — sign in", () => {
     assert.equal(r.body.user.passwordHash, undefined, "passwordHash must never leak");
 
     assert.ok(r.sid, "sid cookie set");
-    assert.ok(r.csrf, "csrf_token cookie set");
 
-    // sid cookie must be HttpOnly so JS can't steal it; csrf_token must NOT
-    // be HttpOnly (the JS client has to read it to echo back the header).
+    // sid cookie must be HttpOnly so JS can't steal it.
     const sidRaw = r.cookies.find((c) => c.startsWith("sid="))!;
-    const csrfRaw = r.cookies.find((c) => c.startsWith("csrf_token="))!;
     assert.match(sidRaw, /HttpOnly/i);
-    assert.doesNotMatch(csrfRaw, /HttpOnly/i);
 
     // The freshly minted sid must resolve a session through /auth/me.
     const m = await me(r.sid);
@@ -126,14 +114,12 @@ describe("auth HTTP flow — sign in", () => {
     const r = await login(tc.seed.alice.email, "not-the-password");
     assert.equal(r.status, 401);
     assert.equal(r.sid, null);
-    assert.equal(r.csrf, null);
   });
 
   it("unknown email → 401, no cookies (timing-equivalent path)", async () => {
     const r = await login("nobody@auth-test.example.com", PASSWORD);
     assert.equal(r.status, 401);
     assert.equal(r.sid, null);
-    assert.equal(r.csrf, null);
   });
 
   it("login persists a sessions row pointing at the user", async () => {
@@ -149,39 +135,15 @@ describe("auth HTTP flow — sign in", () => {
 });
 
 describe("auth HTTP flow — sign out", () => {
-  it("logout WITHOUT X-CSRF-Token → 403, session row still present (regression for client CSRF bug)", async () => {
+  it("logout → 200 ok, session destroyed, cookie cleared", async () => {
     const li = await login(tc.seed.alice.email, PASSWORD);
     assert.equal(li.status, 200);
 
-    const out = await logout({ sid: li.sid, csrf: li.csrf, sendHeader: false });
-    assert.equal(out.status, 403, "csrfProtection must reject mutating call with no header");
-    assert.match(out.body?.error ?? "", /csrf/i);
-
-    // Session was NOT destroyed — /auth/me with the same sid still resolves.
-    const m = await me(li.sid);
-    assert.equal(m.status, 200, "session must survive a CSRF-rejected logout");
-    assert.equal(m.body.user.id, tc.seed.alice.id);
-
-    const rows = await tc.sudoDb
-      .select()
-      .from(tc.schema.sessions)
-      .where(eq(tc.schema.sessions.token, li.sid!));
-    assert.equal(rows.length, 1, "session row still present after rejected logout");
-  });
-
-  it("logout WITH X-CSRF-Token → 200 ok, session destroyed, cookies cleared", async () => {
-    const li = await login(tc.seed.alice.email, PASSWORD);
-    assert.equal(li.status, 200);
-
-    const out = await logout({ sid: li.sid, csrf: li.csrf, sendHeader: true });
+    const out = await logout({ sid: li.sid });
     assert.equal(out.status, 200);
     assert.deepEqual(out.body, { ok: true });
 
-    // Both cookies are cleared (Max-Age=0) — the login-set and logout-clear
-    // pair must move together so the browser never ends up holding a stale
-    // csrf_token without an sid.
     assert.ok(isCleared(out.cookies, "sid"), "sid Set-Cookie clears with Max-Age=0");
-    assert.ok(isCleared(out.cookies, "csrf_token"), "csrf_token Set-Cookie clears with Max-Age=0");
 
     // Server-side session is gone — /auth/me with the now-stale sid returns 401.
     const m = await me(li.sid);
@@ -194,17 +156,16 @@ describe("auth HTTP flow — sign out", () => {
     assert.equal(rows.length, 0, "sessions row removed by destroySession");
   });
 
-  it("logout with no session cookie at all → 200 ok:false, cookies still cleared (idempotent)", async () => {
-    const out = await logout({ sid: null, csrf: null, sendHeader: false });
+  it("logout with no session cookie at all → 200 ok:false, cookie still cleared (idempotent)", async () => {
+    const out = await logout({ sid: null });
     assert.equal(out.status, 200);
     assert.deepEqual(out.body, { ok: false });
     assert.ok(isCleared(out.cookies, "sid"));
-    assert.ok(isCleared(out.cookies, "csrf_token"));
   });
 
   it("after logout, the old sid cannot be reused to log in again — re-login mints a fresh session row", async () => {
     const first = await login(tc.seed.alice.email, PASSWORD);
-    await logout({ sid: first.sid, csrf: first.csrf, sendHeader: true });
+    await logout({ sid: first.sid });
 
     const second = await login(tc.seed.alice.email, PASSWORD);
     assert.equal(second.status, 200);

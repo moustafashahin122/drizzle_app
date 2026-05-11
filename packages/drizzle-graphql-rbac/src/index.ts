@@ -35,6 +35,7 @@ export {
   buildSessionCookie,
   buildClearSessionCookie,
   parseSessionCookie,
+  parseCookieValue,
   extractBearerToken,
   resolveSessionFromToken,
   issueSession,
@@ -42,16 +43,6 @@ export {
   SESSION_COOKIE_NAME,
 } from "./auth/session.js";
 export type { SudoDb, SessionSchema } from "./auth/session.js";
-
-// CSRF primitives + constants (callers may need to set/read these directly).
-export {
-  CSRF_COOKIE_NAME,
-  CSRF_HEADER_NAME,
-  buildCsrfCookie,
-  buildClearCsrfCookie,
-  parseCookieValue,
-} from "./auth/session.js";
-export { csrfProtection } from "./auth/middleware.js";
 
 // REST admin primitives.
 export { buildAdminRoutes } from "./admin/routes.js";

@@ -12,13 +12,9 @@ async function jsonOrError(res) {
 
 /** GraphQL fetch wrapper — used by the todo + admin pages for data queries. */
 export async function gql(query, variables = {}) {
-  const csrf = document.cookie.split("; ").find((c) => c.startsWith("csrf_token="))?.split("=")[1];
   const res = await fetch("/graphql", {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      ...(csrf ? { "X-CSRF-Token": csrf } : {}),
-    },
+    headers: { "Content-Type": "application/json" },
     credentials: "same-origin",
     body: JSON.stringify({ query, variables }),
   });
@@ -99,11 +95,9 @@ export async function register(name, email, password) {
 
 export async function logout() {
   try {
-    const csrf = document.cookie.split("; ").find((c) => c.startsWith("csrf_token="))?.split("=")[1];
     await fetch("/auth/logout", {
       method: "POST",
       credentials: "same-origin",
-      headers: csrf ? { "X-CSRF-Token": csrf } : {},
     });
   } catch {
     /* ignore — server-side cookie clear is best-effort */

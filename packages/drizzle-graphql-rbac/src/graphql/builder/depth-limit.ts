@@ -41,6 +41,11 @@ export function depthLimit(maxDepth: number): ValidationRule {
           let max = depthSoFar;
           for (const sel of n.selectionSet.selections) {
             if (sel.kind === "Field") {
+              // Skip introspection fields (`__schema`, `__type`, `__typename`).
+              // Their selection sets are deeply nested by spec and would
+              // otherwise force callers to choose between a sane depth limit
+              // and a working GraphiQL introspection query.
+              if ((sel as FieldNode).name.value.startsWith("__")) continue;
               const childDepth = walk(sel as FieldNode, depthSoFar + 1);
               if (childDepth > max) max = childDepth;
             } else if (sel.kind === "InlineFragment") {

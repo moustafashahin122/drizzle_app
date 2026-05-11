@@ -11,39 +11,10 @@ import type { User, Session } from "../tables.js";
 import {
   extractBearerToken,
   parseSessionCookie,
-  parseCookieValue,
   resolveSessionFromToken,
-  CSRF_COOKIE_NAME,
-  CSRF_HEADER_NAME,
   type SudoDb,
   type SessionSchema,
 } from "./session.js";
-
-const MUTATING_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
-
-/**
- * Double-submit CSRF check. On mutating requests we require the
- * `X-CSRF-Token` header to equal the non-HttpOnly `csrf_token` cookie.
- *
- * Only cookie-authenticated requests are subject to CSRF — bearer-token
- * clients don't have the browser's auto-attach problem the check defends
- * against. We also skip the check when the `sid` cookie doesn't resolve to
- * a live session (stale / expired cookie from a prior login), otherwise the
- * user would be permanently locked out of `/auth/login` until they cleared
- * cookies by hand.
- */
-export const csrfProtection: MiddlewareHandler<AuthEnv> = async (c, next) => {
-  if (!MUTATING_METHODS.has(c.req.method)) return next();
-  const cookieHeader = c.req.header("cookie");
-  const hasSidCookie = parseSessionCookie(cookieHeader) != null;
-  if (!hasSidCookie || !c.get("session")) return next();
-  const cookieToken = parseCookieValue(cookieHeader, CSRF_COOKIE_NAME);
-  const headerToken = c.req.header(CSRF_HEADER_NAME) ?? null;
-  if (!cookieToken || !headerToken || cookieToken !== headerToken) {
-    return c.json({ error: "CSRF token missing or invalid" }, 403);
-  }
-  await next();
-};
 
 export interface AuthVariables {
   user: User | null;
