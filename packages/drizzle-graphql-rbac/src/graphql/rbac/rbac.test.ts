@@ -1,8 +1,17 @@
+/**
+ * RBAC enforcement at the GraphQL layer.
+ *
+ * Proves that `buildSchema(..., { rbac: { enforce } })` wires the rbac engine
+ * into the generated resolvers — independently of the rdb proxy, which has
+ * its own tests. Auth, ACL, record-rule narrowing, and admin bypass are all
+ * exercised through real `graphql(...)` calls so the public contract is what
+ * gets validated.
+ *
+ * Cast and tables come from `__helpers__.ts`. The cast used here is
+ * Alice(reader) / Bob(admin) / Carol(no role).
+ */
 import { describe, it, before, beforeEach } from "node:test";
 import assert from "node:assert/strict";
-import Database from "better-sqlite3";
-import { drizzle } from "drizzle-orm/better-sqlite3";
-import { sqliteTable, integer, text } from "drizzle-orm/sqlite-core";
 import { eq } from "drizzle-orm";
 import { graphql, type GraphQLSchema } from "graphql";
 
@@ -14,28 +23,17 @@ import {
   defineRecordRules,
 } from "./config.js";
 
-const users = sqliteTable("users", {
-  id: integer("id").primaryKey({ autoIncrement: true }),
-  name: text("name").notNull(),
-});
-const todos = sqliteTable("todos", {
-  id: integer("id").primaryKey({ autoIncrement: true }),
-  title: text("title").notNull(),
-  ownerId: integer("owner_id").references(() => users.id),
-});
-
-const allTables = { users, todos };
-
-function createTablesSql(): string {
-  return `
-    CREATE TABLE users (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL);
-    CREATE TABLE todos (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      title TEXT NOT NULL,
-      owner_id INTEGER REFERENCES users(id)
-    );
-  `;
-}
+import {
+  allTables,
+  todos,
+  users,
+  anonCtx,
+  ctxFor,
+  clearAllMemberships,
+  freshDb,
+  seedReaderAdmin,
+  type Db,
+} from "./__helpers__.js";
 
 const ownRows = [["ownerId", "=", "current_user.id"]];
 const baseConfig = {
@@ -44,119 +42,162 @@ const baseConfig = {
     admin: { isAdmin: true },
   }),
   accessRights: defineAccessRights({
-    reader: {
-      todos: { read: true },
-    },
+    reader: { todos: { read: true } },
   }),
   recordRules: defineRecordRules({
-    reader: {
-      todos: { read: { domain: ownRows } },
-    },
+    reader: { todos: { read: { domain: ownRows } } },
   }),
 };
 
-let db: ReturnType<typeof drizzle>;
-let sqlite: Database.Database;
+/**
+ * Builds an isolated DB + RBAC + GraphQL schema for tests that need a config
+ * different from `baseConfig`. Each test that uses this owns its own DB so
+ * it cannot leak state into the shared baseline.
+ */
+function makeIsolated(cfg: Parameters<typeof buildRbac>[0]) {
+  const { db: d } = freshDb();
+  const r = buildRbac(cfg);
+  const sch = buildSchema(d, allTables, { rbac: { enforce: r.enforce } }).schema;
+  const run = (source: string, contextValue: any, variableValues?: Record<string, unknown>) =>
+    graphql({ schema: sch, source, contextValue, variableValues });
+  return { db: d, rbac: r, schema: sch, run };
+}
+
+let sqlite: ReturnType<typeof freshDb>["sqlite"];
+let db: Db;
 let schema: GraphQLSchema;
 let rbac: BuiltRbac;
 
 before(() => {
-  sqlite = new Database(":memory:");
-  sqlite.exec(createTablesSql());
-  db = drizzle(sqlite);
+  const f = freshDb();
+  sqlite = f.sqlite;
+  db = f.db;
   rbac = buildRbac(baseConfig);
   schema = buildSchema(db, allTables, { rbac: { enforce: rbac.enforce } }).schema;
 });
 
 beforeEach(() => {
-  sqlite.exec(`
-    DELETE FROM todos;
-    DELETE FROM users;
-  `);
-  // Reset memberships between tests.
-  for (let id = 1; id < 1000; id++) {
-    for (const key of rbac.listUserRoles(id)) rbac.revokeRole(id, key);
-  }
-});
-
-const userCtx = (id: number, name = "u") => ({
-  user: { id, name } as any,
-  session: null,
-  batch: new Map(),
+  sqlite.exec(`DELETE FROM todos; DELETE FROM users;`);
+  clearAllMemberships(rbac);
 });
 
 async function run(query: string, contextValue: any, variableValues?: Record<string, unknown>) {
   return graphql({ schema, source: query, contextValue, variableValues });
 }
 
-async function seed() {
-  const [u1] = await db.insert(users).values({ name: "Alice" }).returning();
-  const [u2] = await db.insert(users).values({ name: "Bob" }).returning();
-  const [u3] = await db.insert(users).values({ name: "Carol" }).returning();
-  rbac.assignRole(u1.id, "reader");
-  rbac.assignRole(u2.id, "admin");
-  await db.insert(todos).values([
-    { title: "alice-1", ownerId: u1.id },
-    { title: "alice-2", ownerId: u1.id },
-    { title: "bob-1", ownerId: u2.id },
-    { title: "carol-1", ownerId: u3.id },
-  ]);
-  return { u1, u2, u3 };
-}
+describe("rbac — enforcement (GraphQL layer)", () => {
+  describe("deny paths", () => {
+    // Each case captures how to build a context FROM the seeded cast — that
+    // avoids the autoincrement trap where DELETE doesn't reset SQLite's
+    // primary-key counter, so hardcoded ids drift after the first test runs.
+    const cases: Array<{
+      label: string;
+      ctx: (cast: { carol: { id: number } }) => any;
+      error: RegExp;
+    }> = [
+      {
+        label: "unauthenticated caller (user=null)",
+        ctx: () => anonCtx(),
+        error: /Not authenticated/,
+      },
+      {
+        label: "authenticated user with no role memberships",
+        ctx: (cast) => ctxFor(cast.carol.id),
+        error: /Access denied/,
+      },
+    ];
 
-describe("rbac — enforcement", () => {
-  it("denies unauthenticated callers", async () => {
-    await seed();
-    const r = await run(`{ todos { id } }`, {
-      user: null,
-      session: null,
-      batch: new Map(),
-    });
-    assert.match(r.errors?.[0]?.message ?? "", /Not authenticated/);
+    for (const c of cases) {
+      it(c.label, async () => {
+        const cast = await seedReaderAdmin(db, rbac);
+        const r = await run(`{ todos { id title } }`, c.ctx(cast));
+        assert.equal(r.data?.todos ?? null, null, "data.todos should be null on deny");
+        assert.equal(r.errors?.length, 1);
+        assert.match(r.errors![0].message, c.error);
+      });
+    }
   });
 
-  it("denies users with no roles", async () => {
-    const { u3 } = await seed();
-    const r = await run(`{ todos { id } }`, userCtx(u3.id));
-    assert.match(r.errors?.[0]?.message ?? "", /Access denied/);
-  });
-
-  it("admin role bypasses ACL and record rules — sees every todo", async () => {
-    const { u2 } = await seed();
-    const r = await run(`{ todos { title } }`, userCtx(u2.id));
-    assert.equal(r.errors, undefined);
-    const titles = (r.data as any).todos.map((t: any) => t.title).sort();
-    assert.deepEqual(titles, ["alice-1", "alice-2", "bob-1", "carol-1"]);
-  });
-
-  it("reader sees only their own rows via record rule", async () => {
-    const { u1 } = await seed();
-    const r = await run(`{ todos { title } }`, userCtx(u1.id));
-    assert.equal(r.errors, undefined);
-    const titles = (r.data as any).todos.map((t: any) => t.title).sort();
-    assert.deepEqual(titles, ["alice-1", "alice-2"]);
-  });
-
-  it("reader cannot create todos (no canCreate)", async () => {
-    const { u1 } = await seed();
+  it("admin bypasses ACL and record rules — sees every todo verbatim", async () => {
+    const { alice, bob, carol } = await seedReaderAdmin(db, rbac);
+    // ownerId is promoted to a relation on the output type, so traverse it.
     const r = await run(
-      `mutation { insertIntoTodos(values: [{ title: "x", ownerId: ${u1.id} }]) { id } }`,
-      userCtx(u1.id),
+      `{ todos { id title ownerId { id name } } }`,
+      ctxFor(bob.id),
     );
-    assert.match(r.errors?.[0]?.message ?? "", /Access denied/);
+    assert.equal(r.errors, undefined);
+    type Row = { id: number; title: string; ownerId: { id: number; name: string } };
+    const rows = (r.data as any).todos as Row[];
+    assert.equal(rows.length, 4, "admin must see all four rows, unfiltered");
+    const byTitle = Object.fromEntries(rows.map((t) => [t.title, t]));
+    assert.deepEqual(Object.keys(byTitle).sort(), [
+      "alice-1", "alice-2", "bob-1", "carol-1",
+    ]);
+    // Relation primary keys come back as GraphQL ID (string); coerce when comparing.
+    const ownerNum = (r: Row) => Number(r.ownerId.id);
+    assert.equal(ownerNum(byTitle["alice-1"]), alice.id);
+    assert.equal(byTitle["alice-1"].ownerId.name, "Alice");
+    assert.equal(ownerNum(byTitle["alice-2"]), alice.id);
+    assert.equal(ownerNum(byTitle["bob-1"]),   bob.id);
+    assert.equal(byTitle["bob-1"].ownerId.name, "Bob");
+    assert.equal(ownerNum(byTitle["carol-1"]), carol.id);
+    assert.equal(byTitle["carol-1"].ownerId.name, "Carol");
   });
 
-  it("update is restricted by the matching record rule", async () => {
-    const sqlite2 = new Database(":memory:");
-    sqlite2.exec(createTablesSql());
-    const db2 = drizzle(sqlite2);
+  it("reader sees only own rows; record rule filters out other owners", async () => {
+    const { alice, bob, carol } = await seedReaderAdmin(db, rbac);
+    const r = await run(
+      `{ todos { id title ownerId { id } } }`,
+      ctxFor(alice.id),
+    );
+    assert.equal(r.errors, undefined);
+    type Row = { id: number; title: string; ownerId: { id: number } };
+    const rows = (r.data as any).todos as Row[];
+    assert.equal(rows.length, 2, "reader must see exactly their two todos");
+    assert.deepEqual(rows.map((t) => t.title).sort(), ["alice-1", "alice-2"]);
+    assert.ok(
+      rows.every((t) => Number(t.ownerId.id) === alice.id),
+      "every returned row must be scoped to the calling reader",
+    );
+    assert.ok(rows.every((t) => Number(t.ownerId.id) !== bob.id && Number(t.ownerId.id) !== carol.id));
+
+    // The scalar `ownerId` remains usable on the input side — the same
+    // record-rule scope expressed via `where` yields the same set.
+    const r2 = await run(
+      `query ($w: JSON) { todos(where: $w) { id } }`,
+      ctxFor(alice.id),
+      { w: [["ownerId", "=", alice.id]] },
+    );
+    assert.equal(r2.errors, undefined);
+    assert.equal(((r2.data as any).todos as any[]).length, 2);
+  });
+
+  it("reader cannot create todos and the table remains unchanged (no canCreate)", async () => {
+    const { alice } = await seedReaderAdmin(db, rbac);
+    const before = await db.select().from(todos);
+    assert.equal(before.length, 4);
+
+    const r = await run(
+      `mutation { insertIntoTodos(values: [{ title: "x", ownerId: ${alice.id} }]) { id } }`,
+      ctxFor(alice.id),
+    );
+    assert.equal(r.errors?.length, 1);
+    assert.match(r.errors![0].message, /Access denied/);
+
+    // Isolation: no row was inserted by the denied mutation.
+    const after = await db.select().from(todos);
+    assert.equal(after.length, 4);
+    assert.ok(after.every((t) => t.title !== "x"));
+  });
+
+  it("update record rule narrows mutation scope to the reader's own rows", async () => {
+    // Reader needs `update` here, so build an isolated config rather than
+    // mutating baseConfig (which other tests rely on).
     const own = [["ownerId", "=", "current_user.id"]];
-    const cfg = {
+    const iso = makeIsolated({
       roles: defineRoles({ reader: {} }),
       accessRights: defineAccessRights({
-        reader: {
-          todos: { read: true, update: true },
-        },
+        reader: { todos: { read: true, update: true } },
       }),
       recordRules: defineRecordRules({
         reader: {
@@ -166,38 +207,42 @@ describe("rbac — enforcement", () => {
           },
         },
       }),
-    };
-    const rbac2 = buildRbac(cfg);
-    const schema2 = buildSchema(db2, allTables, { rbac: { enforce: rbac2.enforce } }).schema;
+    });
 
-    const [u1] = await db2.insert(users).values({ name: "Alice" }).returning();
-    const [u2] = await db2.insert(users).values({ name: "Bob" }).returning();
-    rbac2.assignRole(u1.id, "reader");
-    await db2.insert(todos).values([
+    const [u1] = await iso.db.insert(users).values({ name: "Alice" }).returning();
+    const [u2] = await iso.db.insert(users).values({ name: "Bob" }).returning();
+    iso.rbac.assignRole(u1.id, "reader");
+    await iso.db.insert(todos).values([
       { title: "alice-1", ownerId: u1.id },
-      { title: "bob-1", ownerId: u2.id },
+      { title: "bob-1",   ownerId: u2.id },
     ]);
 
-    const r = await graphql({
-      schema: schema2,
-      source: `mutation ($w: JSON) { updateTodos(set: { title: "stolen" }, where: $w) { id title } }`,
-      contextValue: userCtx(u1.id),
-      variableValues: { w: [["title", "=", "bob-1"]] },
-    });
-    assert.equal(r.errors, undefined);
-    assert.deepEqual((r.data as any).updateTodos, []);
-    const [bob] = await db2.select().from(todos).where(eq(todos.title, "bob-1"));
-    assert.equal(bob.title, "bob-1");
-  });
-
-  it("rejects unknown role on assignRole", () => {
-    assert.throws(() => rbac.assignRole(1, "ghost"), /unknown role/);
-  });
-
-  it("rejects empty roles config at build time", () => {
-    assert.throws(
-      () => buildRbac({ roles: {}, accessRights: {}, recordRules: {} }),
-      /roles config is empty/,
+    const r = await iso.run(
+      `mutation ($w: JSON) { updateTodos(set: { title: "stolen" }, where: $w) { id title } }`,
+      ctxFor(u1.id),
+      { w: [["title", "=", "bob-1"]] },
     );
+    assert.equal(r.errors, undefined);
+    assert.deepEqual((r.data as any).updateTodos, [], "no rows must be returned for cross-owner update");
+
+    // Isolation: bob's row untouched, AND alice's own row (not targeted) also untouched.
+    const [bob] = await iso.db.select().from(todos).where(eq(todos.title, "bob-1"));
+    assert.equal(bob.title, "bob-1");
+    assert.equal(bob.ownerId, u2.id);
+    const [alice] = await iso.db.select().from(todos).where(eq(todos.ownerId, u1.id));
+    assert.equal(alice.title, "alice-1");
+  });
+
+  describe("config validation (unit)", () => {
+    it("rejects unknown role on assignRole", () => {
+      assert.throws(() => rbac.assignRole(1, "ghost"), /unknown role/);
+    });
+
+    it("rejects empty roles config at build time", () => {
+      assert.throws(
+        () => buildRbac({ roles: {}, accessRights: {}, recordRules: {} }),
+        /roles config is empty/,
+      );
+    });
   });
 });

@@ -1,208 +1,154 @@
 ---
 name: test-suite-refactor
 description: |
-  Refactors an existing TypeScript test suite to remove redundancy and increase signal by scanning and grouping tests by feature/flow, merging highly similar cases (prefer table-driven tests), removing unnecessary or assertion-free tests only when coverage is preserved, detecting and filling assertion gaps for every row/record created or mutated by the test (all key fields, relations, counterparts, and isolation), strengthening assertions around business outcomes and side effects, and favoring end-to-end functional coverage while keeping readability, determinism, and debuggability. Use when the user asks to deduplicate, merge, prune, strengthen, or audit assertions in tests.
+  Refactors an existing TypeScript test suite in this repo to remove redundancy and increase signal: scan and group tests by feature/flow/invariant, merge near-duplicates (prefer table-driven cases under `node:test`), delete coverage-redundant or assertion-free tests only when coverage is preserved, run a per-row assertion-gap audit (cardinality, full field tuples, FK + inverse relations, isolation), and strengthen assertions around business outcomes and side effects. Calibrated for `node:test` + better-sqlite3 in-memory DBs + the custom GraphQL builder in `packages/drizzle-graphql-rbac`. Use when the user asks to deduplicate, merge, prune, strengthen, or audit assertions in tests.
 ---
 
 # Test suite refactor (dedupe + strengthen)
 
-This skill is for improving an **existing** test suite (not writing tests from scratch): reduce duplication, keep coverage, and increase assertion quality.
+For improving an **existing** test suite — not writing new tests. Goal: fewer tests, higher signal, same or better coverage.
 
-It is calibrated for this repo’s stack:
+## Stack assumptions (this repo)
 
-- Node’s built-in test runner (`node:test`) via `tsx`
-- GraphQL schema builder tests that execute queries/mutations end-to-end
-- Drizzle + SQLite (often in-memory or temp-file DBs)
+- Test runner: Node's built-in `node:test` via `tsx`, invoked by `npm test` (runs the `drizzle-graphql-rbac` workspace).
+- Assertions: `node:assert/strict` (`assert.equal`, `assert.deepEqual`, `assert.ok`, `assert.rejects`).
+- DB: `better-sqlite3` in-memory (`new Database(":memory:")`) + `drizzle-orm/better-sqlite3`. Each test file builds its own minimal schema and seeds rows directly — do not import `src/db.ts`.
+- GraphQL: tests execute end-to-end through `graphql({ schema, source, contextValue, variableValues })` against schemas produced by `buildSchema(...)` in `packages/drizzle-graphql-rbac/src/graphql/builder/`. Treat the GraphQL response (`data`/`errors`) as the contract under test — do not reach into builder internals.
+- RBAC: built with `buildRbac(...)` from `defineRoles` / `defineAccessRights` / `defineRecordRules`. The `admin` role is framework-injected and bypasses all rules; declaring `admin` in app config throws. RBAC state is in-memory.
+- Column-vs-relation rule: a single-column FK (e.g. `todos.assigneeId`) is replaced by a relation field on the **output** type. The scalar remains usable inside `where` / `set` / Insert / Update inputs.
 
 ## Operating principles
 
-- Prefer **fewer, higher-signal** tests over many fragmented ones.
-- **Preserve coverage first**; only remove tests when their intent is fully covered elsewhere.
-- Merge aggressively only when it does not harm **readability** or **debuggability**.
-- Tests must validate **behavior and outcomes**, not implementation details.
-- Keep tests **deterministic**: stable data, explicit assertions, no reliance on incidental side effects.
-- When tests touch RBAC/record rules, assert both **allow** and **deny** boundaries explicitly.
+- **Fewer, higher-signal tests** beat many fragmented ones.
+- **Preserve coverage first.** Only remove a test when its invariant is asserted elsewhere and would fail on regression.
+- **Validate behavior and outcomes**, never builder internals.
+- **Deterministic by construction**: fresh in-memory DB per test or `beforeEach` reset; no shared mutable fixtures across files; no time/random without seeding.
+- **Assert both sides of every access boundary.** For RBAC/record-rule tests, allow and deny paths are both first-class coverage.
 
-## Workflow (use this order)
+## Workflow
 
-### 1) Inventory and group tests
+### 1) Inventory and group
 
-Scan all tests in the target module(s) and produce a quick index. For each test, capture:
-
-- **Feature**: user-facing/business area (e.g. “GraphQL filters”, “FK relation promotion”, “RBAC row rules”)
-- **Functional flow**: end-to-end scenario (input → processing → output + side effects)
-- **Invariant**: the business/contract rule the test proves
-- **Setup shape**: DB seeding + schema builder wiring
-- **Assertions**: what is asserted (and what is missing)
-
-Use this compact index template:
+Scan the target test files and build a compact index. For each test record: feature, flow (input → act → output + side effects), invariant proved, setup shape, and current vs. needed assertions.
 
 ```markdown
 | Test | Feature | Flow | Invariant | Setup | Assertions (current → needed) |
 |------|---------|------|-----------|-------|-------------------------------|
-| filters__inArray | filters | query(where=inArray) | returns only matching rows | seed 3 todos | asserts ids only → add count + full row fields |
+| filters__inArray | filters | query(where=inArray) | returns only matching rows | seed 3 todos | ids only → +length, +full tuple, +excluded ids absent |
 ```
 
-Group tests by:
+Group by **feature → flow → invariant**. Hits in the same cell are merge candidates.
 
-- Feature (top-level)
-- Functional flow (scenario)
-- Invariant (contract/business rule)
+### 2) Detect redundancy
 
-### 2) Detect redundancy (high-confidence matches)
+Merge candidates:
 
-Mark tests as candidates for merging/removal when they are:
+- Same flow + same invariant, differ only in literals.
+- Asserts are a strict subset of another test's asserts on the same flow.
+- Setup-heavy with trivial asserts (often a renamed duplicate).
+- "Does not throw" tests with no behavioral assertion.
 
-- Same flow, same invariant, only different constants
-- Same invariant, tested multiple times via slightly different setup paths but asserting the same thing
-- Setup-heavy tests with minimal or trivial asserts
-- “Does not throw/crash” tests with no meaningful assertions
+Heuristic: if two tests have identical arrange/act shape and differ in input data, they are table-driven candidates.
 
-Practical heuristics:
+### 3) Merge without over-merging
 
-- If two tests have the same arrange/act shape and differ mainly in literals, they are usually **table-driven** candidates.
-- If a test’s asserts are a strict subset of another test’s asserts for the same flow, it is usually redundant.
+Preferred patterns in `node:test`:
 
-### 3) Merge redundant tests (without over-merging)
+- **Table-driven `it`**: iterate `cases` inside one `it`, label each case, assert per case. Best when failure mode is uniform.
+- **`t.test` subtests**: when per-case failure isolation matters, use `await t.test(label, ...)` so each case reports independently.
+- **Scenario helper**: extract an `arrange/act` helper, keep multiple focused `it`s that each assert a distinct invariant.
 
-Merge when tests differ only by input data but validate identical behavior.
+Guardrails:
 
-Preferred merge patterns in `node:test`:
+- Do not collapse distinct invariants into one mega-test.
+- Keep edge cases that represent a separate contract (nulls, empty lists, limit/offset boundaries, RBAC deny) as their own tests.
+- Big end-to-end flow tests stay intact; do not shred them into micro-tests.
 
-- **Table-driven single test**: iterate cases and use a clear per-case label; keep per-case assertions localized.
-- **Subtests**: `await t.test(name, async (t) => { ... })` per case to isolate failures cleanly.
-- **Shared helper**: extract a scenario runner helper (arrange/act) and call it from a few focused tests that assert different invariants.
+### 4) Coverage-safe deletion
 
-Guardrails (do not over-merge):
+Delete only when **all** hold:
 
-- Do not combine unrelated invariants into one mega-test just to reduce count.
-- Do not mix multiple failure modes into one test unless each is asserted explicitly and failures are easy to localize.
-- Keep “big-flow” tests end-to-end, but keep edge-case tests separate when they represent a distinct contract.
+- Invariant is asserted elsewhere in the same flow.
+- The remaining suite would fail if the behavior regressed.
+- The deleted test contributes no unique edge case, security boundary, or known-regression coverage.
 
-### 4) Remove unnecessary tests (coverage-safe deletions)
+Always keep unique coverage of: null/empty/boundary inputs, ordering ties, `limit`/`offset` edges, RBAC deny paths, column-vs-relation behavior, and inverse-relation traversal.
 
-Delete a test only if:
+### 5) Assertion-gap audit (the highest-leverage pass)
 
-- Its invariant is asserted elsewhere in the same flow, and
-- The remaining tests would fail if the behavior regressed, and
-- The deleted test does not cover a unique edge case or boundary.
+Most weak tests assert one field and skip the rest. For every test that **creates or mutates a row**, run this pass before any merging.
 
-Always keep tests that cover unique:
+Procedure per test:
 
-- Edge cases (nulls, empty lists, limit/offset boundaries, zero rows, multi-row ordering ties)
-- Security/access-right boundaries (deny paths are first-class coverage)
-- Regression fixes (when linked to a known bug pattern) if they add distinct coverage
-
-### 5) Strengthen assertions (make tests prove something)
-
-Each test should assert at least one **business outcome** and, when applicable, a **side effect**.
-
-Assertion types to prefer:
-
-- **Correctness**: exact returned rows, ordering, pagination behavior, updated/deleted counts
-- **Side effects**: rows inserted/updated/deleted; relation integrity preserved; sessions/todos linked properly
-- **Error shape**: for deny/invalid input, assert the **error class/message shape** (don’t only assert “throws”)
-- **No unintended changes**: unrelated rows unchanged when that matters (isolation)
-
-Anti-patterns to eliminate:
-
-- “It runs” tests with no asserts
-- Asserting internal/private implementation artifacts
-- Asserting only that a row exists without asserting its **key fields/relations**
-
-### 5a) Detect and fill assertion gaps (systematic pass)
-
-Most low-signal tests don’t miss *all* assertions — they assert one field and skip the rest.
-Run this pass over every test that creates or mutates records.
-
-Rule of thumb: for every **row** a test causes to exist or change, assert the **full identifying tuple** of business-relevant fields — not just one.
-
-Gap detection procedure (per test):
-
-1. Enumerate every row the test causes to exist or change (walk the “act” step).
-2. For each row/table, list its **core fields** + **relation keys**.
-3. Compare to what the test asserts. Missing fields = gaps.
-4. Assert **cardinality** first (`count`), then assert full tuples.
-5. Assert **counterparts** and **links** (FKs, inverse relations, join traversal) when the test’s flow implies them.
-6. Assert **isolation** where the invariant claims “only X changed”.
-
-#### Assertion-gap audit table (add to the inventory output in step 1)
+1. Enumerate every row the test causes to exist or change (walk the act step end-to-end, including cascades).
+2. For each affected row/table, list core fields + relation keys.
+3. Diff against current assertions → gaps.
+4. Assert **cardinality first** (`length === N`), then full identifying tuples.
+5. Assert **counterparts and links**: forward FK value, inverse relation contents, GraphQL relation traversal.
+6. Assert **isolation** wherever the invariant claims "only X changed" — unrelated rows untouched, untouched columns unchanged.
 
 ```markdown
-| Test | Row(s) affected | Fields currently asserted | Fields missing |
-|------|------------------|---------------------------|----------------|
-| insertTodo | todos(1) | id only | title, assigneeId, createdAt shape, FK exists |
-| relationPromotion | users(1), todos(2) | nested names only | todo count, todo.user_id linkage, no extra rows |
+| Test | Rows affected | Asserted | Missing |
+|------|---------------|----------|---------|
+| insertTodo | todos(1) | id | title, assigneeId, FK resolves to user, length===1 |
+| relationPromotion | users(1), todos(2) | nested names | todo count per user, inverse relation excludes other user's todos |
 ```
 
-Fill the “missing” column **before** merging tests — don’t merge two weak tests into one slightly less weak test.
+Fill gaps **before** merging. Never merge two weak tests into one slightly less weak test.
 
-#### Row-level checklist (generic, applies broadly)
+#### Row-level checklist
 
-- **Count**: if you expect one row, assert it’s one row (don’t index into arrays without checking length).
-- **Primary identity**: `id` (or composite key), plus any human-meaningful identifier asserted by the invariant.
-- **Scope**: owner/tenant/user scope when relevant (e.g. `assigneeId`).
-- **All fields touched by the mutation**: set fields match expected values; untouched fields remain expected.
+- **Count**: `assert.equal(rows.length, N)` before indexing.
+- **Identity**: `id` (or composite key) plus any human-meaningful identifier the invariant names.
+- **Scope/ownership**: `assigneeId`, tenant, or session owner when the invariant depends on it.
+- **All touched fields** match expected; untouched fields remain unchanged (read back and compare).
 - **Relations**:
-  - Forward FK: `todo.assigneeId === user.id`
-  - Inverse relation: user’s `todos` includes the right ids and excludes others
-- **Ordering/pagination**: if `orderBy/limit/offset` is used, assert the returned order and length.
-- **Negative assertions**: verify excluded rows truly excluded (especially for filters and RBAC).
+  - Forward FK: `todo.assigneeId === user.id` at the DB level.
+  - Inverse: querying the user's `todos` returns exactly the expected ids — no extras, no duplicates.
+- **Ordering/pagination**: when `orderBy`/`limit`/`offset` is used, assert both order and length.
+- **Negative**: rows that should be filtered out are absent (especially for `where`, record rules).
 
-#### GraphQL-specific checklist (this repo)
+#### GraphQL-specific checklist
 
-- **Query shape**: assert the response shape (data present, errors absent) for success cases.
-- **Error cases**: assert `errors` exists and message/category is stable enough to be meaningful (avoid brittle full-string matches if messages include dynamic ids).
-- **Column-vs-relation rule**: when a column is replaced by a relation field on output types, assert the expected behavior:
-  - Column is still usable in `where`/`set` inputs
-  - Output traverses via the relation field (and does not expose the scalar in the same name)
-- **Relations**: when testing relation traversal, assert both:
-  - Link correctness (the joined row is the intended one)
-  - Cardinality (no duplicates; expected number of children)
-- **Mutations**: assert returned rows match DB state (not only that mutation returned “something”).
+- **Success shape**: `assert.equal(result.errors, undefined)`, then assert `result.data` shape with `deepEqual` for small payloads or field-by-field for large ones.
+- **Error shape**: assert `result.errors` length and a stable substring of the message (avoid full-string matches against messages that embed dynamic ids).
+- **Column-vs-relation**: assert both halves explicitly when relevant:
+  - The scalar `assigneeId` still works inside `where` / `set` / Insert / Update inputs.
+  - The output traversal `assignee { id name }` returns the joined row; the scalar is **not** exposed under the same name on the output type.
+- **Mutations**: cross-check the mutation's `.returning()` result against a follow-up DB read — do not trust only the GraphQL payload.
+- **RBAC**: every record-rule test asserts both allow (rows visible/mutable as expected) and deny (filtered out or rejected with the expected error category). Confirm `admin` bypasses the rule in a dedicated case.
 
 ### 6) Prefer end-to-end functional coverage
 
-Prefer tests that follow the real functional flow:
-
-- Input: realistic seed data and operations
-- Processing: execute through GraphQL (or the public API under test), not internal helpers
-- Output: verify returned results
-- Side effects: verify DB artifacts and relations
-
-If a flow has multiple critical checkpoints, assert intermediate steps too (but keep them tied to business meaning).
+Drive tests through `graphql(...)`, not internal builder helpers. Verify both the returned payload and the resulting DB state. Keep filter/order-translator unit tests (e.g. `filters.test.ts`) — they are intentional micro-tests on pure functions and should stay focused.
 
 ### 7) Naming and structure
 
-Use intention-revealing names. Recommended structure per test:
+- Arrange (minimal), Act (one coherent flow), Assert (outcomes + side effects + isolation).
+- Names: `<feature>__<scenario>__<expected_outcome>` or `<feature>__<edge_case>__<invariant>`.
+- Co-locate helpers in the same file or a `__helpers__.ts` sibling — do not invent new shared-fixture packages.
 
-- Arrange: minimal setup, reuse fixtures/helpers
-- Act: one primary action (or one coherent flow)
-- Assert: outcomes + side effects
+## Verification
 
-Naming patterns:
+After the refactor: run `npm test` from the repo root (executes the `drizzle-graphql-rbac` workspace under `node:test` via `tsx`). All tests must pass. If a test now fails because a previously-hidden gap is exposed, fix the **code** or correct the assertion — do not weaken the assertion to make it pass.
 
-- `test_<feature>__<scenario>__<expected_outcome>`
-- `test_<feature>__<edge_case>__<invariant>`
+## Deliverable
 
-## Deliverable format (what to output after refactor)
+Output a short report:
 
-When finishing a refactor, produce:
-
-- List of merged tests (old → new)
-- List of deleted tests with justification (“coverage preserved by X”)
-- List of assertion upgrades (what invariants are now explicitly proven)
-- Any new helpers/table-driven structures (and where they live)
-- How you verified (e.g. `npm test`)
+- **Merged**: `old → new` mapping with one-line justification each.
+- **Deleted**: each removal with the test that now covers its invariant.
+- **Strengthened**: per test, the invariants now explicitly proven (cardinality, full tuples, relations, isolation, deny paths).
+- **New helpers / table structures**: where they live and what they encapsulate.
+- **Verification**: confirm `npm test` is green and note runtime if it changed materially.
 
 ## Quick checklist
 
-- [ ] All relevant test files scanned
-- [ ] Tests grouped by feature/flow/invariant
-- [ ] Assertion-gap audit run: every affected row has cardinality + full field tuple + relation links + isolation checks asserted
-- [ ] No “silent tests” remain
-- [ ] Redundant tests merged via table-driven tests or shared helpers (only after gaps are filled)
-- [ ] Deletions are coverage-safe
-- [ ] Assertions validate outcomes + side effects
-- [ ] End-to-end flows covered holistically
-- [ ] Names are intention-revealing and structure consistent
+- [ ] All target test files inventoried; tests grouped by feature/flow/invariant.
+- [ ] Assertion-gap audit done **before** any merging: cardinality + full tuples + forward FK + inverse relation + isolation.
+- [ ] No "silent" or assertion-free tests remain.
+- [ ] Merges use table-driven cases or subtests; no distinct invariants collapsed together.
+- [ ] Deletions are coverage-safe and named in the report.
+- [ ] Column-vs-relation behavior asserted on both input and output sides where applicable.
+- [ ] RBAC tests assert allow, deny, and admin-bypass.
+- [ ] `npm test` green; runtime not materially worse.
