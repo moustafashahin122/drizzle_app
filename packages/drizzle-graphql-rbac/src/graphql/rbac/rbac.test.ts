@@ -125,21 +125,16 @@ describe("rbac — enforcement (GraphQL layer)", () => {
   });
 
   it("reader sees only own rows; record rule filters out other owners", async () => {
-    const { run, cast: { alice, bob, carol } } = tc;
-    const r = await run(
-      `{ todos { id title ownerId { id } } }`,
-      ctxFor(alice.id),
-    );
+    const { run, cast: { alice } } = tc;
+    // Reader has read on `todos` only — so the output query does NOT traverse
+    // the `ownerId` relation (that would require a read ACL on `users`, which
+    // relation traversal correctly enforces). Ownership is asserted on the
+    // input side via a `where` filter on the scalar FK column.
+    const r = await run(`{ todos { id title } }`, ctxFor(alice.id));
     assert.equal(r.errors, undefined);
-    type Row = { id: number; title: string; ownerId: { id: number } };
-    const rows = (r.data as any).todos as Row[];
+    const rows = (r.data as any).todos as Array<{ id: number; title: string }>;
     assert.equal(rows.length, 2, "reader must see exactly their two todos");
     assert.deepEqual(rows.map((t) => t.title).sort(), ["alice-1", "alice-2"]);
-    assert.ok(
-      rows.every((t) => Number(t.ownerId.id) === alice.id),
-      "every returned row must be scoped to the calling reader",
-    );
-    assert.ok(rows.every((t) => Number(t.ownerId.id) !== bob.id && Number(t.ownerId.id) !== carol.id));
 
     // The scalar `ownerId` remains usable on the input side — the same
     // record-rule scope expressed via `where` yields the same set.
@@ -150,6 +145,35 @@ describe("rbac — enforcement (GraphQL layer)", () => {
     );
     assert.equal(r2.errors, undefined);
     assert.equal(((r2.data as any).todos as any[]).length, 2);
+  });
+
+  it("relation traversal enforces read ACL on the referenced table (no users grant → denied, localized to the relation field)", async () => {
+    const { run, cast: { alice } } = tc;
+    // Reader has no read ACL on `users`; traversing the `ownerId` relation
+    // must fail with FORBIDDEN rather than silently returning rows (which is
+    // what the pre-fix builder did). The deny must also be localized: the
+    // parent `todos` list still resolves (the reader IS allowed to read
+    // todos), only the nested `ownerId` field nulls out with an error per
+    // row — proving the new guard fires per-relation, not at the query root.
+    const r = await run(`{ todos { id title ownerId { id } } }`, ctxFor(alice.id));
+    const rows = (r.data as any)?.todos as Array<{ id: number; title: string; ownerId: any }> | null;
+
+    // Errors: one per attempted traversal (one per reader-visible todo row).
+    assert.ok(r.errors && r.errors.length >= 1, "expected at least one deny error");
+    for (const err of r.errors!) {
+      assert.match(err.message, /Access denied|forbidden/i);
+      // The error path must end at `ownerId` — proves the guard fired on the
+      // relation field, not at the root `todos` resolver.
+      assert.equal(err.path?.[err.path.length - 1], "ownerId");
+    }
+    assert.equal(r.errors!.length, 2, "one deny per reader-visible todo row");
+
+    // Data localization: parent rows still come back (root `todos` is
+    // allowed), with `ownerId` nulled out everywhere.
+    assert.ok(Array.isArray(rows), "todos list must still resolve");
+    assert.equal(rows!.length, 2, "reader sees their own 2 todos");
+    assert.deepEqual(rows!.map((t) => t.title).sort(), ["alice-1", "alice-2"]);
+    assert.ok(rows!.every((t) => t.ownerId === null), "every ownerId must be null on the denied path");
   });
 
   it("reader cannot create todos and the table remains unchanged (no canCreate)", async () => {

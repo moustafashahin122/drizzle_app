@@ -8,8 +8,8 @@ A single `createApp(...)` call stands up an HTTP service with a fully-typed Grap
 
 - **Zero-boilerplate GraphQL CRUD.** Every table in your Drizzle namespace gets typed `Query` and `Mutation` fields — `list`, `single`, `insert`, `update`, `delete` — with filter, ordering, and pagination inputs derived from the column types.
 - **Automatic relations.** Single-column foreign keys are promoted into forward (`one`) and inverse (`many`) GraphQL fields automatically; explicit Drizzle `relations(...)` declarations take precedence when you need them.
-- **Built-in authentication.** REST `/auth/*` routes (`register`, `login`, `logout`, `me`) with bcrypt-hashed passwords and dual cookie + bearer-token sessions, ready to mount.
-- **Admin sub-app.** REST `/admin/*` endpoints for user management and runtime role-membership changes, gated by the same RBAC engine that protects GraphQL.
+- **Built-in authentication.** REST `/auth/`* routes (`register`, `login`, `logout`, `me`) with bcrypt-hashed passwords and dual cookie + bearer-token sessions, ready to mount.
+- **Admin sub-app.** REST `/admin/`* endpoints for user management and runtime role-membership changes, gated by the same RBAC engine that protects GraphQL.
 - **Code-defined, in-memory RBAC.** Roles, access rights, and record rules are declared in TypeScript and compiled into the engine snapshot at startup — no migrations, no sync routines, no DB drift. User → role assignments live in process memory and can be mutated at runtime via the REST API or the engine handle.
 - **Row-level security with a domain DSL.** Per-role, per-action record rules written in an Odoo-style domain language (`["&", [...], ["|", [...], [...]]]`) are compiled to SQL and AND-injected into every read, update, and delete.
 - **Per-request enforcement wrapper.** `rdbFor(ctx)` returns a Drizzle handle that automatically applies the caller's RBAC envelope to `select`, `insert`, `update`, `delete` — use it in custom routes and they're protected for free.
@@ -20,14 +20,16 @@ A single `createApp(...)` call stands up an HTTP service with a fully-typed Grap
 
 ## At a glance
 
-| Area              | What you get                                                                                |
-|-------------------|---------------------------------------------------------------------------------------------|
-| Transport         | Hono app exposing GraphQL (via `graphql-yoga`) and REST sub-apps; runs on any Web Fetch host. |
-| Database          | Drizzle ORM. SQLite is the reference dialect; the engine only relies on `select()`.         |
-| Auth              | Email + password, bcrypt-hashed, with cookie and `Authorization: Bearer` sessions.          |
+
+| Area              | What you get                                                                                       |
+| ----------------- | -------------------------------------------------------------------------------------------------- |
+| Transport         | Hono app exposing GraphQL (via `graphql-yoga`) and REST sub-apps; runs on any Web Fetch host.      |
+| Database          | Drizzle ORM. SQLite is the reference dialect; the engine only relies on `select()`.                |
+| Auth              | Email + password, bcrypt-hashed, with cookie and `Authorization: Bearer` sessions.                 |
 | Authorization     | Code-defined roles, CRUD grants, and row-level rules; built synchronously, held in process memory. |
-| Persistence model | Two framework-owned tables: `users` and `sessions`. RBAC is in-memory.                      |
-| Runtime mutation  | Role memberships live in the engine; the role catalog and grants are code-only.             |
+| Persistence model | Two framework-owned tables: `users` and `sessions`. RBAC is in-memory.                             |
+| Runtime mutation  | Role memberships live in the engine; the role catalog and grants are code-only.                    |
+
 
 A working reference application is available in this monorepo's root (`../../`).
 
@@ -162,9 +164,11 @@ export const roles = defineRoles({
 export type RoleKey = keyof typeof roles;
 ```
 
-| Field     | Effect                                                                                      |
-|-----------|---------------------------------------------------------------------------------------------|
+
+| Field     | Effect                                                                                                           |
+| --------- | ---------------------------------------------------------------------------------------------------------------- |
 | `isAdmin` | Optional. Members bypass every RBAC check. The framework already provides one — you should rarely need a second. |
+
 
 There is **no inheritance** — each role's grants stand alone. If `manager` should also have what `user` has, restate those grants under `manager`, or assign both roles to the user.
 
@@ -233,8 +237,8 @@ defineAccessRights({
 });
 ```
 
-- **`roleKey`** must match a key from `defineRoles({...})` (or the framework's `admin`). `buildRbacConfig` throws on unknown role refs.
-- **`resourceJsKey`** is the **JS export name** of the Drizzle table (e.g. `todos`, `users`) — not the SQL table name. The auto-generated GraphQL CRUD uses the same key, so the names line up by construction.
+- `**roleKey**` must match a key from `defineRoles({...})` (or the framework's `admin`). `buildRbacConfig` throws on unknown role refs.
+- `**resourceJsKey**` is the **JS export name** of the Drizzle table (e.g. `todos`, `users`) — not the SQL table name. The auto-generated GraphQL CRUD uses the same key, so the names line up by construction.
 
 ### Deny by default
 
@@ -311,21 +315,25 @@ defineRecordRules({
 
 A **domain** is an array of leaves and combinators. Each leaf is `[field, operator, value]`. The `field` must be a column on the resource table.
 
-| Operator               | Notes                                                                |
-|------------------------|----------------------------------------------------------------------|
-| `=`, `!=`              | `null` on either side becomes `IS NULL` / `IS NOT NULL`.             |
-| `<`, `<=`, `>`, `>=`   | Numeric / lexicographic depending on column type.                    |
-| `in`, `not in`         | Value must be an array.                                              |
-| `like`, `not like`     | Case-sensitive pattern match (SQL `LIKE`).                           |
-| `ilike`, `not ilike`   | Case-insensitive pattern match.                                      |
+
+| Operator             | Notes                                                    |
+| -------------------- | -------------------------------------------------------- |
+| `=`, `!=`            | `null` on either side becomes `IS NULL` / `IS NOT NULL`. |
+| `<`, `<=`, `>`, `>=` | Numeric / lexicographic depending on column type.        |
+| `in`, `not in`       | Value must be an array.                                  |
+| `like`, `not like`   | Case-sensitive pattern match (SQL `LIKE`).               |
+| `ilike`, `not ilike` | Case-insensitive pattern match.                          |
+
 
 Combinators are written in **prefix notation** as control strings followed by their operands:
 
-| Token | Arity        |
-|-------|--------------|
-| `&`   | binary AND   |
-| `\|`  | binary OR    |
-| `!`   | unary NOT    |
+
+| Token | Arity      |
+| ----- | ---------- |
+| `&`   | binary AND |
+| `|`   | binary OR  |
+| `!`   | unary NOT  |
+
 
 Implicit AND: a flat list of leaves with no combinator is AND-ed together (Odoo's default).
 
@@ -372,14 +380,16 @@ A granting role with **no rule** on `(resource, action)` is unrestricted on that
 
 Given the three files above, a request from a user holding only `user`:
 
-| Operation                             | Outcome                                                            |
-|---------------------------------------|--------------------------------------------------------------------|
-| `query { todos { id } }`              | Lists every todo (read granted, no rule).                          |
-| `mutation updateTodos(...)` mine      | Succeeds — rule says `assigneeId = current_user.id`.               |
-| `mutation updateTodos(...)` someone else's | `WHERE` narrows to my own; zero rows updated. No error.       |
-| `mutation deleteFromTodos(...)`       | Same as above — only my own get deleted.                           |
-| `mutation insertIntoTodos(...)`       | Granted (`create: true`).                                          |
-| `query { users { id } }`              | `FORBIDDEN` — `user` has no grant on `users`.                      |
+
+| Operation                                  | Outcome                                                 |
+| ------------------------------------------ | ------------------------------------------------------- |
+| `query { todos { id } }`                   | Lists every todo (read granted, no rule).               |
+| `mutation updateTodos(...)` mine           | Succeeds — rule says `assigneeId = current_user.id`.    |
+| `mutation updateTodos(...)` someone else's | `WHERE` narrows to my own; zero rows updated. No error. |
+| `mutation deleteFromTodos(...)`            | Same as above — only my own get deleted.                |
+| `mutation insertIntoTodos(...)`            | Granted (`create: true`).                               |
+| `query { users { id } }`                   | `FORBIDDEN` — `user` has no grant on `users`.           |
+
 
 ---
 
@@ -387,12 +397,14 @@ Given the three files above, a request from a user holding only `user`:
 
 Memberships live in the engine. The REST API for the admin dashboard:
 
-| Method | Path                          | Body            | Returns                          |
-|--------|-------------------------------|-----------------|----------------------------------|
-| GET    | `/admin/roles`                | —               | `{ roles: string[] }`            |
-| GET    | `/admin/users/:id/roles`      | —               | `{ userId, roles: string[] }`    |
-| POST   | `/admin/users/:id/roles`      | `{ roleKey }`   | `{ userId, roles }` (201)        |
-| DELETE | `/admin/users/:id/roles/:key` | —               | `{ userId, roles }` (200)        |
+
+| Method | Path                          | Body          | Returns                       |
+| ------ | ----------------------------- | ------------- | ----------------------------- |
+| GET    | `/admin/roles`                | —             | `{ roles: string[] }`         |
+| GET    | `/admin/users/:id/roles`      | —             | `{ userId, roles: string[] }` |
+| POST   | `/admin/users/:id/roles`      | `{ roleKey }` | `{ userId, roles }` (201)     |
+| DELETE | `/admin/users/:id/roles/:key` | —             | `{ userId, roles }` (200)     |
+
 
 - All endpoints require an authenticated session.
 - `GET` requires the caller to have `users.read`; `POST` / `DELETE` require `users.update`.
@@ -525,10 +537,12 @@ When stdout is a TTY (and `NO_COLOR` is unset), output is rendered via `pino-pre
 
 `createApp` writes through the same root logger:
 
-| Component            | When                                                           |
-|----------------------|----------------------------------------------------------------|
-| `framework.app`      | `debug` line when the app is composed.                         |
-| `framework.app.http` | Hono request log — 4xx → `warn`, 5xx → `error`, else `info`.   |
+
+| Component            | When                                                         |
+| -------------------- | ------------------------------------------------------------ |
+| `framework.app`      | `debug` line when the app is composed.                       |
+| `framework.app.http` | Hono request log — 4xx → `warn`, 5xx → `error`, else `info`. |
+
 
 Pass `logger: false` to `createApp` to silence the HTTP middleware, or `logger: (msg, ...rest) => {...}` to fully override the sink.
 
@@ -560,7 +574,7 @@ Construct your own pino root (custom transport, redact, etc.) and pass child log
 
 ## DB bootstrap
 
-The framework owns just two tables — `users` and `sessions`. A small `CREATE TABLE IF NOT EXISTS` script is sufficient; see the reference app's `src/scripts/init-db.ts`. Once you publish a built dist of this package, the standard `drizzle-kit` `db:generate` / `db:migrate` flow works as well.
+The framework owns just two tables — `users` and `sessions` — exported as `frameworkTables` from `drizzle-graphql-rbac/tables` (a schema-only subpath so `drizzle-kit`'s CJS loader doesn't pull in the runtime). Re-export them from your own schema module and let `drizzle-kit` (`db:push` / `db:generate` + `db:migrate`) manage the SQL. If you need to bootstrap by hand, the shape is:
 
 ```sql
 CREATE TABLE users (
@@ -584,22 +598,24 @@ CREATE TABLE sessions (
 
 ## Layout of this package
 
-| Path                                   | What's there                                                             |
-|----------------------------------------|--------------------------------------------------------------------------|
-| `src/index.ts`                         | Public surface — re-exports everything below.                            |
-| `src/app.ts`                           | `createApp` composition root.                                            |
-| `src/tables.ts`                        | Drizzle definitions for `users` and `sessions`.                          |
-| `src/auth/`                            | `/auth/*` REST sub-app, session primitives, Hono middleware.             |
-| `src/admin/`                           | `/admin/*` REST sub-app (user CRUD + role membership).                   |
-| `src/graphql/builder/`                 | Schema generator: types, root fields, where/orderBy translation.         |
-| `src/graphql/relations.ts`             | Relation introspection (explicit + auto-promoted single-column FK).      |
-| `src/graphql/rbac/config.ts`           | `defineRoles` / `defineAccessRights` / `defineRecordRules` + validation. |
-| `src/graphql/rbac/rbac.ts`             | In-memory engine: snapshot, membership API, `enforce`.                   |
-| `src/graphql/rbac/rbacDb.ts`           | Per-request Drizzle proxy that auto-runs `enforce`.                      |
-| `src/graphql/domain/`                  | Odoo-style domain parser + SQL translator.                               |
-| `src/logger.ts`                        | Pino root logger (pretty on TTY, JSON otherwise) re-exported from the package.  |
 
-Each subdirectory has its own README that goes deeper.
+| Path                         | What's there                                                                   |
+| ---------------------------- | ------------------------------------------------------------------------------ |
+| `src/index.ts`               | Public surface — re-exports everything below.                                  |
+| `src/app.ts`                 | `createApp` composition root.                                                  |
+| `src/tables.ts`              | Drizzle definitions for `users` and `sessions`.                                |
+| `src/auth/`                  | `/auth/*` REST sub-app, session primitives, Hono middleware.                   |
+| `src/admin/`                 | `/admin/*` REST sub-app (user CRUD + role membership).                         |
+| `src/graphql/builder/`       | Schema generator: types, root fields, where/orderBy translation.               |
+| `src/graphql/relations.ts`   | Relation introspection (explicit + auto-promoted single-column FK).            |
+| `src/graphql/rbac/config.ts` | `defineRoles` / `defineAccessRights` / `defineRecordRules` + validation.       |
+| `src/graphql/rbac/rbac.ts`   | In-memory engine: snapshot, membership API, `enforce`.                         |
+| `src/graphql/rbac/rbacDb.ts` | Per-request Drizzle proxy that auto-runs `enforce`.                            |
+| `src/graphql/domain/`        | Odoo-style domain parser + SQL translator.                                     |
+| `src/logger.ts`              | Pino root logger (pretty on TTY, JSON otherwise) re-exported from the package. |
+
+
+Source layout is the source of truth — the public surface is everything re-exported from `src/index.ts`. The reference app at the repo root demonstrates a complete wiring (auto-seeded users + demo data, in-memory role binding, custom Hono routes that use `rdbFor`).
 
 ---
 

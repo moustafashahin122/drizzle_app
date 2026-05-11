@@ -12,22 +12,25 @@
     "db:generate": "drizzle-kit generate",
     "db:migrate": "drizzle-kit migrate",
     "db:studio": "drizzle-kit studio",
-    "dev": "tsx watch src/server.ts",
-    "start": "tsx src/server.ts",
+    "dev": "tsx watch --env-file-if-exists=.env src/server.ts",
+    "start": "tsx --env-file-if-exists=.env src/server.ts",
+    "seed:demo": "tsx --env-file-if-exists=.env src/scripts/seedDemo.ts",
+    "seed:demo:reset": "tsx --env-file-if-exists=.env src/scripts/seedDemo.ts --reset",
     "test:app": "node --import tsx --test src/*.test.ts",
-    "test": "npm run test:app && npm test --workspace drizzle-graphql-rbac",
-    "seed:admin": "tsx src/scripts/seed-admin.ts"
+    "test": "npm run test:app && npm test --workspace drizzle-graphql-rbac"
   },
   "dependencies": {
     "@hono/node-server": "^1.13.7",
-    "@types/bcryptjs": "^2.4.6",
-    "bcryptjs": "^3.0.3",
+    "@hono/zod-validator": "^0.8.0",
+    "@node-rs/argon2": "^2.0.2",
     "better-sqlite3": "^11.7.0",
     "drizzle-graphql-rbac": "*",
     "drizzle-orm": "^0.38.3",
     "graphql": "^16.10.0",
     "graphql-yoga": "^5.10.4",
-    "hono": "^4.6.14"
+    "hono": "^4.6.14",
+    "hono-rate-limiter": "^0.5.3",
+    "zod": "^4.4.3"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.12",

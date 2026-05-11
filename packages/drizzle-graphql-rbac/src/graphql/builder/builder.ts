@@ -69,7 +69,7 @@ import { introspectSchema } from "./relations.js";
 import { buildTableMeta } from "./builder-types.js";
 import { addRootFields } from "./builder-resolvers.js";
 import type { DomainContext } from "../domain/domain.js";
-import type { DrizzleLike, TableMeta } from "./types.js";
+import type { DrizzleLike, Guard, TableMeta } from "./types.js";
 import type { RbacContext } from "../rbac/rbac.js";
 
 export type { DrizzleLike } from "./types.js";
@@ -216,6 +216,18 @@ export function buildSchema(
 
   const relationBatchSize = options.relationBatchSize ?? 100;
   const maxListLimit = options.maxListLimit ?? 200;
+  const rbac = options.rbac;
+
+  // Per-referenced-table read guard used by relation traversal. Mirrors the
+  // guard built inside `addRootFields` for root resolvers so nested fields
+  // enforce the same record rules and read ACL on the referenced resource.
+  // `null` when rbac is disabled or the resource is on the bypass list.
+  const guardFor = (refMeta: TableMeta): Guard => {
+    if (!rbac) return null;
+    if (rbac.bypassResources?.has(refMeta.jsKey)) return null;
+    return async (gqlCtx, action) =>
+      (await rbac.enforce(gqlCtx, refMeta.jsKey, action, refMeta.columns)).where;
+  };
 
   // Pass 1: build object types (with relation field thunks) + input types.
   for (const [jsKey, table] of intro.tablesByKey) {
@@ -231,6 +243,7 @@ export function buildSchema(
       metas,
       db,
       domainCtxFor,
+      guardFor,
       hiddenOutput,
       hiddenInput,
       relationBatchSize,
@@ -242,7 +255,6 @@ export function buildSchema(
   // Pass 2: build root Query and Mutation.
   const queryFields: GraphQLFieldConfigMap<unknown, unknown> = {};
   const mutationFields: GraphQLFieldConfigMap<unknown, unknown> = {};
-  const rbac = options.rbac;
   for (const meta of metas.values()) {
     addRootFields(meta, queryFields, mutationFields, db, domainCtxFor(meta), rbac, maxListLimit);
   }

@@ -99,7 +99,12 @@ export async function register(name, email, password) {
 
 export async function logout() {
   try {
-    await fetch("/auth/logout", { method: "POST", credentials: "same-origin" });
+    const csrf = document.cookie.split("; ").find((c) => c.startsWith("csrf_token="))?.split("=")[1];
+    await fetch("/auth/logout", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: csrf ? { "X-CSRF-Token": csrf } : {},
+    });
   } catch {
     /* ignore — server-side cookie clear is best-effort */
   }

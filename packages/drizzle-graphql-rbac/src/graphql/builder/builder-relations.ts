@@ -25,7 +25,7 @@ import { applyListArgs, combineWhere } from "./filters.js";
 import type { ExtractedRelation } from "./relations.js";
 import type { DomainContext } from "../domain/domain.js";
 import { GraphQLJSON } from "./scalars.js";
-import type { DrizzleLike, TableMeta } from "./types.js";
+import type { DrizzleLike, Guard, TableMeta } from "./types.js";
 import {
   jsKeyOf,
   projectionForSelection,
@@ -71,6 +71,15 @@ export function buildRelationField(
   refCtx: DomainContext,
   relationBatchSize: number,
   maxListLimit: number,
+  /**
+   * Guard for the referenced table. Resolved once at build time so each
+   * traversal of this relation field AND-s the referenced table's read
+   * record-rule into the join `where` (and throws FORBIDDEN if the caller
+   * lacks a read ACL on the referenced resource). `null` when RBAC is
+   * disabled or the referenced resource is on the bypass list — in that
+   * case nested traversal behaves like a sudo read.
+   */
+  refGuard: Guard,
 ): GraphQLFieldConfig<any, any> {
 
   const isMany = rel.kind === "many";
@@ -109,9 +118,15 @@ export function buildRelationField(
         keys.push(v);
       }
 
-      const userWhere = isMany
+      // Enforce RBAC on the referenced table: throws FORBIDDEN if the caller
+      // has no read ACL, otherwise returns the row-level extra-where to AND
+      // into the join. Without this, nested relation traversal would bypass
+      // record rules that root resolvers do enforce.
+      const rbacWhere = refGuard ? await refGuard(context, "read") : undefined;
+      const argsWhere = isMany
         ? whereDomainToSql(args?.where, refMeta, refCtx, context)
         : undefined;
+      const userWhere = combineWhere(rbacWhere, argsWhere);
 
       // Batch when (a) we have a per-request cache, (b) the join is single-column,
       // and (c) we don't need per-parent limit/offset (those can't be expressed

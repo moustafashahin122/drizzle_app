@@ -46,7 +46,13 @@ import { buildRbacDb, type RbacDb } from "./graphql/rbac/rbacDb.js";
 import { buildAuthRoutes } from "./auth/routes.js";
 import { buildAdminRoutes } from "./admin/routes.js";
 import { sessionMiddleware, csrfProtection, type AuthEnv } from "./auth/middleware.js";
-import type { SudoDb, SessionSchema } from "./auth/session.js";
+import {
+  parseCookieValue,
+  CSRF_COOKIE_NAME,
+  CSRF_HEADER_NAME,
+  type SudoDb,
+  type SessionSchema,
+} from "./auth/session.js";
 import { logger } from "./logger.js";
 import type {
   User,
@@ -247,8 +253,20 @@ export function createApp(opts: CreateAppOptions): CreatedApp {
     graphqlEndpoint,
     // GraphiQL serves an interactive query console and depends on
     // introspection to power its autocomplete; keep them in lock-step so
-    // production never exposes either.
-    graphiql: graphqlAllowIntrospection,
+    // production never exposes either. Prefill the X-CSRF-Token header from
+    // the request's csrf_token cookie so introspection POSTs pass the
+    // double-submit check when the developer is already logged in.
+    graphiql: graphqlAllowIntrospection
+      ? (request: Request) => {
+          const csrf = parseCookieValue(
+            request.headers.get("cookie"),
+            CSRF_COOKIE_NAME,
+          );
+          return csrf
+            ? { defaultHeaders: JSON.stringify({ [CSRF_HEADER_NAME]: csrf }) }
+            : {};
+        }
+      : false,
     logging: loggingEnabled,
     plugins: [
       {

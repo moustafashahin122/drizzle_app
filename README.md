@@ -4,25 +4,54 @@ Single-process **Hono** server with a **GraphQL** endpoint generated from the Dr
 
 This repo does **not** use the `drizzle-graphql` npm package. The GraphQL schema generator is implemented in `src/graphql/` and mounted at `/graphql`.
 
-## Documentation
-
-- Run / migrations / tests: `docs/HOW_TO_RUN.md`
-- GraphQL generator deep dive: `docs/explanations/src-graphql.md`
-- Architecture overview: `docs/ARCHITECTURE.md`
-- Database schema + Drizzle workflows: `docs/DATABASE.md`
-- Auth, sessions, and RBAC: `docs/AUTH_AND_RBAC.md`
-- Seeds, scripts, and tests: `docs/SCRIPTS_AND_TESTS.md`
-
 ## Run
 
 ```bash
 cd drizzle_todo_app
 npm install
+npm run db:push      # one-time on fresh checkout: apply schema to todo.db
 npm run dev
 ```
 
 - App: `http://localhost:3000`
 - GraphiQL explorer: `http://localhost:3000/graphql`
+
+### Environment variables
+
+`npm run dev` and `npm start` load `.env` when present (`tsx --env-file-if-exists=.env`).
+
+| Variable                        | When            | Purpose                                                |
+| ------------------------------- | --------------- | ------------------------------------------------------ |
+| `PORT`                          | Optional        | HTTP port (default `3000`)                             |
+| `LOG_LEVEL`                     | Optional        | `trace`/`debug`/`info`/`warn`/`error`/`fatal`/`silent` |
+| `DEV_PASSWORD`                  | Dev only        | Password for auto-seeded demo users (default `demo123`)|
+| `ADMIN_EMAIL`, `ADMIN_PASSWORD` | Production only | Required at startup (see [User seeding](#user-seeding))|
+| `ADMIN_NAME`                    | Production only | Display name for the bootstrapped admin (default `Admin`) |
+
+## Auth, sessions, and RBAC
+
+REST `/auth/*` (`register`, `login`, `logout`, `me`) sets an HttpOnly `sid` session cookie; non-browser clients can use `Authorization: Bearer <token>` instead. The GraphQL endpoint runs the same session middleware, so any authenticated request — cookie or bearer — is identified before resolvers run.
+
+RBAC is fully **in-memory** and code-defined across three small files:
+
+- `src/roles.ts` — role catalog (`demo`, `manager`; framework auto-injects `admin`).
+- `src/accessRights.ts` — per-role CRUD grants per resource (JS table key).
+- `src/recordRules.ts` — per-role row-level filters in an Odoo-style domain DSL. The `demo` role's todos rules use `[["assigneeId", "=", "current_user.id"]]` so each demo user only sees their own rows.
+
+There is **no inheritance** — flatten shared grants. Multi-role users get the union of grants; per-role record rules OR together. Memberships live in process memory and reset on restart — the server re-binds them at startup from a hard-coded email map (`src/demoUsers.ts`).
+
+## User seeding
+
+The server seeds users automatically at startup (`src/scripts/bootstrapUsers.ts`):
+
+- **Dev** (`NODE_ENV !== "production"`): upserts three users with password `demo123` (override via `DEV_PASSWORD`):
+  - `demo_admin@example.com` — `admin` role (full bypass).
+  - `demo_manager@example.com` — `manager` role (full todo CRUD, still RBAC-checked).
+  - `demo_user@example.com` — `demo` role (record rule scopes todos to "assigned to me").
+
+  On the **first boot of an empty DB**, it also seeds a `Demo project` and seven demo todos distributed across the three users (plus one unassigned). Seeding is one-shot: any pre-existing row in `todos` skips it, so developer edits aren't clobbered on restart. Delete `todo.db` and re-run `npm run db:push` to reset.
+
+- **Production** (`NODE_ENV === "production"`): upserts a single admin row from `ADMIN_EMAIL` / `ADMIN_PASSWORD` (optional `ADMIN_NAME`) and **throws** if either is missing. No demo users or demo data.
 
 ## Logging
 
@@ -49,10 +78,9 @@ Components emitted by this app:
 
 | Component        | When                                                              |
 |------------------|-------------------------------------------------------------------|
-| `app.server`     | Startup and in-memory role seeding.                               |
-| `app.db`         | Drizzle SQL queries (bridged into pino at `debug`).               |
-| `app.seed.admin` | `npm run seed:admin` output.                                      |
-| `app.seed.demo`  | `npx tsx src/scripts/seed-demo.ts` output.                        |
+| `app.server`           | Startup and in-memory role seeding.                         |
+| `app.db`               | Drizzle SQL queries (bridged into pino at `debug`).         |
+| `app.bootstrap`        | User + demo-data seed at startup (`src/scripts/bootstrapUsers.ts`). |
 
 Framework components: `framework.app`, `framework.app.http` (see `packages/drizzle-graphql-rbac/README.md`).
 
@@ -107,7 +135,7 @@ npm run db:studio
 
 Opens Drizzle Studio in the browser for browsing/editing rows.
 
-> Note: the app can create its tables without a prior migrate step; see `src/db.ts` and `docs/DATABASE.md` for details.
+> The schema is in `src/schema.ts` (re-exporting the framework's `users` / `sessions` from `drizzle-graphql-rbac/tables`) and is consumed by `drizzle-kit` via `drizzle.config.ts`. There is no raw-SQL bootstrap script — `db:push` is the canonical first step.
 
 ## Endpoints
 
@@ -226,7 +254,8 @@ query Paged {
 ```
 
 Filter (only incomplete) — `where` accepts an Odoo polish-prefix domain (a
-JSON array). See `src/graphql/domain/README.md` for the full syntax.
+JSON array). See [Filter operators](#filter-operators-cheat-sheet) for the
+full syntax.
 
 ```graphql
 query Pending($w: JSON) {
@@ -418,7 +447,15 @@ Dotted field paths traverse single-column relations:
 `assigneeId IN (SELECT id FROM assignees WHERE email ILIKE …)`.
 
 The string `"current_user.id"` is substituted from the request context at
-evaluation time. Full reference: `src/graphql/domain/README.md`.
+evaluation time. Full reference: `packages/drizzle-graphql-rbac/README.md`.
 
-The SQLite database file `todo.db` is created automatically on first run.
-# drizzle_app
+The SQLite database file `todo.db` is created on first run of `npm run db:push`.
+
+## Tests
+
+```bash
+npm test            # app tests + framework workspace tests
+npm run test:app    # app-level tests only (src/*.test.ts)
+```
+
+Tests use Node's built-in test runner under `tsx` and run against isolated in-memory SQLite databases.

@@ -7,16 +7,17 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - `npm run dev` — start Hono server with tsx watch on `http://localhost:3000` (GraphiQL at `/graphql`).
 - `npm start` — run server once without watch.
 - `npm test` — runs the package's test suite (`drizzle-graphql-rbac` workspace) under Node's built-in test runner via `tsx`.
-- `npm run db:push` — apply the Drizzle schema in `src/db.ts` to `todo.db`. This is the bootstrap step on a fresh checkout. `src/db.ts` imports the framework tables from `drizzle-graphql-rbac/tables` (the schema-only subpath) so `drizzle-kit`'s CJS loader doesn't pull in the app runtime.
+- `npm run db:push` — apply the Drizzle schema in `src/schema.ts` to `todo.db`. This is the bootstrap step on a fresh checkout. `src/schema.ts` imports the framework tables from `drizzle-graphql-rbac/tables` (the schema-only subpath) so `drizzle-kit`'s CJS loader doesn't pull in the app runtime. The file-backed Drizzle handle lives in `src/sudoDb.ts`.
 - `npm run db:generate` / `npm run db:migrate` — generate and apply SQL migrations for production-style flows.
 - `npm run db:studio` — Drizzle Studio for browsing `todo.db`.
-- `npm run seed:admin` — upsert the bootstrap admin user. Role assignment happens at server start (RBAC is in-memory).
+- `npm run seed:demo` — runs `src/scripts/seedDemo.ts`, which upserts the three demo users (`demo_admin@example.com` admin, `demo_manager@example.com` manager, `demo_user@example.com` demo) with password `demo123` (override via `DEV_PASSWORD`) and, if `todos` is empty, seeds a demo project + todos. Safe to re-run; todo seeding is one-shot.
+- Server startup runs `src/scripts/bootstrapUsers.ts`, which is now prod-only: in `NODE_ENV === "production"` it requires `ADMIN_EMAIL` / `ADMIN_PASSWORD` and upserts that single admin row. In dev it is a no-op — use `npm run seed:demo` to populate demo data.
 
 ## Architecture
 
 This is a single-process Hono app that serves a static frontend (`public/`) and a GraphQL endpoint at `POST /graphql`.
 
-### Drizzle schema (`src/db.ts`)
+### Drizzle schema (`src/schema.ts`)
 
 Re-exports the framework-owned tables (`users`, `sessions`) from `drizzle-graphql-rbac/tables` and defines the app-owned `todos` table. The `todos.assignee_id` column has a `.references(() => users.id)` FK — this single-column FK is what the GraphQL layer auto-promotes into a relation field (forward `assigneeId` and inverse `todos`). The DB schema is managed entirely through `drizzle-kit` against these declarations; there is no raw-SQL bootstrap script.
 

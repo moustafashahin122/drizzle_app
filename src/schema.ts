@@ -17,12 +17,20 @@ import { users } from "drizzle-graphql-rbac/tables";
 export { users, sessions, frameworkTables } from "drizzle-graphql-rbac/tables";
 export type { User, NewUser, Session } from "drizzle-graphql-rbac/tables";
 
+export const projects = sqliteTable("projects", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  name: text("name").notNull(),
+});
+export type Project = typeof projects.$inferSelect;
+export type NewProject = typeof projects.$inferInsert;
+
 export const todos = sqliteTable("todos", {
   id: integer("id").primaryKey({ autoIncrement: true }),
   title: text("title").notNull(),
   completed: integer("completed", { mode: "boolean" }).notNull().default(false),
   createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
   assigneeId: integer("assignee_id").references(() => users.id),
+  projectId: integer("project_id").references(() => projects.id),
 });
 export type Todo = typeof todos.$inferSelect;
 export type NewTodo = typeof todos.$inferInsert;

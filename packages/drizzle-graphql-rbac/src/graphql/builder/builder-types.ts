@@ -25,7 +25,7 @@ import { buildRelationField } from "./builder-relations.js";
 import { introspectSchema } from "./relations.js";
 import { columnToBaseType, wrapNonNull } from "./types.js";
 import { isNotNull } from "./drizzle-internals.js";
-import type { DrizzleLike, TableMeta } from "./types.js";
+import type { DrizzleLike, Guard, TableMeta } from "./types.js";
 import type { DomainContext } from "../domain/domain.js";
 
 /**
@@ -47,6 +47,7 @@ function buildObjectFields(
   metas: Map<string, TableMeta>,
   db: DrizzleLike,
   domainCtxFor: (m: TableMeta) => DomainContext,
+  guardFor: (m: TableMeta) => Guard,
   hiddenOutput: Set<string>,
   relationBatchSize: number,
   maxListLimit: number,
@@ -68,7 +69,7 @@ function buildObjectFields(
     // Relation field replaces a same-named scalar column on the output type.
     // The scalar FK column remains usable in `set` / Insert / Update inputs
     // (and inside a domain leaf) because they iterate the unchanged column map.
-    fields[rel.fieldName] = buildRelationField(rel, meta, refMeta, db, domainCtxFor(refMeta), relationBatchSize, maxListLimit);
+    fields[rel.fieldName] = buildRelationField(rel, meta, refMeta, db, domainCtxFor(refMeta), relationBatchSize, maxListLimit, guardFor(refMeta));
   }
   return fields;
 }
@@ -87,6 +88,7 @@ export function buildTableMeta(
   metas: Map<string, TableMeta>,
   db: DrizzleLike,
   domainCtxFor: (m: TableMeta) => DomainContext,
+  guardFor: (m: TableMeta) => Guard,
   hiddenOutput: Set<string>,
   hiddenInput: Set<string>,
   relationBatchSize: number,
@@ -98,7 +100,7 @@ export function buildTableMeta(
 
   const objectType = new GraphQLObjectType({
     name: typeName,
-    fields: () => buildObjectFields(meta, intro, metas, db, domainCtxFor, hiddenOutput, relationBatchSize, maxListLimit),
+    fields: () => buildObjectFields(meta, intro, metas, db, domainCtxFor, guardFor, hiddenOutput, relationBatchSize, maxListLimit),
   });
   const insertInput = buildInsertInput(typeName, columns, hiddenInput);
   const updateInput = buildUpdateInput(typeName, columns, hiddenInput);
