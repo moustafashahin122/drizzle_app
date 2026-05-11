@@ -2,10 +2,10 @@ import { describe, it, before, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import Database from "better-sqlite3";
 import { drizzle } from "drizzle-orm/better-sqlite3";
-import { sqliteTable, integer, text, uniqueIndex } from "drizzle-orm/sqlite-core";
+import { sqliteTable, integer, text } from "drizzle-orm/sqlite-core";
 import { eq } from "drizzle-orm";
 
-import { buildRbac } from "./rbac.js";
+import { buildRbac, type BuiltRbac } from "./rbac.js";
 import { buildRbacDb } from "./rbacDb.js";
 import {
   defineRoles,
@@ -22,50 +22,8 @@ const todos = sqliteTable("todos", {
   title: text("title").notNull(),
   ownerId: integer("owner_id").references(() => users.id),
 });
-const roles = sqliteTable("roles", {
-  id: integer("id").primaryKey({ autoIncrement: true }),
-  xid: text("xid").notNull().unique(),
-  key: text("key").notNull().unique(),
-  isAdmin: integer("is_admin", { mode: "boolean" }).notNull().default(false),
-});
-const accessRights = sqliteTable(
-  "access_rights",
-  {
-    id: integer("id").primaryKey({ autoIncrement: true }),
-    xid: text("xid").notNull().unique(),
-    roleId: integer("role_id").notNull().references(() => roles.id),
-    resource: text("resource").notNull(),
-    canCreate: integer("can_create", { mode: "boolean" }).notNull().default(false),
-    canRead: integer("can_read", { mode: "boolean" }).notNull().default(false),
-    canUpdate: integer("can_update", { mode: "boolean" }).notNull().default(false),
-    canDelete: integer("can_delete", { mode: "boolean" }).notNull().default(false),
-  },
-  (t) => ({ uniqRoleResource: uniqueIndex("ar_role_resource_uniq").on(t.roleId, t.resource) }),
-);
-const recordRules = sqliteTable(
-  "record_rules",
-  {
-    id: integer("id").primaryKey({ autoIncrement: true }),
-    xid: text("xid").notNull().unique(),
-    roleId: integer("role_id").notNull().references(() => roles.id),
-    resource: text("resource").notNull(),
-    action: text("action").notNull(),
-    domain: text("domain").notNull(),
-  },
-  (t) => ({ uniqRoleResAct: uniqueIndex("rr_role_res_act_uniq").on(t.roleId, t.resource, t.action) }),
-);
-const userRoles = sqliteTable(
-  "user_roles",
-  {
-    id: integer("id").primaryKey({ autoIncrement: true }),
-    userId: integer("user_id").notNull().references(() => users.id),
-    roleId: integer("role_id").notNull().references(() => roles.id),
-  },
-  (t) => ({ uniqUserRole: uniqueIndex("ur_user_role_uniq").on(t.userId, t.roleId) }),
-);
 
-const allTables = { users, todos, roles, accessRights, recordRules, userRoles };
-const rbacSchema = { roles, accessRights, recordRules, userRoles };
+const allTables = { users, todos };
 
 function createTablesSql(): string {
   return `
@@ -75,63 +33,26 @@ function createTablesSql(): string {
       title TEXT NOT NULL,
       owner_id INTEGER REFERENCES users(id)
     );
-    CREATE TABLE roles (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      xid TEXT NOT NULL UNIQUE,
-      key TEXT NOT NULL UNIQUE,
-      is_admin INTEGER NOT NULL DEFAULT 0
-    );
-    CREATE TABLE access_rights (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      xid TEXT NOT NULL UNIQUE,
-      role_id INTEGER NOT NULL REFERENCES roles(id),
-      resource TEXT NOT NULL,
-      can_create INTEGER NOT NULL DEFAULT 0,
-      can_read INTEGER NOT NULL DEFAULT 0,
-      can_update INTEGER NOT NULL DEFAULT 0,
-      can_delete INTEGER NOT NULL DEFAULT 0
-    );
-    CREATE UNIQUE INDEX ar_role_resource_uniq ON access_rights(role_id, resource);
-    CREATE TABLE record_rules (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      xid TEXT NOT NULL UNIQUE,
-      role_id INTEGER NOT NULL REFERENCES roles(id),
-      resource TEXT NOT NULL,
-      action TEXT NOT NULL,
-      domain TEXT NOT NULL
-    );
-    CREATE UNIQUE INDEX rr_role_res_act_uniq ON record_rules(role_id, resource, action);
-    CREATE TABLE user_roles (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      user_id INTEGER NOT NULL REFERENCES users(id),
-      role_id INTEGER NOT NULL REFERENCES roles(id)
-    );
-    CREATE UNIQUE INDEX ur_user_role_uniq ON user_roles(user_id, role_id);
   `;
 }
 
 const own = [["ownerId", "=", "current_user.id"]];
 const rbacConfig = {
   roles: defineRoles({
-    reader: { xid: "t.role.reader" },
-    admin: { xid: "t.role.admin", isAdmin: true },
+    reader: {},
+    admin: { isAdmin: true },
   }),
   accessRights: defineAccessRights({
     reader: {
-      todos: {
-        xid: "t.ar.reader.todos",
-        read: true,
-        update: true,
-        delete: true,
-      },
+      todos: { read: true, update: true, delete: true },
     },
   }),
   recordRules: defineRecordRules({
     reader: {
       todos: {
-        read:   { xid: "t.rr.reader.todos.read",   domain: own },
-        update: { xid: "t.rr.reader.todos.update", domain: own },
-        delete: { xid: "t.rr.reader.todos.delete", domain: own },
+        read:   { domain: own },
+        update: { domain: own },
+        delete: { domain: own },
       },
     },
   }),
@@ -140,29 +61,24 @@ const rbacConfig = {
 let db: ReturnType<typeof drizzle>;
 let sqlite: Database.Database;
 let rdbFor: ReturnType<typeof buildRbacDb>;
-let rbacRef: ReturnType<typeof buildRbac>;
-let roleIdByKey: Map<string, number>;
+let rbac: BuiltRbac;
 
-before(async () => {
+before(() => {
   sqlite = new Database(":memory:");
   sqlite.exec(createTablesSql());
   db = drizzle(sqlite);
-  rbacRef = buildRbac(db, rbacSchema, rbacConfig);
-  rdbFor = buildRbacDb({ db, schema: allTables, enforce: rbacRef.enforce });
-  await rbacRef.sync();
-  const rows: { key: string; id: number }[] = await db
-    .select({ id: roles.id, key: roles.key })
-    .from(roles);
-  roleIdByKey = new Map(rows.map((r) => [r.key, r.id]));
+  rbac = buildRbac(rbacConfig);
+  rdbFor = buildRbacDb({ db, schema: allTables, enforce: rbac.enforce });
 });
 
 beforeEach(() => {
   sqlite.exec(`
-    DELETE FROM user_roles;
     DELETE FROM todos;
     DELETE FROM users;
   `);
-  rbacRef.clearCache();
+  for (let id = 1; id < 1000; id++) {
+    for (const key of rbac.listUserRoles(id)) rbac.revokeRole(id, key);
+  }
 });
 
 const ctxFor = (id: number, name = "u") => ({
@@ -175,10 +91,8 @@ async function seed() {
   const [u1] = await db.insert(users).values({ name: "Alice" }).returning();
   const [u2] = await db.insert(users).values({ name: "Bob" }).returning();
   const [u3] = await db.insert(users).values({ name: "Carol" }).returning();
-  await db.insert(userRoles).values([
-    { userId: u1.id, roleId: roleIdByKey.get("reader")! },
-    { userId: u2.id, roleId: roleIdByKey.get("admin")! },
-  ]);
+  rbac.assignRole(u1.id, "reader");
+  rbac.assignRole(u2.id, "admin");
   await db.insert(todos).values([
     { title: "alice-1", ownerId: u1.id },
     { title: "alice-2", ownerId: u1.id },
@@ -294,21 +208,19 @@ describe("rbacDb — insert", () => {
     sqlite2.exec(createTablesSql());
     const db2 = drizzle(sqlite2);
     const cfg = {
-      roles: defineRoles({ reader: { xid: "t2.role.reader" } }),
+      roles: defineRoles({ reader: {} }),
       accessRights: defineAccessRights({
         reader: {
-          todos: { xid: "t2.ar.reader.todos", create: true, read: true },
+          todos: { create: true, read: true },
         },
       }),
       recordRules: defineRecordRules({}),
     };
-    const rbac2 = buildRbac(db2, rbacSchema, cfg);
+    const rbac2 = buildRbac(cfg);
     const rdb2For = buildRbacDb({ db: db2, schema: allTables, enforce: rbac2.enforce });
-    await rbac2.sync();
 
-    const [readerRole] = await db2.select({ id: roles.id }).from(roles).where(eq(roles.key, "reader"));
     const [u] = await db2.insert(users).values({ name: "Alice" }).returning();
-    await db2.insert(userRoles).values({ userId: u.id, roleId: readerRole.id });
+    rbac2.assignRole(u.id, "reader");
     const rdb = rdb2For(ctxFor(u.id));
     const out = await rdb
       .insert(todos)
@@ -325,7 +237,7 @@ describe("rbacDb — bypass and escape hatch", () => {
     const bypassRdbFor = buildRbacDb({
       db,
       schema: allTables,
-      enforce: rbacRef.enforce,
+      enforce: rbac.enforce,
       bypassResources: new Set(["todos"]),
     });
     const rdb = bypassRdbFor(ctxFor(u3.id)); // u3 has no roles

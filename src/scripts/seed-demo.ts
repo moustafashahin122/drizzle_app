@@ -1,46 +1,18 @@
 /**
- * Idempotent demo seed.
+ * Idempotent demo user seed.
  *
- * Creates two demo users (`demo1`, `demo2`) and assigns `demo1` to the
- * `demo` role. Runs `syncRbacFromCode` first so the `roles` table is
- * populated and the user_roles FK can resolve.
- *
- *   - Access rights for `demo`: create/read/update/delete on `todos`.
- *   - Record rule for `demo`: read/update/delete `todos` are filtered by
- *                              `[["assigneeId", "=", "current_user.id"]]`.
- *
- * `demo2` is intentionally unassigned, so it has no `todos` access at all
- * — useful to contrast against `demo1`.
+ * Creates two demo users (`demo1`, `demo2`). Role assignment is in-memory in
+ * this build — `server.ts` assigns the `demo` role to `demo1@example.com`
+ * on startup. `demo2` stays unassigned so the contrast (no role → no todos
+ * access) is observable.
  *
  * Usage: `npx tsx src/scripts/seed-demo.ts`
  */
 import bcrypt from "bcryptjs";
-import { and, eq } from "drizzle-orm";
-import {
-  buildRbacConfig,
-  mergeFrameworkRbac,
-  syncRbacFromCode,
-} from "drizzle-graphql-rbac";
-import { db, users, userRoles, roles, accessRights, recordRules } from "../db.js";
-import { roles as rolesCfg } from "../roles.js";
-import { accessRights as arCfg } from "../accessRights.js";
-import { recordRules as rrCfg } from "../recordRules.js";
+import { eq } from "drizzle-orm";
+import { db, users } from "../db.js";
 
-const DEMO_ROLE_KEY = "demo";
 const DEMO_PASSWORD = process.env.DEMO_PASSWORD ?? "demo123";
-
-const resolved = buildRbacConfig(
-  mergeFrameworkRbac({
-    roles: rolesCfg,
-    accessRights: arCfg,
-    recordRules: rrCfg,
-  }),
-);
-await syncRbacFromCode(
-  db,
-  { roles, accessRights, recordRules, userRoles },
-  resolved,
-);
 
 async function ensureUser(name: string, email: string, password: string): Promise<number> {
   const passwordHash = await bcrypt.hash(password, 10);
@@ -58,25 +30,9 @@ async function ensureUser(name: string, email: string, password: string): Promis
   return created.id;
 }
 
-async function ensureRoleAssignment(userId: number, roleKey: string): Promise<void> {
-  const [role] = await db.select({ id: roles.id }).from(roles).where(eq(roles.key, roleKey)).limit(1);
-  if (!role) throw new Error(`Role '${roleKey}' not found after sync.`);
-  const [existing] = await db
-    .select()
-    .from(userRoles)
-    .where(and(eq(userRoles.userId, userId), eq(userRoles.roleId, role.id)))
-    .limit(1);
-  if (existing) return;
-  await db.insert(userRoles).values({ userId, roleId: role.id });
-  console.log(`Assigned user ${userId} to role '${roleKey}'.`);
-}
-
-const demo1Id = await ensureUser("Demo One", "demo1@example.com", DEMO_PASSWORD);
-const demo2Id = await ensureUser("Demo Two", "demo2@example.com", DEMO_PASSWORD);
-
-await ensureRoleAssignment(demo1Id, DEMO_ROLE_KEY);
+await ensureUser("Demo One", "demo1@example.com", DEMO_PASSWORD);
+await ensureUser("Demo Two", "demo2@example.com", DEMO_PASSWORD);
 
 console.log("");
-console.log(`demo1 credentials: demo1@example.com / ${DEMO_PASSWORD}  (in '${DEMO_ROLE_KEY}' role — sees only todos assigned to them)`);
+console.log(`demo1 credentials: demo1@example.com / ${DEMO_PASSWORD}  (server.ts assigns the 'demo' role in memory)`);
 console.log(`demo2 credentials: demo2@example.com / ${DEMO_PASSWORD}  (no role — no todos access)`);
-void demo2Id;

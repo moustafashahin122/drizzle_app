@@ -4,18 +4,15 @@
  * `createApp` is the all-in-one composition root. It wires:
  *
  * 1. {@link buildSchema} — auto-generated GraphQL CRUD over the user's Drizzle
- *    schema (todos, plus the framework tables).
- * 2. {@link buildRbac} — RBAC engine driven by the in-code role / access /
- *    record-rule configs and the persisted `userRoles` membership table.
+ *    schema (your tables plus the framework's `users` / `sessions`).
+ * 2. {@link buildRbac} — in-memory RBAC engine built synchronously from the
+ *    code config. User→role membership lives in the engine and is mutated by
+ *    the admin sub-app.
  * 3. {@link buildAuthRoutes} — REST `/auth/{register,login,logout,me}`.
  * 4. {@link buildAdminRoutes} — REST `/admin/users` (RBAC-enforced) plus
  *    `/admin/users/:id/roles` for managing role membership.
  * 5. A Yoga GraphQL handler at `POST /graphql` that consumes the same
  *    session middleware so resolvers see the authenticated user.
- *
- * The caller supplies the Drizzle `db`, a schema namespace whose properties
- * include — at minimum — the framework tables, and the RBAC config (three
- * tiny TypeScript files: roles, access rights, record rules).
  *
  * @example
  * import { createApp } from "drizzle-graphql-rbac";
@@ -25,18 +22,20 @@
  * import { accessRights } from "./accessRights.js";
  * import { recordRules } from "./recordRules.js";
  *
- * const { app } = createApp({
+ * const { app, rbac } = createApp({
  *   db: schema.db,
  *   schema,
  *   rbac: { roles, accessRights, recordRules },
  * });
+ * // Optionally seed memberships before serving traffic:
+ * // rbac.assignRole(adminUserId, "admin");
  * serve({ fetch: app.fetch, port: 3000 });
  */
 import { Hono } from "hono";
 import { logger as honoLogger } from "hono/logger";
 import { createYoga } from "graphql-yoga";
 import { buildSchema, type BuildSchemaOptions } from "./graphql/builder/builder.js";
-import { buildRbac, type BuildRbacOptions } from "./graphql/rbac/rbac.js";
+import { buildRbac, type BuiltRbac } from "./graphql/rbac/rbac.js";
 import type { RbacConfig } from "./graphql/rbac/config.js";
 import { mergeFrameworkRbac } from "./frameworkRbac.js";
 import { buildRbacDb, type RbacDb } from "./graphql/rbac/rbacDb.js";
@@ -48,32 +47,22 @@ import type {
   User,
   Session,
   users as usersTableType,
-  userRoles as userRolesTableType,
-  roles as rolesTableType,
-  accessRights as accessRightsTableType,
-  recordRules as recordRulesTableType,
 } from "./tables.js";
 
 export interface CreateAppOptions {
   /** A Drizzle DB instance (any dialect). */
   db: SessionDb;
   /**
-   * The full schema namespace: framework tables (users, sessions, userRoles)
-   * plus any app-specific tables. Pass via `import * as schema from "./db.js"`.
+   * The full schema namespace: framework tables (users, sessions) plus any
+   * app-specific tables. Pass via `import * as schema from "./db.js"`.
    */
   schema: Record<string, unknown> & SessionSchema & {
     users: typeof usersTableType;
-    userRoles: typeof userRolesTableType;
-    roles: typeof rolesTableType;
-    accessRights: typeof accessRightsTableType;
-    recordRules: typeof recordRulesTableType;
   };
   /**
    * The code-defined RBAC config — roles, access rights, and record rules.
    * Conventionally three small files in the host app: `src/roles.ts`,
-   * `src/accessRights.ts`, `src/recordRules.ts`. The framework re-exports
-   * `defineRoles` / `defineAccessRights` / `defineRecordRules` helpers for
-   * IDE autocomplete; they are identity functions at runtime.
+   * `src/accessRights.ts`, `src/recordRules.ts`.
    */
   rbac: RbacConfig;
   /**
@@ -83,10 +72,7 @@ export interface CreateAppOptions {
   hiddenOutputColumns?: BuildSchemaOptions["hiddenOutputColumns"];
   /** Forwarded to {@link buildSchema} — name overrides for generated types. */
   typeNames?: BuildSchemaOptions["typeNames"];
-  /**
-   * Forwarded to {@link buildSchema} — bespoke Query fields the app wants on
-   * top of the auto-generated CRUD.
-   */
+  /** Forwarded to {@link buildSchema} — bespoke Query fields. */
   extraQueryFields?: BuildSchemaOptions["extraQueryFields"];
   /** Forwarded to {@link buildSchema} — bespoke Mutation fields. */
   extraMutationFields?: BuildSchemaOptions["extraMutationFields"];
@@ -101,47 +87,28 @@ export interface CreateAppOptions {
   graphqlEndpoint?: string;
   /**
    * Enable request + GraphQL operation logging.
-   *  - `true` (default): mounts Hono's `logger()` middleware (per-request
-   *    method/path/status/duration to stdout) and turns on Yoga's built-in
-   *    operation logging.
+   *  - `true` (default): mounts Hono's `logger()` middleware and turns on
+   *    Yoga's built-in operation logging.
    *  - `false`: no logging.
-   *  - A function: passed to Hono's `logger(fn)` so callers can route lines
-   *    to their own sink (pino, winston, structured JSON, etc.). Yoga's
-   *    logging is enabled when a function is supplied.
+   *  - A function: passed to Hono's `logger(fn)`.
    */
   logger?: boolean | ((message: string, ...rest: string[]) => void);
-  /**
-   * Tunables for the cross-request RBAC cache (effective roles + per-user
-   * enforce results). Defaults to a 30-minute TTL with bounded size; pass
-   * `{ cacheTtlMs: 0 }` to disable. Call the returned `invalidateUser`
-   * after admin mutations that change a user's role assignments.
-   */
-  rbacCache?: BuildRbacOptions;
 }
 
 export interface CreatedApp {
   /** The Hono app — call `.fetch` from `@hono/node-server` or any Web Fetch host. */
   app: Hono<AuthEnv>;
+  /** The RBAC engine — call `assignRole` / `revokeRole` to seed memberships at startup. */
+  rbac: BuiltRbac;
   /** Per-request RBAC-bound DB factory; re-exported so callers can write custom routes. */
   rdbFor: (ctx: { user: User | null; batch?: Map<string, unknown> }) => RbacDb;
-  /** Drop the RBAC cache for one user (call after admin mutations to their role assignments). */
-  invalidateRbacUser: (userId: number) => void;
-  /** Drop the entire RBAC cache. */
-  clearRbacCache: () => void;
-  /**
-   * Resolves once the RBAC config has been synced from code to DB and the
-   * engine snapshot has loaded. Awaits in tests; in production the server
-   * starts listening immediately and the sync runs in the background, so
-   * the very first requests may be denied (deny-all default) until the
-   * sync completes — usually a few milliseconds against SQLite. Awaiting
-   * this is optional.
-   */
-  rbacReady: Promise<void>;
 }
 
 /**
  * Build the full Hono app with REST auth, REST admin, GraphQL CRUD, and
- * RBAC enforcement wired together.
+ * RBAC enforcement wired together. The RBAC engine is built synchronously
+ * from the code config; memberships start empty and are added via the
+ * returned `rbac` handle or the admin REST endpoints.
  */
 export function createApp(opts: CreateAppOptions): CreatedApp {
   const {
@@ -155,7 +122,6 @@ export function createApp(opts: CreateAppOptions): CreatedApp {
     publicDir = "./public",
     graphqlEndpoint = "/graphql",
     logger: loggerOpt = true,
-    rbacCache,
   } = opts;
   const loggingEnabled = loggerOpt !== false;
 
@@ -164,25 +130,10 @@ export function createApp(opts: CreateAppOptions): CreatedApp {
     sessions: schema.sessions,
   };
 
-  // Merge framework-owned roles (currently just `admin`) into the
-  // user-supplied config. Apps should not redefine `admin`; if they do,
-  // mergeFrameworkRbac throws.
+  // Merge framework-owned roles (currently just `admin`) into the user-supplied
+  // config. Apps should not redefine `admin`; if they do, mergeFrameworkRbac throws.
   const mergedRbac = mergeFrameworkRbac(rbacConfig);
-
-  const rbac = buildRbac(
-    db,
-    {
-      roles: schema.roles,
-      accessRights: schema.accessRights,
-      recordRules: schema.recordRules,
-      userRoles: schema.userRoles,
-    },
-    mergedRbac,
-    // Default to 30-minute cross-request RBAC cache with bounded size; the
-    // engine itself defaults to off, so apps that want freshness on every
-    // mutation (or run the engine directly in tests) opt out cleanly.
-    { cacheTtlMs: 30 * 60 * 1000, ...(rbacCache ?? {}) },
-  );
+  const rbac = buildRbac(mergedRbac);
 
   const { schema: gqlSchema } = buildSchema(db, schema, {
     hiddenOutputColumns,
@@ -228,9 +179,6 @@ export function createApp(opts: CreateAppOptions): CreatedApp {
     buildAuthRoutes({
       db,
       schema: sessionSchema,
-      // Drop the user's cached RBAC entries on sign-out so a re-login (or
-      // another user reusing this id later) sees a clean slate.
-      onSignout: rbac.invalidateUser,
     }),
   );
   app.route(
@@ -239,11 +187,8 @@ export function createApp(opts: CreateAppOptions): CreatedApp {
       db,
       schema: sessionSchema,
       usersTable: schema.users,
-      userRolesTable: schema.userRoles,
-      rolesTable: schema.roles,
       rdbFor,
-      enforce: rbac.enforce,
-      onRolesChanged: rbac.invalidateUser,
+      rbac,
     }),
   );
 
@@ -257,38 +202,10 @@ export function createApp(opts: CreateAppOptions): CreatedApp {
   });
 
   if (publicDir) {
-    // Lazy-load the static helper so non-Node hosts (e.g. workerd, Bun) can
-    // still import this module without pulling in @hono/node-server.
     void import("@hono/node-server/serve-static").then(({ serveStatic }) => {
       app.use("/*", serveStatic({ root: publicDir }));
     });
   }
 
-  // Kick off the RBAC sync in the background. The server's `app.fetch` is
-  // returned immediately; sync runs via `queueMicrotask` so the host's
-  // `serve(...)` call can begin listening right away. Tests can await
-  // `rbacReady` to make sure the snapshot is loaded before issuing requests.
-  const rbacReady = new Promise<void>((resolve, reject) => {
-    queueMicrotask(() => {
-      rbac
-        .sync()
-        .then(() => resolve())
-        .catch((err) => {
-          // eslint-disable-next-line no-console
-          console.error("[rbac] background sync failed:", err);
-          reject(err);
-        });
-    });
-  });
-  // Don't crash the process if nothing awaits the promise; the error has
-  // already been logged above.
-  rbacReady.catch(() => {});
-
-  return {
-    app,
-    rdbFor,
-    invalidateRbacUser: rbac.invalidateUser,
-    clearRbacCache: rbac.clearCache,
-    rbacReady,
-  };
+  return { app, rbac, rdbFor };
 }

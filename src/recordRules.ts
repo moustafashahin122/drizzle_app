@@ -1,5 +1,5 @@
 /**
- * Per-role row-level filters. Each entry carries an `xid` and a `domain`.
+ * Per-role row-level filters.
  *
  * A "domain" is an Odoo-style polish-prefix array. Each leaf is a triple
  * `[field, operator, value]`; values may use placeholders such as
@@ -18,9 +18,9 @@ const ownTodos = [["assigneeId", "=", "current_user.id"]];
 export const recordRules = defineRecordRules({
   demo: {
     todos: {
-      read:   { xid: "todo.rr.demo.todos.read",   domain: ownTodos },
-      update: { xid: "todo.rr.demo.todos.update", domain: ownTodos },
-      delete: { xid: "todo.rr.demo.todos.delete", domain: ownTodos },
+      read:   { domain: ownTodos },
+      update: { domain: ownTodos },
+      delete: { domain: ownTodos },
     },
   },
 });

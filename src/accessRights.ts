@@ -1,5 +1,5 @@
 /**
- * Per-role CRUD grants. Each entry carries an `xid` for stable DB identity.
+ * Per-role CRUD grants.
  *
  * Resources are the JS keys of Drizzle tables (e.g. `todos`, `users`); a
  * role with `read: true` on a resource may run any GraphQL `<resource>` /
@@ -14,7 +14,6 @@ import { defineAccessRights } from "drizzle-graphql-rbac";
 export const accessRights = defineAccessRights({
   demo: {
     todos: {
-      xid: "todo.ar.demo.todos",
       create: true,
       read: true,
       update: true,

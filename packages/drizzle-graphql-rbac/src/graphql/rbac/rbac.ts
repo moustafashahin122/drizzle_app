@@ -1,14 +1,14 @@
 /**
  * @module graphql/rbac
  *
- * RBAC engine. Reads from a code-defined config that has been *synced* to
- * matching DB tables (`roles`, `access_rights`, `record_rules`); the engine
- * itself consults an in-memory snapshot of those tables, refreshed when
- * the sync routine completes.
+ * In-memory RBAC engine. Roles, access rights, record rules, **and**
+ * user→role assignments all live in process memory — built synchronously
+ * from the code config on startup, mutated at runtime via the engine's
+ * membership API.
  *
- * - **Roles** declared via {@link defineRoles}. Each role carries an `xid`
- *   and an optional `isAdmin` flag. There is no inheritance: each role's
- *   grants stand alone.
+ * - **Roles** declared via {@link defineRoles}. Each role may carry an
+ *   optional `isAdmin` flag. There is no inheritance: each role's grants
+ *   stand alone.
  * - **Access rights** declared via {@link defineAccessRights}: per-role CRUD
  *   booleans on a resource (the table's JS schema key, e.g. `"todos"`).
  *   The user's effective grant set is the union across every role they hold.
@@ -18,59 +18,19 @@
  *   Odoo-style polish-prefix domains. Domains from roles granting the
  *   action are OR-combined and AND-ed into the resolver's `where`.
  *
- * Only the user → role mapping (`userRoles` table) is written at runtime.
- * The admin dashboard manages assignments; everything else is a code change
- * + restart (the sync routine reconciles the DB to the code on next start).
- *
  * Placeholders: the engine injects `{ "current_user.id": ctx.user?.id ?? null }`
  * when evaluating each rule. Unauthenticated callers get `null`, which makes
  * `=`/`!=` against the placeholder produce no row matches — the safe default.
  */
-import { eq, or, type SQL } from "drizzle-orm";
+import { or, type SQL } from "drizzle-orm";
 import { GraphQLError } from "graphql";
-import type {
-  roles as rolesTable,
-  accessRights as accessRightsTable,
-  recordRules as recordRulesTable,
-  userRoles as userRolesTable,
-  User,
-} from "../../tables.js";
+import type { User } from "../../tables.js";
 import type { ColumnMap } from "../builder/filters.js";
 import { parseDomain, domainToSql } from "../domain/domain.js";
-import {
-  RbacCache,
-  type CachedRoles,
-  type RbacCacheOptions,
-} from "./cache.js";
 import type { Action, RbacConfig } from "./config.js";
 import { buildRbacConfig } from "./config.js";
-import {
-  emptySnapshot,
-  loadRbacSnapshot,
-  syncRbacFromCode,
-  type RbacSnapshot,
-  type SyncResult,
-} from "./sync.js";
 
 export type { Action } from "./config.js";
-
-/**
- * Tables the engine reads. Apps re-export these from their schema module via
- * `frameworkTables`.
- */
-export interface RbacSchema {
-  roles: typeof rolesTable;
-  accessRights: typeof accessRightsTable;
-  recordRules: typeof recordRulesTable;
-  userRoles: typeof userRolesTable;
-}
-
-export interface RbacDb {
-  select: (...args: any[]) => any;
-  insert: (...args: any[]) => any;
-  update: (...args: any[]) => any;
-  delete: (...args: any[]) => any;
-}
 
 export interface RbacContext {
   user: User | null;
@@ -80,8 +40,6 @@ export interface RbacContext {
 
 const forbidden = (msg: string) =>
   new GraphQLError(msg, { extensions: { code: "FORBIDDEN" } });
-
-export type BuildRbacOptions = RbacCacheOptions;
 
 /**
  * Hook passed to {@link buildSchema} as `options.rbac.enforce`. Throws
@@ -101,139 +59,133 @@ export interface RbacEnforce {
 }
 
 /**
- * Result of {@link buildRbac}.
+ * Result of {@link buildRbac}. Membership lives in the engine — the admin
+ * sub-app calls these methods to add and remove roles at runtime.
  */
 export interface BuiltRbac {
   /** The `enforce` hook to pass to `buildSchema` and `buildRbacDb`. */
   enforce: RbacEnforce;
-  /** Drop a single user's cached entries. */
-  invalidateUser: (userId: number) => void;
-  /** Drop every cached entry. */
-  clearCache: () => void;
-  /**
-   * Run a sync against the DB, then refresh the engine's in-memory snapshot
-   * and clear the cache. Call after creation if you need to be sure the
-   * engine is in sync before serving traffic; otherwise let `createApp`
-   * fire it for you in the background.
-   */
-  sync: () => Promise<SyncResult>;
-  /** Re-read the snapshot from the DB (without running sync). */
-  refreshSnapshot: () => Promise<void>;
-  /** The current snapshot — exposed for tests / debugging. */
-  getSnapshot: () => RbacSnapshot;
+  /** Every role key known to the engine, sorted. */
+  listRoleKeys(): string[];
+  /** Roles the user currently holds, sorted by key. Returns `[]` for unknown users. */
+  listUserRoles(userId: number): string[];
+  /** Add a user to a role. Throws if `roleKey` isn't defined in the config. Returns true if the assignment is new. */
+  assignRole(userId: number, roleKey: string): boolean;
+  /** Remove a user from a role. Returns true if a row was removed. */
+  revokeRole(userId: number, roleKey: string): boolean;
+  /** True iff the engine knows about `roleKey`. */
+  hasRole(roleKey: string): boolean;
+}
+
+interface RoleEntry {
+  id: number;
+  key: string;
+  isAdmin: boolean;
 }
 
 /**
- * Build the {@link RbacEnforce} hook bound to a Drizzle DB and the framework
- * tables. The engine starts with an empty snapshot (deny-all); call
- * {@link BuiltRbac.sync} (or let `createApp`'s background sync do it) to
- * reconcile the DB with the code config and load the snapshot.
+ * Build the {@link RbacEnforce} hook and membership API from the resolved
+ * code config. Everything is in-memory; there is no DB-side state.
  */
-export function buildRbac(
-  db: RbacDb,
-  schema: RbacSchema,
-  config: RbacConfig,
-  options: BuildRbacOptions = {},
-): BuiltRbac {
+export function buildRbac(config: RbacConfig): BuiltRbac {
   const resolved = buildRbacConfig(config);
-  const cache = new RbacCache<SQL>(options);
-  let snapshot: RbacSnapshot = emptySnapshot();
 
-  const userRolesTab = schema.userRoles;
+  // ---- Snapshot built once, synchronously ---------------------------------
 
-  /**
-   * Resolve the caller's effective role-id set straight from `user_roles`.
-   * Roles whose row no longer exists in the snapshot are dropped (the FK
-   * prevents stale ids in practice, but the snapshot may briefly lag).
-   */
-  const resolveRoles = async (userId: number): Promise<CachedRoles> => {
-    const rows: { roleId: number }[] = await db
-      .select({ roleId: userRolesTab.roleId })
-      .from(userRolesTab)
-      .where(eq(userRolesTab.userId, userId));
+  const rolesByKey = new Map<string, RoleEntry>();
+  resolved.roles.forEach((r, i) => {
+    rolesByKey.set(r.key, { id: i + 1, key: r.key, isAdmin: r.isAdmin });
+  });
+
+  const accessByRoleId = new Map<number, Map<string, Set<Action>>>();
+  for (const a of resolved.accessRights) {
+    const role = rolesByKey.get(a.roleKey);
+    if (!role) continue;
+    let perResource = accessByRoleId.get(role.id);
+    if (!perResource) accessByRoleId.set(role.id, (perResource = new Map()));
+    let actions = perResource.get(a.resource);
+    if (!actions) perResource.set(a.resource, (actions = new Set()));
+    if (a.canCreate) actions.add("create");
+    if (a.canRead) actions.add("read");
+    if (a.canUpdate) actions.add("update");
+    if (a.canDelete) actions.add("delete");
+  }
+
+  const rulesByRoleId = new Map<number, Map<string, Map<Action, unknown[]>>>();
+  for (const r of resolved.recordRules) {
+    const role = rolesByKey.get(r.roleKey);
+    if (!role) continue;
+    let perResource = rulesByRoleId.get(role.id);
+    if (!perResource) rulesByRoleId.set(role.id, (perResource = new Map()));
+    let perAction = perResource.get(r.resource);
+    if (!perAction) perResource.set(r.resource, (perAction = new Map()));
+    perAction.set(r.action, r.domain);
+  }
+
+  // ---- Membership (in-memory, mutated at runtime) -------------------------
+
+  const userRoles = new Map<number, Set<number>>();
+
+  const rolesForUser = (userId: number): { roleIds: number[]; isAdmin: boolean } => {
+    const ids = userRoles.get(userId);
+    if (!ids?.size) return { roleIds: [], isAdmin: false };
     const roleIds: number[] = [];
     let isAdmin = false;
-    for (const { roleId } of rows) {
-      const meta = snapshot.rolesById.get(roleId);
-      if (!meta) continue;
-      roleIds.push(roleId);
-      if (meta.isAdmin) isAdmin = true;
+    for (const id of ids) {
+      roleIds.push(id);
+      // Look up by id — small N, linear scan is fine.
+      for (const role of rolesByKey.values()) {
+        if (role.id === id && role.isAdmin) {
+          isAdmin = true;
+          break;
+        }
+      }
     }
     return { roleIds, isAdmin };
   };
 
-  const getRoles = async (ctx: RbacContext): Promise<CachedRoles> => {
-    if (!ctx.user) return { roleIds: [], isAdmin: false };
-    const userId = ctx.user.id;
-    const requestKey = `__rbac_roles:${userId}`;
-    const cachedReq = ctx.batch?.get(requestKey) as CachedRoles | undefined;
-    if (cachedReq) return cachedReq;
-    const cachedGlobal = cache.getRoles(userId);
-    if (cachedGlobal) {
-      ctx.batch?.set(requestKey, cachedGlobal);
-      return cachedGlobal;
-    }
-    const out = await resolveRoles(userId);
-    ctx.batch?.set(requestKey, out);
-    cache.setRoles(userId, out);
-    return out;
-  };
+  // ---- enforce ------------------------------------------------------------
 
   const enforce: RbacEnforce = async (ctx, resource, action, columns) => {
     if (!ctx.user) throw forbidden("Not authenticated");
     const userId = ctx.user.id;
 
     const requestKey = `__rbac_enforce:${userId}:${resource}:${action}`;
-    const cachedReq = ctx.batch?.get(requestKey) as
+    const cached = ctx.batch?.get(requestKey) as
       | { where?: SQL }
       | { __forbidden: string }
       | undefined;
-    if (cachedReq) {
-      if ("__forbidden" in cachedReq) throw forbidden(cachedReq.__forbidden);
-      return cachedReq;
-    }
-    const cachedGlobal = cache.getEnforce(userId, resource, action);
-    if (cachedGlobal) {
-      ctx.batch?.set(requestKey, cachedGlobal);
-      if ("__forbidden" in cachedGlobal) throw forbidden(cachedGlobal.__forbidden);
-      return cachedGlobal;
+    if (cached) {
+      if ("__forbidden" in cached) throw forbidden(cached.__forbidden);
+      return cached;
     }
 
     const memo = (out: { where?: SQL }) => {
       ctx.batch?.set(requestKey, out);
-      cache.setEnforce(userId, resource, action, out);
       return out;
     };
     const denyAndThrow = (msg: string): never => {
-      const entry = { __forbidden: msg };
-      ctx.batch?.set(requestKey, entry);
-      cache.setEnforce(userId, resource, action, entry);
+      ctx.batch?.set(requestKey, { __forbidden: msg });
       throw forbidden(msg);
     };
 
-    const { roleIds, isAdmin } = await getRoles(ctx);
+    const { roleIds, isAdmin } = rolesForUser(userId);
     if (isAdmin) return memo({});
     if (!roleIds.length) denyAndThrow(`Access denied on '${resource}'`);
 
-    // Roles whose access-rights row grants this (resource, action).
     const grantingRoleIds: number[] = [];
     for (const id of roleIds) {
-      const perResource = snapshot.accessByRole.get(id);
-      if (perResource?.get(resource)?.has(action)) grantingRoleIds.push(id);
+      if (accessByRoleId.get(id)?.get(resource)?.has(action)) grantingRoleIds.push(id);
     }
     if (!grantingRoleIds.length) {
       denyAndThrow(`Access denied on '${resource}' for '${action}'`);
     }
 
-    // Record rules: only those owned by roles that *also* grant the action
-    // contribute. A granting role with no rule means unrestricted access on
-    // that role's grant; if any granting role is unrestricted, the effective
-    // filter collapses to none.
     const placeholders = { "current_user.id": ctx.user?.id ?? null };
     const perRole: SQL[] = [];
     let anyUnrestricted = false;
     for (const id of grantingRoleIds) {
-      const domain = snapshot.rulesByRole.get(id)?.get(resource)?.get(action);
+      const domain = rulesByRoleId.get(id)?.get(resource)?.get(action);
       if (!domain) {
         anyUnrestricted = true;
         continue;
@@ -249,21 +201,39 @@ export function buildRbac(
     return memo({ where: combined });
   };
 
+  // ---- Membership API -----------------------------------------------------
+
   return {
     enforce,
-    invalidateUser: (userId: number) => cache.invalidateUser(userId),
-    clearCache: () => cache.clear(),
-    sync: async () => {
-      const result = await syncRbacFromCode(db, schema, resolved);
-      snapshot = await loadRbacSnapshot(db, schema);
-      cache.clear();
-      return result;
+    listRoleKeys: () =>
+      Array.from(rolesByKey.keys()).sort(),
+    listUserRoles: (userId: number) => {
+      const ids = userRoles.get(userId);
+      if (!ids?.size) return [];
+      const keys: string[] = [];
+      for (const role of rolesByKey.values()) {
+        if (ids.has(role.id)) keys.push(role.key);
+      }
+      return keys.sort();
     },
-    refreshSnapshot: async () => {
-      snapshot = await loadRbacSnapshot(db, schema);
-      cache.clear();
+    assignRole: (userId: number, roleKey: string) => {
+      const role = rolesByKey.get(roleKey);
+      if (!role) throw new Error(`rbac: unknown role '${roleKey}'`);
+      let set = userRoles.get(userId);
+      if (!set) userRoles.set(userId, (set = new Set()));
+      if (set.has(role.id)) return false;
+      set.add(role.id);
+      return true;
     },
-    getSnapshot: () => snapshot,
+    revokeRole: (userId: number, roleKey: string) => {
+      const role = rolesByKey.get(roleKey);
+      if (!role) throw new Error(`rbac: unknown role '${roleKey}'`);
+      const set = userRoles.get(userId);
+      if (!set?.has(role.id)) return false;
+      set.delete(role.id);
+      if (!set.size) userRoles.delete(userId);
+      return true;
+    },
+    hasRole: (roleKey: string) => rolesByKey.has(roleKey),
   };
 }
-

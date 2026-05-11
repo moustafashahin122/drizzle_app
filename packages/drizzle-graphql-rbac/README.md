@@ -1,13 +1,35 @@
 # drizzle-graphql-rbac
 
-Auto-generated GraphQL CRUD + REST auth + Odoo-style RBAC, all driven by your existing [Drizzle](https://orm.drizzle.team/) schema. One `createApp(...)` call gives you:
+> A batteries-included backend framework that turns a [Drizzle](https://orm.drizzle.team/) schema into a production-ready GraphQL + REST API — complete with authentication, sessions, and Odoo-style role-based access control.
 
-- A GraphQL endpoint with `Query` / `Mutation` fields generated from every Drizzle table in the namespace you pass in.
-- REST `/auth/*` endpoints (`register`, `login`, `logout`, `me`) with cookie + bearer-token sessions.
-- REST `/admin/*` endpoints for user CRUD and role-membership management.
-- **Code-defined RBAC**: roles, access rights, and record rules live in three small TypeScript files in your app. Only user → role assignment is persisted, so admins can move users between roles at runtime without a code change.
+A single `createApp(...)` call stands up an HTTP service with a fully-typed GraphQL CRUD layer, cookie/bearer authentication, an admin sub-app, and a row-level security engine governed by three small TypeScript files. No code generators, no migrations to write for the framework tables, no runtime schema drift.
 
-The reference app in this monorepo's root (`../../`) is a working demo built on top of this package.
+## Highlights
+
+- **Zero-boilerplate GraphQL CRUD.** Every table in your Drizzle namespace gets typed `Query` and `Mutation` fields — `list`, `single`, `insert`, `update`, `delete` — with filter, ordering, and pagination inputs derived from the column types.
+- **Automatic relations.** Single-column foreign keys are promoted into forward (`one`) and inverse (`many`) GraphQL fields automatically; explicit Drizzle `relations(...)` declarations take precedence when you need them.
+- **Built-in authentication.** REST `/auth/*` routes (`register`, `login`, `logout`, `me`) with bcrypt-hashed passwords and dual cookie + bearer-token sessions, ready to mount.
+- **Admin sub-app.** REST `/admin/*` endpoints for user management and runtime role-membership changes, gated by the same RBAC engine that protects GraphQL.
+- **Code-defined RBAC, DB-synced.** Roles, access rights, and record rules are declared in TypeScript and reconciled to the database on startup by external id (`xid`) — like Odoo's `xml_id`. Rename a role's key, the row persists; remove an entry, it cascade-deletes.
+- **Row-level security with a domain DSL.** Per-role, per-action record rules written in an Odoo-style domain language (`["&", [...], ["|", [...], [...]]]`) are compiled to SQL and AND-injected into every read, update, and delete.
+- **Per-request enforcement wrapper.** `rdbFor(ctx)` returns a Drizzle handle that automatically applies the caller's RBAC envelope to `select`, `insert`, `update`, `delete` — use it in custom routes and they're protected for free.
+- **Multi-role union semantics.** Users may hold any number of roles; grants combine as the union and per-role record rules OR together. Matches Odoo's behavior exactly.
+- **TTL + LRU caching.** Effective roles and per-`(user, resource, action)` enforce results are cached in-process with bounded size; surgical invalidation hooks are exposed.
+- **Composable primitives.** `createApp` is a convenience layer over `buildSchema`, `buildRbac`, `buildRbacDb`, `buildAuthRoutes`, and `buildAdminRoutes` — use them directly when you need a custom pipeline.
+- **Hermetic, no-mocks test suite.** Every subsystem is exercised end-to-end through the generated GraphQL schema against in-memory SQLite.
+
+## At a glance
+
+| Area              | What you get                                                                                |
+|-------------------|---------------------------------------------------------------------------------------------|
+| Transport         | Hono app exposing GraphQL (via `graphql-yoga`) and REST sub-apps; runs on any Web Fetch host. |
+| Database          | Drizzle ORM. SQLite is the reference dialect; the engine only relies on `select()`.         |
+| Auth              | Email + password, bcrypt-hashed, with cookie and `Authorization: Bearer` sessions.          |
+| Authorization     | Code-defined roles, CRUD grants, and row-level rules; cache-backed enforcement.             |
+| Persistence model | Six framework-owned tables: `users`, `sessions`, `roles`, `access_rights`, `record_rules`, `user_roles`. |
+| Runtime mutation  | Only `user_roles` is written at runtime; role catalog and grants are code-only.             |
+
+A working reference application is available in this monorepo's root (`../../`).
 
 ---
 

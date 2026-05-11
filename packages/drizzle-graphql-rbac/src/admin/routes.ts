@@ -2,8 +2,8 @@
  * @module admin/routes
  *
  * REST endpoints for the admin dashboard's user CRUD and role membership.
- * RBAC is enforced automatically by {@link RbacDb} — these handlers are thin
- * translation layers between HTTP and Drizzle.
+ * User CRUD is RBAC-enforced via {@link RbacDb}. Role membership is held in
+ * the in-memory RBAC engine — these handlers translate HTTP into engine calls.
  *
  * | Method | Path                          | Body                                | Auth |
  * |--------|-------------------------------|-------------------------------------|------|
@@ -17,26 +17,15 @@
  * | DELETE | /admin/users/:id/roles/:key   | —                                   | yes  |
  *
  * Roles themselves are code-defined; this module only manages membership.
- * Adding a user to a role that doesn't exist in the code config returns 400.
- *
- * "Auth: yes" means the request must carry a valid session and the caller's
- * roles must grant the corresponding action on the affected resource. The
- * RbacDb wrapper throws `FORBIDDEN` on deny, which the route translates to a
- * 403 JSON body. `passwordHash` is never returned.
+ * Adding a user to a role that isn't defined in the code config returns 400.
  */
 import { Hono } from "hono";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import bcrypt from "bcryptjs";
-import { and, asc, eq } from "drizzle-orm";
-import type {
-  User,
-  users as usersTableType,
-  userRoles as userRolesTableType,
-  roles as rolesTableType,
-} from "../tables.js";
-import { getTableColumns } from "drizzle-orm";
+import { asc, eq, getTableColumns } from "drizzle-orm";
+import type { User, users as usersTableType } from "../tables.js";
 import type { RbacDb } from "../graphql/rbac/rbacDb.js";
-import type { RbacEnforce } from "../graphql/rbac/rbac.js";
+import type { BuiltRbac } from "../graphql/rbac/rbac.js";
 import type { ColumnMap } from "../graphql/builder/filters.js";
 import { requireAuth, sessionMiddleware, type AuthEnv } from "../auth/middleware.js";
 import type { SessionDb, SessionSchema } from "../auth/session.js";
@@ -46,7 +35,6 @@ function publicUser(user: User): Omit<User, "passwordHash"> {
   return rest;
 }
 
-/** Translate an RBAC throw into a JSON response status. */
 function errorResponse(err: any): { status: ContentfulStatusCode; body: { error: string } } {
   const code = err?.extensions?.code;
   if (code === "FORBIDDEN") return { status: 403, body: { error: err.message } };
@@ -56,59 +44,33 @@ function errorResponse(err: any): { status: ContentfulStatusCode; body: { error:
 }
 
 export interface AdminRoutesDeps {
-  /** The raw db is used for session resolution and role-membership writes. */
+  /** Raw db, used for session resolution. */
   db: SessionDb;
   schema: SessionSchema;
   /** The `users` Drizzle table — passed in so this module has no hard dependency on `../db.js`. */
   usersTable: typeof usersTableType;
-  /** The `userRoles` join table. */
-  userRolesTable: typeof userRolesTableType;
-  /** The `roles` table — used to translate role keys to role ids. */
-  rolesTable: typeof rolesTableType;
   /** Per-request RBAC-bound db factory built by `buildRbacDb`. */
   rdbFor: (ctx: { user: User | null; batch?: Map<string, unknown> }) => RbacDb;
-  /**
-   * The raw RBAC enforce hook — used by the role-membership endpoints to
-   * gate on `users.update` without issuing a no-op SQL update.
-   */
-  enforce: RbacEnforce;
-  /**
-   * Called after a user's role assignments change so the RBAC engine can
-   * drop its caches for that user.
-   */
-  onRolesChanged?: (userId: number) => void;
+  /** The RBAC engine — used for role-membership lookups, mutations, and enforcement. */
+  rbac: BuiltRbac;
 }
 
 /**
  * Build the `/admin/*` Hono sub-app. Mount with
  * `app.route("/admin", buildAdminRoutes(deps))`.
- *
- * The sub-app installs {@link sessionMiddleware} + {@link requireAuth} on
- * every route — RBAC then narrows further per-resource.
  */
 export function buildAdminRoutes(deps: AdminRoutesDeps) {
-  const {
-    db,
-    schema,
-    rdbFor,
-    enforce,
-    usersTable,
-    userRolesTable,
-    rolesTable,
-    onRolesChanged,
-  } = deps;
+  const { db, schema, rdbFor, usersTable, rbac } = deps;
   const usersColumns = getTableColumns(usersTable) as ColumnMap;
   const app = new Hono<AuthEnv>();
   app.use("*", sessionMiddleware(db, schema));
   app.use("*", requireAuth);
 
-  /** Build a per-request RBAC db bound to the current user. */
   const rdbForReq = (c: any): RbacDb =>
     rdbFor({ user: c.get("user"), batch: new Map() });
 
-  /** Enforce a `users` action for the current request and throw on deny. */
   const requirePerm = (c: any, action: "read" | "update") =>
-    enforce(
+    rbac.enforce(
       { user: c.get("user"), batch: new Map() },
       "users",
       action,
@@ -201,6 +163,8 @@ export function buildAdminRoutes(deps: AdminRoutesDeps) {
         .where(eq(usersTable.id, id))
         .returning();
       if (!rows.length) return c.json({ error: "Not found" }, 404);
+      // Drop any in-memory role assignments for the deleted user.
+      for (const key of rbac.listUserRoles(id)) rbac.revokeRole(id, key);
       return c.json({ id });
     } catch (err) {
       const r = errorResponse(err);
@@ -209,41 +173,13 @@ export function buildAdminRoutes(deps: AdminRoutesDeps) {
   });
 
   // -------------------------------------------------------------------------
-  // Role membership
+  // Role membership (in-memory)
   // -------------------------------------------------------------------------
 
-  /** Look up `roles.id` for a given role key, or `null` if not present. */
-  const findRoleId = async (key: string): Promise<number | null> => {
-    const [row] = await db
-      .select({ id: rolesTable.id })
-      .from(rolesTable)
-      .where(eq(rolesTable.key, key))
-      .limit(1);
-    return row?.id ?? null;
-  };
-
-  /** Return the user's currently assigned role keys, sorted. */
-  const listUserRoleKeys = async (userId: number): Promise<string[]> => {
-    const rows: { key: string }[] = await db
-      .select({ key: rolesTable.key })
-      .from(userRolesTable)
-      .innerJoin(rolesTable, eq(userRolesTable.roleId, rolesTable.id))
-      .where(eq(userRolesTable.userId, userId));
-    return rows.map((r) => r.key).sort();
-  };
-
-  /**
-   * Role list — exposes the role keys currently in the DB so the dashboard
-   * can render a picker without hard-coding them. Reads from the `roles`
-   * table, which the sync routine keeps in lockstep with the code config.
-   */
   app.get("/roles", async (c) => {
     try {
       await requirePerm(c, "read");
-      const rows: { key: string }[] = await db
-        .select({ key: rolesTable.key })
-        .from(rolesTable);
-      return c.json({ roles: rows.map((r) => r.key).sort() });
+      return c.json({ roles: rbac.listRoleKeys() });
     } catch (err) {
       const r = errorResponse(err);
       return c.json(r.body, r.status);
@@ -261,7 +197,7 @@ export function buildAdminRoutes(deps: AdminRoutesDeps) {
         .where(eq(usersTable.id, id))
         .limit(1);
       if (!user) return c.json({ error: "Not found" }, 404);
-      return c.json({ userId: id, roles: await listUserRoleKeys(id) });
+      return c.json({ userId: id, roles: rbac.listUserRoles(id) });
     } catch (err) {
       const r = errorResponse(err);
       return c.json(r.body, r.status);
@@ -276,26 +212,17 @@ export function buildAdminRoutes(deps: AdminRoutesDeps) {
     if (!roleKey) return c.json({ error: "roleKey is required" }, 400);
     try {
       await requirePerm(c, "update");
-      const roleId = await findRoleId(roleKey);
-      if (roleId === null) return c.json({ error: `Unknown role '${roleKey}'` }, 400);
+      if (!rbac.hasRole(roleKey)) {
+        return c.json({ error: `Unknown role '${roleKey}'` }, 400);
+      }
       const [target] = await db
         .select()
         .from(usersTable)
         .where(eq(usersTable.id, id))
         .limit(1);
       if (!target) return c.json({ error: "Not found" }, 404);
-      const [existing] = await db
-        .select()
-        .from(userRolesTable)
-        .where(
-          and(eq(userRolesTable.userId, id), eq(userRolesTable.roleId, roleId)),
-        )
-        .limit(1);
-      if (!existing) {
-        await db.insert(userRolesTable).values({ userId: id, roleId });
-        onRolesChanged?.(id);
-      }
-      return c.json({ userId: id, roles: await listUserRoleKeys(id) }, 201);
+      rbac.assignRole(id, roleKey);
+      return c.json({ userId: id, roles: rbac.listUserRoles(id) }, 201);
     } catch (err) {
       const r = errorResponse(err);
       return c.json(r.body, r.status);
@@ -309,22 +236,17 @@ export function buildAdminRoutes(deps: AdminRoutesDeps) {
     if (!roleKey) return c.json({ error: "roleKey is required" }, 400);
     try {
       await requirePerm(c, "update");
-      const roleId = await findRoleId(roleKey);
-      if (roleId === null) return c.json({ error: `Unknown role '${roleKey}'` }, 400);
+      if (!rbac.hasRole(roleKey)) {
+        return c.json({ error: `Unknown role '${roleKey}'` }, 400);
+      }
       const [target] = await db
         .select()
         .from(usersTable)
         .where(eq(usersTable.id, id))
         .limit(1);
       if (!target) return c.json({ error: "Not found" }, 404);
-      const removed: { id: number }[] = await db
-        .delete(userRolesTable)
-        .where(
-          and(eq(userRolesTable.userId, id), eq(userRolesTable.roleId, roleId)),
-        )
-        .returning({ id: userRolesTable.id });
-      if (removed.length) onRolesChanged?.(id);
-      return c.json({ userId: id, roles: await listUserRoleKeys(id) });
+      rbac.revokeRole(id, roleKey);
+      return c.json({ userId: id, roles: rbac.listUserRoles(id) });
     } catch (err) {
       const r = errorResponse(err);
       return c.json(r.body, r.status);
