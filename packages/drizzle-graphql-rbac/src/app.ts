@@ -36,7 +36,7 @@ import { logger as honoLogger } from "hono/logger";
 import { createYoga } from "graphql-yoga";
 import { buildSchema, type BuildSchemaOptions } from "./graphql/builder/builder.js";
 import { depthLimit } from "./graphql/index.js";
-import { buildRbac, type BuiltRbac } from "./graphql/rbac/rbac.js";
+import { buildRbac, type BuiltRbac, type RbacContext } from "./graphql/rbac/rbac.js";
 import type { RbacConfig } from "./graphql/rbac/config.js";
 import { mergeFrameworkRbac } from "./frameworkRbac.js";
 import { buildRbacDb, type RbacDb } from "./graphql/rbac/rbacDb.js";
@@ -111,8 +111,12 @@ export interface CreatedApp {
   app: Hono<AuthEnv>;
   /** The RBAC engine — call `assignRole` / `revokeRole` to seed memberships at startup. */
   rbac: BuiltRbac;
-  /** Per-request RBAC-bound DB factory; re-exported so callers can write custom routes. */
-  rdbFor: (ctx: { user: User | null; batch?: Map<string, unknown> }) => RbacDb;
+  /**
+   * Per-request RBAC-bound DB factory; re-exported so callers can write
+   * custom routes. Pass the request's resolved auth context (the same shape
+   * the framework's GraphQL/REST handlers build from `sessionMiddleware`).
+   */
+  rdbFor: (ctx: RbacContext) => RbacDb;
 }
 
 /**

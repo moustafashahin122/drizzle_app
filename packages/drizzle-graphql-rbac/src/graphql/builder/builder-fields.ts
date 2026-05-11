@@ -19,6 +19,7 @@ import {
 } from "graphql";
 import type { ColumnMap } from "./filters.js";
 import { columnToBaseType, wrapNonNull } from "./types.js";
+import { hasDefault, isGenerated, isNotNull } from "./drizzle-internals.js";
 
 /**
  * Build the `<TypeName>Insert` input. Each field is required iff the column is
@@ -34,8 +35,7 @@ export function buildInsertInput(
     fields: () => {
       const fields: GraphQLInputFieldConfigMap = {};
       for (const [name, col] of Object.entries(columns)) {
-        const c: any = col;
-        const required = c.notNull && !c.hasDefault && !(c as any).generated;
+        const required = isNotNull(col) && !hasDefault(col) && !isGenerated(col);
         const base = columnToBaseType(col);
         fields[name] = { type: wrapNonNull(base, required) };
       }

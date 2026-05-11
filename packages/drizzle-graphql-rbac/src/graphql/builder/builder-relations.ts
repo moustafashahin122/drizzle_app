@@ -69,6 +69,7 @@ export function buildRelationField(
   refMeta: TableMeta,
   db: DrizzleLike,
   refCtx: DomainContext,
+  relationBatchSize: number,
 ): GraphQLFieldConfig<any, any> {
 
   const isMany = rel.kind === "many";
@@ -137,7 +138,7 @@ export function buildRelationField(
       }|${JSON.stringify(args?.where ?? null)}|${JSON.stringify(args?.orderBy ?? null)}|${projKeys}`;
       let loader = batch!.get(cacheKey) as RelationLoader | undefined;
       if (!loader) {
-        loader = createRelationLoader(rel, refMeta, db, isMany, args, userWhere, projection);
+        loader = createRelationLoader(rel, refMeta, db, isMany, args, userWhere, projection, relationBatchSize);
         batch!.set(cacheKey, loader);
       }
       return loader.load(keys[0]);
@@ -164,6 +165,7 @@ function createRelationLoader(
   args: any,
   userWhere: SQL | undefined,
   projection: Record<string, Column> | undefined,
+  relationBatchSize: number,
 ): RelationLoader {
   const refCol = rel.references![0];
   const refKeyName = jsKeyOf(refMeta.columns, refCol);
@@ -187,23 +189,38 @@ function createRelationLoader(
         return;
       }
       const uniqueKeys = Array.from(new Set(pending.map((p) => p.key)));
-      const joinSql = inArray(refCol, uniqueKeys as any[]);
-      const where = combineWhere(joinSql, userWhere);
-      const baseSelect = proj
-        ? db.select(proj).from(refMeta.table as any)
-        : db.select().from(refMeta.table as any);
-      const rows: any[] = await applyListArgs(
-        baseSelect,
-        // limit/offset are dropped at the per-batch level (they were only
-        // safe to apply per-parent, which the canBatch gate already excluded
-        // for `many` relations; for `one` relations args is undefined).
-        args ? { orderBy: args.orderBy } : undefined,
-        refMeta.columns,
-        where,
-      );
+      // Chunk the IN-list by relationBatchSize so very wide parent fan-outs
+      // don't blow past driver/DB parameter limits with a single oversized
+      // query. Infinity disables chunking. Each chunk issues one SELECT;
+      // results are merged back into a single per-key bucket map before
+      // pending promises are resolved, so each pending caller sees the same
+      // shape regardless of chunk boundaries.
+      const chunkSize =
+        Number.isFinite(relationBatchSize) && relationBatchSize > 0
+          ? Math.floor(relationBatchSize)
+          : uniqueKeys.length;
+      const allRows: any[] = [];
+      for (let i = 0; i < uniqueKeys.length; i += chunkSize) {
+        const chunk = uniqueKeys.slice(i, i + chunkSize);
+        const joinSql = inArray(refCol, chunk as any[]);
+        const where = combineWhere(joinSql, userWhere);
+        const baseSelect = proj
+          ? db.select(proj).from(refMeta.table as any)
+          : db.select().from(refMeta.table as any);
+        const rows: any[] = await applyListArgs(
+          baseSelect,
+          // limit/offset are dropped at the per-batch level (they were only
+          // safe to apply per-parent, which the canBatch gate already excluded
+          // for `many` relations; for `one` relations args is undefined).
+          args ? { orderBy: args.orderBy } : undefined,
+          refMeta.columns,
+          where,
+        );
+        for (const r of rows) allRows.push(r);
+      }
       if (isMany) {
         const buckets = new Map<unknown, any[]>();
-        for (const row of rows) {
+        for (const row of allRows) {
           const k = row[refKeyName];
           let arr = buckets.get(k);
           if (!arr) buckets.set(k, (arr = []));
@@ -212,7 +229,7 @@ function createRelationLoader(
         for (const p of pending) p.resolve(buckets.get(p.key) ?? []);
       } else {
         const byKey = new Map<unknown, any>();
-        for (const row of rows) {
+        for (const row of allRows) {
           const k = row[refKeyName];
           if (!byKey.has(k)) byKey.set(k, row);
         }

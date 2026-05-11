@@ -137,6 +137,15 @@ export interface BuildSchemaOptions {
      */
      bypassResources?: Set<string>;
   };
+  /**
+   * Maximum number of distinct foreign-key values to include in a single
+   * `WHERE pk IN (...)` query issued by the relation batch loader. When more
+   * than this many unique keys are queued during a microtask, the loader
+   * flushes in chunks of this size. Set to `Infinity` to disable chunking.
+   *
+   * @default 100
+   */
+  relationBatchSize?: number;
 }
 
 /** Capitalize first character of a string. */
@@ -187,6 +196,8 @@ export function buildSchema(
     },
   });
 
+  const relationBatchSize = options.relationBatchSize ?? 100;
+
   // Pass 1: build object types (with relation field thunks) + input types.
   for (const [jsKey, table] of intro.tablesByKey) {
     const sqlName = getTableName(table);
@@ -201,6 +212,7 @@ export function buildSchema(
       db,
       domainCtxFor,
       hiddenOutput,
+      relationBatchSize,
     );
     metas.set(sqlName, meta);
   }

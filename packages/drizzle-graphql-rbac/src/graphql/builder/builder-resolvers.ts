@@ -23,6 +23,7 @@ import { GraphQLJSON } from "./scalars.js";
 import type { BuildSchemaOptions } from "./builder.js";
 import type { DrizzleLike, Guard, TableMeta } from "./types.js";
 import { selectProjected, whereDomainToSql } from "./util.js";
+import { isPrimary } from "./drizzle-internals.js";
 
 /**
  * Attach the standard CRUD root fields for a table to the Query and Mutation
@@ -129,7 +130,7 @@ function buildInsertMutationField(
   // Primary-key columns of the table. Used to re-fetch inserted rows for
   // create-domain post-check. Computed once per schema build.
   const pkEntries: Array<[string, Column]> = Object.entries(meta.columns).filter(
-    ([, c]) => (c as any).primary,
+    ([, c]) => isPrimary(c),
   );
   return {
     type: listType(meta),

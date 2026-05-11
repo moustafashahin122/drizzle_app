@@ -21,12 +21,19 @@ import type {
 } from "./graphql/rbac/config.js";
 
 /**
+ * Key of the framework-owned admin role. Apps must not redefine a role under
+ * this key; see {@link mergeFrameworkRbac}. Exported so callers (admin tooling,
+ * seed scripts, role-assignment endpoints) can avoid hard-coding the literal.
+ */
+export const ADMIN_ROLE = "admin" as const;
+
+/**
  * The framework-owned roles. Currently just `admin` — `isAdmin: true` makes
  * it short-circuit every RBAC check, so it doesn't need any access-rights or
  * record-rule entries.
  */
 export const FRAMEWORK_ROLES: RolesConfig = {
-  admin: { isAdmin: true },
+  [ADMIN_ROLE]: { isAdmin: true },
 };
 
 export const FRAMEWORK_ACCESS_RIGHTS: AccessRightsConfig = {};

@@ -299,6 +299,38 @@ describe("buildSchema — relation batching", () => {
     // 1 parent query + 5 child queries (one per todo).
     assert.equal(selectCount, 6);
   });
+
+  it("chunks the IN-list query when relationBatchSize < unique-fk-count", async () => {
+    const sqlite = new Database(":memory:");
+    sqlite.exec(`
+      CREATE TABLE assignees (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, email TEXT NOT NULL);
+      CREATE TABLE todos (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, completed INTEGER NOT NULL DEFAULT 0, assignee_id INTEGER REFERENCES assignees(id));
+      INSERT INTO assignees (name, email) VALUES ('A','a@x'),('B','b@x'),('C','c@x'),('D','d@x');
+      INSERT INTO todos (title, assignee_id) VALUES ('t1',1),('t2',2),('t3',3),('t4',4);
+    `);
+    let chunkSelectCount = 0;
+    const counted = drizzle(sqlite, {
+      logger: { logQuery: (q) => { if (q.startsWith("select")) chunkSelectCount++; } },
+    });
+    const chunkedSchema = buildSchema(
+      counted,
+      { assignees, todos },
+      { relationBatchSize: 2 },
+    ).schema;
+    const result = await graphql({
+      schema: chunkedSchema,
+      source: `{ todos(orderBy: { id: ASC }) { title assigneeId { name } } }`,
+      contextValue: { batch: new Map() },
+    });
+    assert.equal(result.errors, undefined);
+    // 1 parent query + 2 chunked IN-queries (4 unique FKs split into batches of 2).
+    assert.equal(chunkSelectCount, 3);
+    const data: any = result.data;
+    assert.deepEqual(
+      data.todos.map((t: any) => [t.title, t.assigneeId.name]),
+      [["t1","A"],["t2","B"],["t3","C"],["t4","D"]],
+    );
+  });
 });
 
 describe("buildSchema — mutations round-trip", () => {

@@ -75,6 +75,7 @@ export type { RbacDbDeps } from "./graphql/rbac/rbacDb.js";
 // Framework-owned RBAC entries (the built-in `admin` role) + helper to
 // merge them into a user config when wiring the engine directly.
 export {
+  ADMIN_ROLE,
   FRAMEWORK_ROLES,
   FRAMEWORK_ACCESS_RIGHTS,
   FRAMEWORK_RECORD_RULES,

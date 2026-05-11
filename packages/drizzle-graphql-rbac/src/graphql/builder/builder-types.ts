@@ -24,6 +24,7 @@ import { buildInsertInput, buildUpdateInput } from "./builder-fields.js";
 import { buildRelationField } from "./builder-relations.js";
 import { introspectSchema } from "./relations.js";
 import { columnToBaseType, wrapNonNull } from "./types.js";
+import { isNotNull } from "./drizzle-internals.js";
 import type { DrizzleLike, TableMeta } from "./types.js";
 import type { DomainContext } from "../domain/domain.js";
 
@@ -47,12 +48,13 @@ function buildObjectFields(
   db: DrizzleLike,
   domainCtxFor: (m: TableMeta) => DomainContext,
   hiddenOutput: Set<string>,
+  relationBatchSize: number,
 ): GraphQLFieldConfigMap<any, any> {
   const fields: GraphQLFieldConfigMap<any, any> = {};
   for (const [name, col] of Object.entries(meta.columns)) {
     if (hiddenOutput.has(name)) continue;
     fields[name] = {
-      type: wrapNonNull(columnToBaseType(col), (col as any).notNull),
+      type: wrapNonNull(columnToBaseType(col), isNotNull(col)),
       resolve: (src) => src?.[name],
     };
   }
@@ -65,7 +67,7 @@ function buildObjectFields(
     // Relation field replaces a same-named scalar column on the output type.
     // The scalar FK column remains usable in `set` / Insert / Update inputs
     // (and inside a domain leaf) because they iterate the unchanged column map.
-    fields[rel.fieldName] = buildRelationField(rel, meta, refMeta, db, domainCtxFor(refMeta));
+    fields[rel.fieldName] = buildRelationField(rel, meta, refMeta, db, domainCtxFor(refMeta), relationBatchSize);
   }
   return fields;
 }
@@ -85,6 +87,7 @@ export function buildTableMeta(
   db: DrizzleLike,
   domainCtxFor: (m: TableMeta) => DomainContext,
   hiddenOutput: Set<string>,
+  relationBatchSize: number,
 ): TableMeta {
   const sqlName = getTableName(table);
   const columns = getTableColumns(table) as ColumnMap;
@@ -92,7 +95,7 @@ export function buildTableMeta(
 
   const objectType = new GraphQLObjectType({
     name: typeName,
-    fields: () => buildObjectFields(meta, intro, metas, db, domainCtxFor, hiddenOutput),
+    fields: () => buildObjectFields(meta, intro, metas, db, domainCtxFor, hiddenOutput, relationBatchSize),
   });
   const insertInput = buildInsertInput(typeName, columns);
   const updateInput = buildUpdateInput(typeName, columns);
