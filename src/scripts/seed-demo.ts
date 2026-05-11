@@ -10,7 +10,10 @@
  */
 import bcrypt from "bcryptjs";
 import { eq } from "drizzle-orm";
+import { logger } from "drizzle-graphql-rbac";
 import { db, users } from "../db.js";
+
+const log = logger.child({ component: "app.seed.demo" });
 
 const DEMO_PASSWORD = process.env.DEMO_PASSWORD ?? "demo123";
 
@@ -19,20 +22,25 @@ async function ensureUser(name: string, email: string, password: string): Promis
   const [existing] = await db.select().from(users).where(eq(users.email, email)).limit(1);
   if (existing) {
     await db.update(users).set({ passwordHash, active: true }).where(eq(users.id, existing.id));
-    console.log(`Updated user ${email} (id=${existing.id}); password reset.`);
+    log.info({ email, userId: existing.id }, "updated user; password reset");
     return existing.id;
   }
   const [created] = await db
     .insert(users)
     .values({ name, email, passwordHash, active: true })
     .returning();
-  console.log(`Created user ${email} (id=${created.id}).`);
+  log.info({ email, userId: created.id }, "created user");
   return created.id;
 }
 
 await ensureUser("Demo One", "demo1@example.com", DEMO_PASSWORD);
 await ensureUser("Demo Two", "demo2@example.com", DEMO_PASSWORD);
 
-console.log("");
-console.log(`demo1 credentials: demo1@example.com / ${DEMO_PASSWORD}  (server.ts assigns the 'demo' role in memory)`);
-console.log(`demo2 credentials: demo2@example.com / ${DEMO_PASSWORD}  (no role — no todos access)`);
+log.info(
+  { email: "demo1@example.com", password: DEMO_PASSWORD },
+  "demo1 credentials (server.ts assigns the 'demo' role in memory)",
+);
+log.info(
+  { email: "demo2@example.com", password: DEMO_PASSWORD },
+  "demo2 credentials (no role — no todos access)",
+);

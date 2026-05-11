@@ -10,7 +10,10 @@
  */
 import bcrypt from "bcryptjs";
 import { eq } from "drizzle-orm";
+import { logger } from "drizzle-graphql-rbac";
 import { db, users } from "../db.js";
+
+const log = logger.child({ component: "app.seed.admin" });
 
 const email = process.env.ADMIN_EMAIL ?? "admin@example.com";
 const password = process.env.ADMIN_PASSWORD ?? "admin123";
@@ -21,14 +24,14 @@ const passwordHash = await bcrypt.hash(password, 10);
 const [existing] = await db.select().from(users).where(eq(users.email, email)).limit(1);
 if (existing) {
   await db.update(users).set({ passwordHash, active: true }).where(eq(users.id, existing.id));
-  console.log(`Updated existing user ${email} (id=${existing.id}); password reset.`);
+  log.info({ email, userId: existing.id }, "updated existing user; password reset");
 } else {
   const [created] = await db
     .insert(users)
     .values({ name, email, passwordHash, active: true })
     .returning();
-  console.log(`Created admin user ${email} (id=${created.id}).`);
+  log.info({ email, userId: created.id }, "created admin user");
 }
 
-console.log(`Credentials: ${email} / ${password}`);
-console.log("The 'admin' role is assigned in memory by server.ts on startup.");
+log.info({ email, password }, "admin credentials");
+log.info("the 'admin' role is assigned in memory by server.ts on startup");

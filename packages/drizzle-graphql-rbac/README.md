@@ -2,7 +2,7 @@
 
 > A batteries-included backend framework that turns a [Drizzle](https://orm.drizzle.team/) schema into a production-ready GraphQL + REST API — complete with authentication, sessions, and Odoo-style role-based access control.
 
-A single `createApp(...)` call stands up an HTTP service with a fully-typed GraphQL CRUD layer, cookie/bearer authentication, an admin sub-app, and a row-level security engine governed by three small TypeScript files. No code generators, no migrations to write for the framework tables, no runtime schema drift.
+A single `createApp(...)` call stands up an HTTP service with a fully-typed GraphQL CRUD layer, cookie/bearer authentication, an admin sub-app, and a row-level security engine governed by three small TypeScript files. RBAC is fully **in-memory** in this build: the engine is constructed synchronously on startup from your code config and there is no RBAC schema to migrate.
 
 ## Highlights
 
@@ -10,13 +10,13 @@ A single `createApp(...)` call stands up an HTTP service with a fully-typed Grap
 - **Automatic relations.** Single-column foreign keys are promoted into forward (`one`) and inverse (`many`) GraphQL fields automatically; explicit Drizzle `relations(...)` declarations take precedence when you need them.
 - **Built-in authentication.** REST `/auth/*` routes (`register`, `login`, `logout`, `me`) with bcrypt-hashed passwords and dual cookie + bearer-token sessions, ready to mount.
 - **Admin sub-app.** REST `/admin/*` endpoints for user management and runtime role-membership changes, gated by the same RBAC engine that protects GraphQL.
-- **Code-defined RBAC, DB-synced.** Roles, access rights, and record rules are declared in TypeScript and reconciled to the database on startup by external id (`xid`) — like Odoo's `xml_id`. Rename a role's key, the row persists; remove an entry, it cascade-deletes.
+- **Code-defined, in-memory RBAC.** Roles, access rights, and record rules are declared in TypeScript and compiled into the engine snapshot at startup — no migrations, no sync routines, no DB drift. User → role assignments live in process memory and can be mutated at runtime via the REST API or the engine handle.
 - **Row-level security with a domain DSL.** Per-role, per-action record rules written in an Odoo-style domain language (`["&", [...], ["|", [...], [...]]]`) are compiled to SQL and AND-injected into every read, update, and delete.
 - **Per-request enforcement wrapper.** `rdbFor(ctx)` returns a Drizzle handle that automatically applies the caller's RBAC envelope to `select`, `insert`, `update`, `delete` — use it in custom routes and they're protected for free.
 - **Multi-role union semantics.** Users may hold any number of roles; grants combine as the union and per-role record rules OR together. Matches Odoo's behavior exactly.
-- **TTL + LRU caching.** Effective roles and per-`(user, resource, action)` enforce results are cached in-process with bounded size; surgical invalidation hooks are exposed.
 - **Composable primitives.** `createApp` is a convenience layer over `buildSchema`, `buildRbac`, `buildRbacDb`, `buildAuthRoutes`, and `buildAdminRoutes` — use them directly when you need a custom pipeline.
 - **Hermetic, no-mocks test suite.** Every subsystem is exercised end-to-end through the generated GraphQL schema against in-memory SQLite.
+- **Pino logger re-exported.** A pre-configured [pino](https://getpino.io/) root is exported as `logger`; framework code uses it via `logger.child({ component: "..." })`. Pretty + colorized via `pino-pretty` on a TTY, JSON otherwise. `LOG_LEVEL` env var controls the active level.
 
 ## At a glance
 
@@ -25,9 +25,9 @@ A single `createApp(...)` call stands up an HTTP service with a fully-typed Grap
 | Transport         | Hono app exposing GraphQL (via `graphql-yoga`) and REST sub-apps; runs on any Web Fetch host. |
 | Database          | Drizzle ORM. SQLite is the reference dialect; the engine only relies on `select()`.         |
 | Auth              | Email + password, bcrypt-hashed, with cookie and `Authorization: Bearer` sessions.          |
-| Authorization     | Code-defined roles, CRUD grants, and row-level rules; cache-backed enforcement.             |
-| Persistence model | Six framework-owned tables: `users`, `sessions`, `roles`, `access_rights`, `record_rules`, `user_roles`. |
-| Runtime mutation  | Only `user_roles` is written at runtime; role catalog and grants are code-only.             |
+| Authorization     | Code-defined roles, CRUD grants, and row-level rules; built synchronously, held in process memory. |
+| Persistence model | Two framework-owned tables: `users` and `sessions`. RBAC is in-memory.                      |
+| Runtime mutation  | Role memberships live in the engine; the role catalog and grants are code-only.             |
 
 A working reference application is available in this monorepo's root (`../../`).
 
@@ -57,12 +57,8 @@ import { sqliteTable, integer, text } from "drizzle-orm/sqlite-core";
 import { sql } from "drizzle-orm";
 import { frameworkTables, users } from "drizzle-graphql-rbac";
 
-export {
-  users, sessions, roles, accessRights, recordRules, userRoles,
-} from "drizzle-graphql-rbac";
-export type {
-  User, Session, UserRole, Role, AccessRight, RecordRule,
-} from "drizzle-graphql-rbac";
+export { users, sessions } from "drizzle-graphql-rbac";
+export type { User, NewUser, Session } from "drizzle-graphql-rbac";
 
 export const todos = sqliteTable("todos", {
   id: integer("id").primaryKey({ autoIncrement: true }),
@@ -76,21 +72,19 @@ sqlite.pragma("foreign_keys = ON");
 export const db = drizzle(sqlite, { schema: { ...frameworkTables, todos } });
 ```
 
-The framework owns six tables: `users`, `sessions`, `roles`, `access_rights`, `record_rules`, `user_roles`. The last four are written by `syncRbacFromCode` on server start to mirror your code config — see below. Only `user_roles` is touched at runtime by the admin dashboard.
+The framework owns two tables: `users` and `sessions`. RBAC is fully in-memory.
 
 ### 3. Define your RBAC config
 
-Three files. Each entry carries an `xid` ("external id", like Odoo's `xml_id`) that anchors its identity in the DB across rebuilds — rename a role's key, the row stays; remove an xid, its row gets cascade-deleted on next sync.
-
-The framework provides one role for free: `admin` (full bypass via `isAdmin: true`, xid `dgr.role.admin`). `createApp` merges it into your config automatically — **do not redeclare `admin`** or any xid that starts with the reserved `dgr.` prefix.
+Three files. The framework provides one role for free: `admin` (full bypass via `isAdmin: true`). `createApp` merges it into your config automatically — **do not redeclare `admin`**.
 
 ```ts
 // src/roles.ts
 import { defineRoles } from "drizzle-graphql-rbac";
 export const roles = defineRoles({
   // 'admin' is provided by the framework — don't add it here.
-  user: { xid: "app.role.user" },
-  demo: { xid: "app.role.demo" },
+  user: {},
+  demo: {},
 });
 ```
 
@@ -99,10 +93,7 @@ export const roles = defineRoles({
 import { defineAccessRights } from "drizzle-graphql-rbac";
 export const accessRights = defineAccessRights({
   demo: {
-    todos: {
-      xid: "app.ar.demo.todos",
-      create: true, read: true, update: true, delete: true,
-    },
+    todos: { create: true, read: true, update: true, delete: true },
   },
 });
 ```
@@ -114,9 +105,9 @@ const own = [["assigneeId", "=", "current_user.id"]];
 export const recordRules = defineRecordRules({
   demo: {
     todos: {
-      read:   { xid: "app.rr.demo.todos.read",   domain: own },
-      update: { xid: "app.rr.demo.todos.update", domain: own },
-      delete: { xid: "app.rr.demo.todos.delete", domain: own },
+      read:   { domain: own },
+      update: { domain: own },
+      delete: { domain: own },
     },
   },
 });
@@ -133,22 +124,25 @@ import { roles } from "./roles.js";
 import { accessRights } from "./accessRights.js";
 import { recordRules } from "./recordRules.js";
 
-const { app } = createApp({
+const { app, rbac } = createApp({
   db: schema.db,
   schema,
   rbac: { roles, accessRights, recordRules },
 });
 
+// Seed memberships in memory — re-run on every restart since RBAC is not persisted.
+rbac.assignRole(/* adminUserId */ 1, "admin");
+
 serve({ fetch: app.fetch, port: 3000 });
 ```
 
-That's the whole server. GraphiQL is at `/graphql`, REST auth at `/auth/*`, admin at `/admin/*`. The RBAC config sync runs in the background (via `queueMicrotask`) right after `serve(...)` starts listening — `createApp` returns immediately. Tests can `await app.rbacReady` if they need the snapshot loaded before issuing requests.
+That's the whole server. GraphiQL is at `/graphql`, REST auth at `/auth/*`, admin at `/admin/*`. The RBAC engine is constructed synchronously inside `createApp` — there is nothing to await.
 
 ---
 
 ## Defining roles
 
-`defineRoles` takes an object whose **keys** are short role names used in code, and whose **values** carry the metadata: a stable `xid` and an optional `isAdmin` flag. The framework already supplies an `admin` role — your file only declares the roles your app needs.
+`defineRoles` takes an object whose **keys** are short role names used in code, and whose **values** carry the metadata (currently just an optional `isAdmin` flag). The framework already supplies an `admin` role — your file only declares the roles your app needs.
 
 ```ts
 // src/roles.ts
@@ -156,13 +150,13 @@ import { defineRoles } from "drizzle-graphql-rbac";
 
 export const roles = defineRoles({
   /** Logged-in user with no special powers — the default for new sign-ups. */
-  user: { xid: "app.role.user" },
+  user: {},
 
   /** Sees and edits todos in their team. */
-  manager: { xid: "app.role.manager" },
+  manager: {},
 
   /** Read-only auditor — useful for compliance reviews. */
-  auditor: { xid: "app.role.auditor" },
+  auditor: {},
 });
 
 export type RoleKey = keyof typeof roles;
@@ -170,29 +164,22 @@ export type RoleKey = keyof typeof roles;
 
 | Field     | Effect                                                                                      |
 |-----------|---------------------------------------------------------------------------------------------|
-| `xid`     | **Required.** Stable external id (like Odoo's `xml_id`). Anchors the DB row across rebuilds. Convention: `<app>.role.<name>`. Renaming the role key keeps the row; removing the entry cascade-deletes it (and its access-rights / record-rules / `user_roles` rows). |
 | `isAdmin` | Optional. Members bypass every RBAC check. The framework already provides one — you should rarely need a second. |
 
-There is **no inheritance** — each role's grants stand alone. If `manager` should also have what `user` has, restate those grants under `manager`, or assign both roles to the user via `user_roles`.
+There is **no inheritance** — each role's grants stand alone. If `manager` should also have what `user` has, restate those grants under `manager`, or assign both roles to the user.
 
-> Users hold roles via the `user_roles` table (FK to `roles.id`). The admin dashboard manages assignments at runtime; the role catalog itself is code-only.
+> Users hold roles via the engine's in-memory membership map. The admin REST endpoints manage assignments at runtime; the role catalog itself is code-only.
 
 ### Framework-owned `admin` role
 
-`createApp` automatically merges in `admin` (`isAdmin: true`, xid `dgr.role.admin`). App authors should not:
-
-- declare a role with key `"admin"`, or
-- use any xid starting with the reserved `dgr.` prefix.
-
-`mergeFrameworkRbac` throws on either collision so the mistake surfaces on startup.
+`createApp` automatically merges in `admin` (`isAdmin: true`). App authors should not declare a role with key `"admin"` — `mergeFrameworkRbac` throws on collision.
 
 If you're calling `buildRbac` directly (lower-level than `createApp`) and want the framework admin, opt in:
 
 ```ts
-import { mergeFrameworkRbac } from "drizzle-graphql-rbac";
+import { mergeFrameworkRbac, buildRbac } from "drizzle-graphql-rbac";
 
-const cfg = mergeFrameworkRbac({ roles, accessRights, recordRules });
-const rbac = buildRbac(db, schema, cfg);
+const rbac = buildRbac(mergeFrameworkRbac({ roles, accessRights, recordRules }));
 ```
 
 ### What admins should not be
@@ -212,7 +199,6 @@ import { defineAccessRights } from "drizzle-graphql-rbac";
 export const accessRights = defineAccessRights({
   user: {
     todos: {
-      xid: "app.ar.user.todos",
       read: true,
       create: true,
       update: true,
@@ -221,19 +207,13 @@ export const accessRights = defineAccessRights({
   },
 
   manager: {
-    todos: {
-      xid: "app.ar.manager.todos",
-      read: true, create: true, update: true, delete: true,
-    },
-    users: {
-      xid: "app.ar.manager.users",
-      read: true, // managers can browse the user directory
-    },
+    todos: { read: true, create: true, update: true, delete: true },
+    users: { read: true }, // managers can browse the user directory
   },
 
   auditor: {
-    todos: { xid: "app.ar.auditor.todos", read: true },
-    users: { xid: "app.ar.auditor.users", read: true },
+    todos: { read: true },
+    users: { read: true },
   },
 });
 ```
@@ -244,7 +224,6 @@ export const accessRights = defineAccessRights({
 defineAccessRights({
   [roleKey]: {
     [resourceJsKey]: {
-      xid:     string,    // required, globally unique
       create?: boolean,   // missing = false
       read?:   boolean,
       update?: boolean,
@@ -254,9 +233,8 @@ defineAccessRights({
 });
 ```
 
-- **`roleKey`** must match a key from `defineRoles({...})` (or the framework's `admin`). `mergeFrameworkRbac` / `buildRbacConfig` throws on unknown role refs.
+- **`roleKey`** must match a key from `defineRoles({...})` (or the framework's `admin`). `buildRbacConfig` throws on unknown role refs.
 - **`resourceJsKey`** is the **JS export name** of the Drizzle table (e.g. `todos`, `users`) — not the SQL table name. The auto-generated GraphQL CRUD uses the same key, so the names line up by construction.
-- **`xid` convention**: `<app>.ar.<role>.<resource>`. Stays stable even if you rename the role key.
 
 ### Deny by default
 
@@ -264,11 +242,11 @@ If no role the user holds grants `(resource, action)`, the engine throws `FORBID
 
 ### How grants combine
 
-A user with **multiple roles** gets the **union** of their grants. So a user in both `auditor` (read-only) and `manager` (full CRUD) has full CRUD on `todos`.
+A user with **multiple roles** gets the **union** of their grants. A user in both `auditor` (read-only) and `manager` (full CRUD) has full CRUD on `todos`.
 
 ### Resources the framework owns
 
-The auto-generated GraphQL CRUD applies to every table in your schema namespace, including the framework tables (`users`, `sessions`, `roles`, `access_rights`, `record_rules`, `user_roles`). If you don't want clients reading `sessions` over GraphQL, simply don't grant `sessions.read` to any role (the default) — admin tooling can use the unwrapped `rdb.raw` handle.
+The auto-generated GraphQL CRUD applies to every table in your schema namespace, including the framework tables (`users`, `sessions`). If you don't want clients reading `sessions` over GraphQL, simply don't grant `sessions.read` to any role (the default) — admin tooling can use the unwrapped `rdb.raw` handle.
 
 ---
 
@@ -287,23 +265,15 @@ export const recordRules = defineRecordRules({
   user: {
     todos: {
       // 'user' can read every todo, but only update or delete their own.
-      update: { xid: "app.rr.user.todos.update", domain: own },
-      delete: { xid: "app.rr.user.todos.delete", domain: own },
+      update: { domain: own },
+      delete: { domain: own },
     },
   },
 
   manager: {
     todos: {
-      // Managers see and edit todos in their team; the team id is stamped
-      // onto each row at insert time.
-      read: {
-        xid: "app.rr.manager.todos.read",
-        domain: [["teamId", "=", "current_user.teamId"]],
-      },
-      update: {
-        xid: "app.rr.manager.todos.update",
-        domain: [["teamId", "=", "current_user.teamId"]],
-      },
+      read:   { domain: [["teamId", "=", "current_user.teamId"]] },
+      update: { domain: [["teamId", "=", "current_user.teamId"]] },
     },
   },
 
@@ -311,7 +281,6 @@ export const recordRules = defineRecordRules({
     todos: {
       // Auditors see only published, non-archived todos.
       read: {
-        xid: "app.rr.auditor.todos.read",
         domain: ["&", ["state", "=", "published"], ["archived", "=", false]],
       },
     },
@@ -325,20 +294,17 @@ export const recordRules = defineRecordRules({
 defineRecordRules({
   [roleKey]: {
     [resourceJsKey]: {
-      read?:   { xid: string, domain: Domain },
-      update?: { xid: string, domain: Domain },
-      delete?: { xid: string, domain: Domain },
-      create?: { xid: string, domain: Domain }, // ACL-only on insert; create
-                                                // domains are accepted but
-                                                // not currently enforced by
-                                                // the auto-CRUD layer.
+      read?:   { domain: Domain },
+      update?: { domain: Domain },
+      delete?: { domain: Domain },
+      create?: { domain: Domain }, // ACL-only on insert; create domains are
+                                   // accepted but not enforced by the
+                                   // auto-CRUD layer.
     },
   },
 });
 ```
 
-- **`xid` convention**: `<app>.rr.<role>.<resource>.<action>`.
-- The DB enforces one rule per `(role, resource, action)` via a unique index — the entry above replaces, not stacks.
 - A role that **grants** an action with **no rule** on it gets unrestricted access. So the `user` example above lets `user` *read* every todo (no rule) but only *update / delete* their own (rule per action).
 
 ### Domain syntax
@@ -394,13 +360,13 @@ The engine injects `{ "current_user.id": ctx.user?.id ?? null }` before evaluati
 const own = [["assigneeId", "=", "current_user.id"]];
 ```
 
-Anonymous callers get `null`, which makes equality against the placeholder match no rows — the safe default. To add more placeholders (e.g. `current_user.teamId` from a custom user shape), wrap `enforce` yourself; see "Going off the rails" below.
+Anonymous callers get `null`, which makes equality against the placeholder match no rows — the safe default. To add more placeholders (e.g. `current_user.teamId` from a custom user shape), wrap `enforce` yourself.
 
 ### How rules combine across roles
 
-If a user holds **multiple roles** that all grant the same action, their per-role rules **OR** together — holding *any* qualifying role is enough. So a user with both `manager` (sees their team's todos) and `auditor` (sees published todos) sees the union: their team's todos *or* any published todo.
+If a user holds **multiple roles** that all grant the same action, their per-role rules **OR** together — holding *any* qualifying role is enough. A user with both `manager` (sees their team's todos) and `auditor` (sees published todos) sees the union: their team's todos *or* any published todo.
 
-A granting role with **no rule** on `(resource, action)` is unrestricted on that grant — and unrestricted ORed with anything is still unrestricted. So mixing a role with no rule and a role with a rule yields no row filter at all (matches Odoo).
+A granting role with **no rule** on `(resource, action)` is unrestricted on that grant — and unrestricted ORed with anything is still unrestricted. Mixing a role with no rule and a role with a rule yields no row filter at all (matches Odoo).
 
 ### Putting it together (worked example)
 
@@ -415,13 +381,11 @@ Given the three files above, a request from a user holding only `user`:
 | `mutation insertIntoTodos(...)`       | Granted (`create: true`).                                          |
 | `query { users { id } }`              | `FORBIDDEN` — `user` has no grant on `users`.                      |
 
-A granting role with no rule on `(resource, action)` grants unrestricted access. Mixing such a role with a rule-bearing role yields unrestricted access — same as Odoo: "no rule" means "no row restriction".
-
 ---
 
-## Managing role membership at runtime
+## Managing role membership
 
-Roles themselves are immutable from the dashboard, but membership is fully dynamic. The framework mounts these REST endpoints under `/admin/*`:
+Memberships live in the engine. The REST API for the admin dashboard:
 
 | Method | Path                          | Body            | Returns                          |
 |--------|-------------------------------|-----------------|----------------------------------|
@@ -432,23 +396,29 @@ Roles themselves are immutable from the dashboard, but membership is fully dynam
 
 - All endpoints require an authenticated session.
 - `GET` requires the caller to have `users.read`; `POST` / `DELETE` require `users.update`.
-- Posting a `roleKey` that doesn't match any synced row in the `roles` table returns 400.
-- Membership changes invalidate the RBAC cache for the affected user, so the next request sees the new set.
+- Posting a `roleKey` that isn't defined in the code config returns 400.
 
-There is no endpoint for creating or deleting roles. To change what a role can do, edit `roles.ts` / `accessRights.ts` / `recordRules.ts` and redeploy — `syncRbacFromCode` reconciles the DB on next start. Removed roles cascade-delete their `user_roles` / AR / RR rows.
+Programmatically, use the engine handle returned by `createApp`:
+
+```ts
+const { rbac } = createApp({ ... });
+rbac.assignRole(userId, "manager");
+rbac.revokeRole(userId, "auditor");
+rbac.listUserRoles(userId);  // ["manager"]
+rbac.listRoleKeys();         // every role known to the engine, sorted
+rbac.hasRole("ghost");       // false
+```
+
+> Because memberships are in-memory, they reset to empty on every restart. Seed your bootstrap admin (and any well-known accounts) explicitly after `createApp` returns — e.g. look up users by email and call `rbac.assignRole(id, "admin")`.
+
+There is no endpoint for creating or deleting roles. To change what a role can do, edit `roles.ts` / `accessRights.ts` / `recordRules.ts` and redeploy.
 
 ---
 
 ## What you get from `createApp`
 
 ```ts
-const {
-  app,
-  rdbFor,
-  invalidateRbacUser,
-  clearRbacCache,
-  rbacReady, // Promise<void> — resolves once the background sync + snapshot load is done
-} = createApp({
+const { app, rbac, rdbFor } = createApp({
   db,
   schema,
   rbac: { roles, accessRights, recordRules },
@@ -461,15 +431,12 @@ const {
   publicDir:           "./public", // null to disable static serving
   graphqlEndpoint:     "/graphql",
   logger:              true,        // boolean | (msg, ...rest) => void
-  rbacCache:           { cacheTtlMs: 30 * 60 * 1000 },
 });
 ```
 
 - `app` — a Hono app. Pass `app.fetch` to `@hono/node-server`'s `serve`, or to any Web Fetch host.
+- `rbac` — the engine handle. Use it to seed memberships at startup and read/mutate them at runtime: `assignRole`, `revokeRole`, `listUserRoles`, `listRoleKeys`, `hasRole`, `enforce`.
 - `rdbFor(ctx)` — per-request RBAC-bound Drizzle wrapper. Use it in custom routes so they're enforced just like the auto-CRUD.
-- `invalidateRbacUser(userId)` — drop one user's cached roles + enforce results.
-- `clearRbacCache()` — drop everything.
-- `rbacReady` — resolves when the background sync + snapshot load finishes. The server starts listening immediately; the very first requests may be denied (deny-all default) until the sync completes (usually a few ms against SQLite). Awaiting is optional but useful in tests.
 
 ### Per-request RBAC db
 
@@ -500,29 +467,18 @@ The wrapper supports `select`, `update`, `delete`, `insert` and forwards `where`
 ```ts
 import {
   buildSchema,            // GraphQL CRUD generator
-  buildRbac,              // RBAC engine
+  buildRbac,              // RBAC engine (in-memory)
   buildRbacDb,            // per-request Drizzle wrapper
   buildAuthRoutes,        // /auth/* sub-app
   buildAdminRoutes,       // /admin/* sub-app
   sessionMiddleware,
+  mergeFrameworkRbac,
   defineRoles,
   defineAccessRights,
   defineRecordRules,
 } from "drizzle-graphql-rbac";
 
-const rbac = buildRbac(
-  db,
-  {
-    roles: schema.roles,
-    accessRights: schema.accessRights,
-    recordRules: schema.recordRules,
-    userRoles: schema.userRoles,
-  },
-  { roles, accessRights, recordRules },
-);
-
-// Run the sync against the DB and load the snapshot before serving traffic.
-await rbac.sync();
+const rbac = buildRbac(mergeFrameworkRbac({ roles, accessRights, recordRules }));
 
 const { schema: gqlSchema } = buildSchema(db, schema, {
   rbac: { enforce: rbac.enforce },
@@ -532,70 +488,97 @@ const { schema: gqlSchema } = buildSchema(db, schema, {
 const rdbFor = buildRbacDb({ db, schema, enforce: rbac.enforce });
 ```
 
-`buildRbac` returns `{ enforce, invalidateUser, clearCache, sync, refreshSnapshot, getSnapshot }`. You can also call `syncRbacFromCode` and `loadRbacSnapshot` directly (e.g. in seed scripts) — see `src/graphql/rbac/sync.ts`.
-
-You can write a custom `enforce` if you want extra placeholders, multi-tenancy filters, or audit logging — it just needs to return `Promise<{ where?: SQL }>` (and throw `GraphQLError` with `extensions.code = "FORBIDDEN"` to deny). See `src/graphql/rbac/rbac.ts` for the reference implementation.
+`buildRbac` returns `{ enforce, listRoleKeys, listUserRoles, assignRole, revokeRole, hasRole }`. You can write a custom `enforce` if you want extra placeholders, multi-tenancy filters, or audit logging — it just needs to return `Promise<{ where?: SQL }>` (and throw `GraphQLError` with `extensions.code = "FORBIDDEN"` to deny). See `src/graphql/rbac/rbac.ts` for the reference implementation.
 
 ---
 
-## Caching
+## Logging
 
-`buildRbac` keeps two TTL+LRU caches per process:
+The framework uses [pino](https://getpino.io/) and exports a pre-configured root logger. Use it directly or construct your own — there's no custom wrapper.
 
-- Effective roles per user — the role keys held + the `isAdmin` flag.
-- Per-`(userId, resource, action)` enforce result — either the SQL fragment or a `__forbidden` marker carrying the deny message.
+```ts
+import { logger } from "drizzle-graphql-rbac";
 
-Both share one TTL. Defaults are `cacheTtlMs: 0` for direct `buildRbac` callers (off — every request hits the DB) and `30 * 60 * 1000` for `createApp` (30-minute TTL with bounded size). Pass `rbacCache: { cacheTtlMs: 0 }` to disable, or call `invalidateRbacUser(id)` after any out-of-band change to a user's `user_roles` rows.
+const log = logger.child({ component: "billing" });
+log.info({ invoiceId: 42, customerId: 7 }, "invoice issued");
+log.warn({ attempt: 3 }, "retrying");
+```
 
-The admin role-membership endpoints already invalidate the affected user. Custom code that writes to `user_roles` directly should do the same.
+### Configuration
+
+Set the active level with either a CLI flag or an env var. Precedence: `--log-level` > `LOG_LEVEL` > default `info`. Pino's six levels apply (plus `silent`): `trace`, `debug`, `info`, `warn`, `error`, `fatal`.
+
+```bash
+# CLI flag (both forms supported)
+node app.js --log-level=debug
+node app.js --log-level debug
+
+# Env var
+LOG_LEVEL=debug node app.js
+```
+
+Unknown values fall back silently to `info`.
+
+When stdout is a TTY (and `NO_COLOR` is unset), output is rendered via `pino-pretty` with colorized levels and an ISO timestamp; otherwise pino emits newline-delimited JSON.
+
+### Framework-emitted components
+
+`createApp` writes through the same root logger:
+
+| Component            | When                                                           |
+|----------------------|----------------------------------------------------------------|
+| `framework.app`      | `debug` line when the app is composed.                         |
+| `framework.app.http` | Hono request log — 4xx → `warn`, 5xx → `error`, else `info`.   |
+
+Pass `logger: false` to `createApp` to silence the HTTP middleware, or `logger: (msg, ...rest) => {...}` to fully override the sink.
+
+### Bridging Drizzle's query logger
+
+Drizzle's `logger: true` option writes raw SQL via `console.log`. To keep everything flowing through pino, pass a small adapter instead:
+
+```ts
+import { drizzle } from "drizzle-orm/better-sqlite3";
+import { logger } from "drizzle-graphql-rbac";
+
+const dbLog = logger.child({ component: "app.db" });
+
+export const db = drizzle(sqlite, {
+  schema,
+  logger: {
+    logQuery: (query, params) => dbLog.debug({ query, params }, "drizzle query"),
+  },
+});
+```
+
+SQL then respects `LOG_LEVEL` and emits as structured JSON (or pretty in a TTY) alongside the rest of your logs.
+
+### Want a different setup?
+
+Construct your own pino root (custom transport, redact, etc.) and pass child loggers around in your app. The framework's own logging will keep using its own root, but you're not forced into ours.
 
 ---
 
 ## DB bootstrap
 
-The framework owns six tables (`users`, `sessions`, `roles`, `access_rights`, `record_rules`, `user_roles`), but `drizzle-kit` cannot load this package's TS-only entry point in CJS mode, so its `push` / `generate` commands fail. Two reliable paths:
-
-1. **One-shot CREATE** — run a small script (see the reference app's `src/scripts/init-db.ts`) that issues `CREATE TABLE IF NOT EXISTS` for the six framework tables plus your app tables. Idempotent and works in production. The runtime sync routine fills `roles` / `access_rights` / `record_rules` from the code config.
-2. **Hand-written migrations** — once you publish a built dist of this package, `drizzle-kit` will resolve it normally and the standard `db:generate` / `db:migrate` flow works.
-
-RBAC schema reference:
+The framework owns just two tables — `users` and `sessions`. A small `CREATE TABLE IF NOT EXISTS` script is sufficient; see the reference app's `src/scripts/init-db.ts`. Once you publish a built dist of this package, the standard `drizzle-kit` `db:generate` / `db:migrate` flow works as well.
 
 ```sql
-CREATE TABLE roles (
-  id        INTEGER PRIMARY KEY AUTOINCREMENT,
-  xid       TEXT    NOT NULL UNIQUE,
-  key       TEXT    NOT NULL UNIQUE,
-  is_admin  INTEGER NOT NULL DEFAULT 0
+CREATE TABLE users (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  name          TEXT    NOT NULL,
+  email         TEXT    NOT NULL UNIQUE,
+  password_hash TEXT    NOT NULL,
+  active        INTEGER NOT NULL DEFAULT 1,
+  created_at    TEXT    NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
-CREATE TABLE access_rights (
-  id          INTEGER PRIMARY KEY AUTOINCREMENT,
-  xid         TEXT    NOT NULL UNIQUE,
-  role_id     INTEGER NOT NULL REFERENCES roles(id),
-  resource    TEXT    NOT NULL,
-  can_create  INTEGER NOT NULL DEFAULT 0,
-  can_read    INTEGER NOT NULL DEFAULT 0,
-  can_update  INTEGER NOT NULL DEFAULT 0,
-  can_delete  INTEGER NOT NULL DEFAULT 0
+CREATE TABLE sessions (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  token      TEXT    NOT NULL UNIQUE,
+  user_id    INTEGER NOT NULL REFERENCES users(id),
+  created_at TEXT    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  expires_at TEXT    NOT NULL
 );
-CREATE UNIQUE INDEX ar_role_resource_uniq ON access_rights(role_id, resource);
-CREATE TABLE record_rules (
-  id        INTEGER PRIMARY KEY AUTOINCREMENT,
-  xid       TEXT    NOT NULL UNIQUE,
-  role_id   INTEGER NOT NULL REFERENCES roles(id),
-  resource  TEXT    NOT NULL,
-  action    TEXT    NOT NULL,
-  domain    TEXT    NOT NULL  -- JSON-encoded domain
-);
-CREATE UNIQUE INDEX rr_role_res_act_uniq ON record_rules(role_id, resource, action);
-CREATE TABLE user_roles (
-  id       INTEGER PRIMARY KEY AUTOINCREMENT,
-  user_id  INTEGER NOT NULL REFERENCES users(id),
-  role_id  INTEGER NOT NULL REFERENCES roles(id)
-);
-CREATE UNIQUE INDEX ur_user_role_uniq ON user_roles(user_id, role_id);
 ```
-
-The sync routine matches code entries to DB rows by `xid`. Renaming a role's `key` keeps the row; removing the entry from code cascade-deletes its `user_roles` / AR / RR rows on the next sync.
 
 ---
 
@@ -605,17 +588,16 @@ The sync routine matches code entries to DB rows by `xid`. Renaming a role's `ke
 |----------------------------------------|--------------------------------------------------------------------------|
 | `src/index.ts`                         | Public surface — re-exports everything below.                            |
 | `src/app.ts`                           | `createApp` composition root.                                            |
-| `src/tables.ts`                        | Drizzle definitions for `users`, `sessions`, `roles`, `access_rights`, `record_rules`, `user_roles`. |
+| `src/tables.ts`                        | Drizzle definitions for `users` and `sessions`.                          |
 | `src/auth/`                            | `/auth/*` REST sub-app, session primitives, Hono middleware.             |
 | `src/admin/`                           | `/admin/*` REST sub-app (user CRUD + role membership).                   |
 | `src/graphql/builder/`                 | Schema generator: types, root fields, where/orderBy translation.         |
 | `src/graphql/relations.ts`             | Relation introspection (explicit + auto-promoted single-column FK).      |
 | `src/graphql/rbac/config.ts`           | `defineRoles` / `defineAccessRights` / `defineRecordRules` + validation. |
-| `src/graphql/rbac/rbac.ts`             | The `enforce` engine + snapshot accessors.                               |
-| `src/graphql/rbac/sync.ts`             | DB ↔ code reconciliation by `xid` + snapshot loader.                     |
+| `src/graphql/rbac/rbac.ts`             | In-memory engine: snapshot, membership API, `enforce`.                   |
 | `src/graphql/rbac/rbacDb.ts`           | Per-request Drizzle proxy that auto-runs `enforce`.                      |
-| `src/graphql/rbac/cache.ts`            | TTL+LRU caches for effective roles and enforce results.                  |
 | `src/graphql/domain/`                  | Odoo-style domain parser + SQL translator.                               |
+| `src/logger.ts`                        | Pino root logger (pretty on TTY, JSON otherwise) re-exported from the package.  |
 
 Each subdirectory has its own README that goes deeper.
 

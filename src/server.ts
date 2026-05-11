@@ -1,10 +1,12 @@
 import { serve } from "@hono/node-server";
 import { inArray } from "drizzle-orm";
-import { createApp } from "drizzle-graphql-rbac";
+import { createApp, logger } from "drizzle-graphql-rbac";
 import * as schema from "./db.js";
 import { roles } from "./roles.js";
 import { accessRights } from "./accessRights.js";
 import { recordRules } from "./recordRules.js";
+
+const log = logger.child({ component: "app.server" });
 
 const { app, rbac } = createApp({
   db: schema.db,
@@ -28,11 +30,14 @@ if (bootstrapEmails.length) {
     .where(inArray(schema.users.email, bootstrapEmails));
   for (const { id, email } of rows) {
     for (const key of bootstrap[email] ?? []) {
-      if (rbac.hasRole(key)) rbac.assignRole(id, key);
+      if (rbac.hasRole(key)) {
+        rbac.assignRole(id, key);
+        log.debug({ userId: id, email, role: key }, "seeded role");
+      }
     }
   }
 }
 const port = Number(process.env.PORT ?? 3000);
 serve({ fetch: app.fetch, port });
-console.log(`Server running on http://localhost:${port}`);
-console.log(`GraphiQL at http://localhost:${port}/graphql`);
+log.info({ url: `http://localhost:${port}` }, "server started");
+log.info({ url: `http://localhost:${port}/graphql` }, "graphiql ready");

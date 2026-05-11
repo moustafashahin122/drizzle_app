@@ -24,6 +24,40 @@ npm run dev
 - App: `http://localhost:3000`
 - GraphiQL explorer: `http://localhost:3000/graphql`
 
+## Logging
+
+Logging uses [pino](https://getpino.io/) via the shared `logger` exported from `drizzle-graphql-rbac`. Six levels — `trace`, `debug`, `info`, `warn`, `error`, `fatal` (plus `silent`).
+
+Pick a level in either of two ways (CLI flag wins over env, env wins over the `info` default):
+
+```bash
+# CLI flag — remember the `--` so npm forwards the arg to the script
+npm run dev   -- --log-level=debug
+npm start     -- --log-level warn
+npx tsx src/server.ts --log-level=trace
+
+# Env var
+LOG_LEVEL=debug npm run dev
+LOG_LEVEL=warn  npm start
+```
+
+Unknown levels fall back to `info`.
+
+Output is colorized via `pino-pretty` when stdout is a TTY, and newline-delimited JSON otherwise. Set `NO_COLOR=1` to force JSON in a TTY.
+
+Components emitted by this app:
+
+| Component        | When                                                              |
+|------------------|-------------------------------------------------------------------|
+| `app.server`     | Startup and in-memory role seeding.                               |
+| `app.db`         | Drizzle SQL queries (bridged into pino at `debug`).               |
+| `app.seed.admin` | `npm run seed:admin` output.                                      |
+| `app.seed.demo`  | `npx tsx src/scripts/seed-demo.ts` output.                        |
+
+Framework components: `framework.app`, `framework.app.http` (see `packages/drizzle-graphql-rbac/README.md`).
+
+To see SQL traces, run with `LOG_LEVEL=debug`. The Drizzle `logger` option in `src/db.ts` forwards `logQuery(query, params)` to the shared pino root — there is no separate `console.log` path.
+
 ## Database migrations
 
 Drizzle Kit drives both the schema (`src/db.ts`) and the SQLite file (`todo.db`, configured in `drizzle.config.ts`). Two workflows are supported:
