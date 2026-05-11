@@ -2,7 +2,7 @@ import { describe, it, before } from "node:test";
 import assert from "node:assert/strict";
 import Database from "better-sqlite3";
 import { drizzle } from "drizzle-orm/better-sqlite3";
-import { graphql, type GraphQLSchema } from "graphql";
+import { graphql, type GraphQLSchema, type GraphQLInputObjectType, type GraphQLObjectType } from "graphql";
 import { integer, sqliteTable, text } from "drizzle-orm/sqlite-core";
 import { sql } from "drizzle-orm";
 
@@ -334,6 +334,139 @@ describe("buildSchema — relation batching", () => {
     assert.deepEqual(
       data.todos.map((t: any) => [t.title, t.assigneeId.name]),
       [["t1","A"],["t2","B"],["t3","C"],["t4","D"]],
+    );
+  });
+});
+
+describe("buildSchema — hiddenInputColumns", () => {
+  // Use a small users-like table to exercise the option without disturbing
+  // the shared `db`/`schema` setup above.
+  const users = sqliteTable("users", {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    name: text("name").notNull(),
+    email: text("email").notNull(),
+    passwordHash: text("password_hash").notNull(),
+  });
+
+  function freshDb() {
+    const sqlite = new Database(":memory:");
+    sqlite.exec(`
+      CREATE TABLE users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        email TEXT NOT NULL,
+        password_hash TEXT NOT NULL
+      );
+    `);
+    return drizzle(sqlite);
+  }
+
+  // Table-driven: covers Insert/Update presence/absence of hidden columns + the
+  // "default (option omitted): all columns appear" baseline in one place. Each
+  // row is its own subtest so a single failing case names itself in the report.
+  it("hidden-input column presence per (inputType, field, expectPresent)", async (t) => {
+    const cases: Array<{
+      configHidden: { users: string[] } | undefined;
+      inputType: "UsersInsert" | "UsersUpdate";
+      field: "passwordHash" | "email" | "name";
+      expectPresent: boolean;
+    }> = [
+      { configHidden: { users: ["passwordHash"] }, inputType: "UsersInsert", field: "passwordHash", expectPresent: false },
+      { configHidden: { users: ["passwordHash"] }, inputType: "UsersUpdate", field: "passwordHash", expectPresent: false },
+      // Non-hidden columns must still appear on the same input types.
+      { configHidden: { users: ["passwordHash"] }, inputType: "UsersInsert", field: "email", expectPresent: true },
+      { configHidden: { users: ["passwordHash"] }, inputType: "UsersUpdate", field: "name", expectPresent: true },
+      // Default (option omitted): every column appears on Insert.
+      { configHidden: undefined, inputType: "UsersInsert", field: "passwordHash", expectPresent: true },
+    ];
+    for (const c of cases) {
+      const label = `${c.inputType}/${c.field}/hidden=${!c.expectPresent}`;
+      await t.test(label, () => {
+        const opts = c.configHidden ? { hiddenInputColumns: c.configHidden } : undefined;
+        const s = buildSchema(freshDb(), { users }, opts).schema;
+        const t0 = s.getType(c.inputType) as GraphQLInputObjectType;
+        const field = t0.getFields()[c.field];
+        if (c.expectPresent) {
+          assert.ok(field, `${c.field} must be present on ${c.inputType}`);
+        } else {
+          assert.equal(field, undefined, `${c.field} must NOT be present on ${c.inputType}`);
+        }
+      });
+    }
+  });
+
+  it("does not affect the output object type (independent from hiddenOutputColumns)", () => {
+    // Hide `name` from inputs only — confirm it stays on the Users output.
+    const s = buildSchema(freshDb(), { users }, {
+      hiddenInputColumns: { users: ["name"] },
+    }).schema;
+    const usersOut = s.getType("Users") as GraphQLObjectType;
+    const outFields = usersOut.getFields();
+    assert.ok(outFields.name, "Users output type must still expose `name`");
+    assert.ok(outFields.passwordHash, "Users output type must still expose `passwordHash`");
+    const insertType = s.getType("UsersInsert") as GraphQLInputObjectType;
+    assert.equal(insertType.getFields().name, undefined);
+  });
+});
+
+describe("buildSchema — maxListLimit clamp", () => {
+  function dbWithRows(n: number) {
+    const sqlite = new Database(":memory:");
+    sqlite.exec(`
+      CREATE TABLE assignees (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, email TEXT NOT NULL);
+    `);
+    const stmt = sqlite.prepare("INSERT INTO assignees (name, email) VALUES (?, ?)");
+    for (let i = 0; i < n; i++) stmt.run(`u${i}`, `u${i}@x`);
+    return drizzle(sqlite);
+  }
+
+  // Table-driven: the three clamp behaviours share an identical "build schema
+  // with cap=5, seed 10 rows, run list query" flow — only the query's `limit`
+  // argument varies. `queryLimit: null` means omit `limit` from the query.
+  it("clamp behaviour per (configCap, queryLimit, expectedRows)", async (t) => {
+    const cases: Array<{ configCap: number; queryLimit: number | null; expected: number }> = [
+      { configCap: 5, queryLimit: 100, expected: 5 }, // over cap → clamped
+      { configCap: 5, queryLimit: 3, expected: 3 },   // under cap respected
+      { configCap: 5, queryLimit: null, expected: 5 }, // omitted → defaults to cap
+    ];
+    for (const c of cases) {
+      const label = `cap=${c.configCap}/limit=${c.queryLimit ?? "omitted"}→${c.expected}`;
+      await t.test(label, async () => {
+        const s = buildSchema(dbWithRows(10), { assignees }, { maxListLimit: c.configCap }).schema;
+        const source =
+          c.queryLimit === null
+            ? `{ assignees { id } }`
+            : `{ assignees(limit: ${c.queryLimit}) { id } }`;
+        const result = await graphql({ schema: s, source });
+        assert.equal(result.errors, undefined, "clamping must be silent — no errors");
+        const data: any = result.data;
+        assert.equal(data.assignees.length, c.expected);
+      });
+    }
+  });
+
+  it("default cap is 200 when maxListLimit is unspecified", async () => {
+    // Strengthened: pin not just cardinality but the first/last identities so a
+    // regression that returns 200 *random* rows (e.g. accidental ORDER BY drop)
+    // fails here.
+    const s = buildSchema(dbWithRows(250), { assignees }).schema;
+    const result = await graphql({
+      schema: s,
+      source: `{ assignees(orderBy: { id: ASC }, limit: 1000) { id name } }`,
+    });
+    assert.equal(result.errors, undefined);
+    const data: any = result.data;
+    assert.equal(data.assignees.length, 200);
+    // Use loose equality on `id` — the builder maps the PK to GraphQL's `ID`
+    // scalar which is serialized as a string. The point of these asserts is
+    // identity + ordering, not scalar shape.
+    assert.equal(String(data.assignees[0].id), "1");
+    assert.equal(data.assignees[0].name, "u0", "first row should be the first seeded row");
+    assert.equal(String(data.assignees[199].id), "200");
+    assert.equal(
+      data.assignees[199].name,
+      "u199",
+      "200th row should be the 200th seeded row — proves we got the FIRST 200, not a random 200",
     );
   });
 });

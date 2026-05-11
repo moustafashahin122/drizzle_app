@@ -34,6 +34,7 @@
  */
 import { Hono } from "hono";
 import { logger as honoLogger } from "hono/logger";
+import { bodyLimit } from "hono/body-limit";
 import { createYoga } from "graphql-yoga";
 import { NoSchemaIntrospectionCustomRule } from "graphql/validation";
 import { buildSchema, type BuildSchemaOptions } from "./graphql/builder/builder.js";
@@ -44,7 +45,7 @@ import { mergeFrameworkRbac } from "./frameworkRbac.js";
 import { buildRbacDb, type RbacDb } from "./graphql/rbac/rbacDb.js";
 import { buildAuthRoutes } from "./auth/routes.js";
 import { buildAdminRoutes } from "./admin/routes.js";
-import { sessionMiddleware, type AuthEnv } from "./auth/middleware.js";
+import { sessionMiddleware, csrfProtection, type AuthEnv } from "./auth/middleware.js";
 import type { SudoDb, SessionSchema } from "./auth/session.js";
 import { logger } from "./logger.js";
 import type {
@@ -84,9 +85,19 @@ export interface CreateAppOptions {
   rbac: RbacConfig;
   /**
    * Forwarded to {@link buildSchema}. Use this to hide sensitive output
-   * columns; defaults to hiding `users.passwordHash`.
+   * columns; defaults to hiding `users.passwordHash` and `sessions.token`.
    */
   hiddenOutputColumns?: BuildSchemaOptions["hiddenOutputColumns"];
+  /**
+   * Forwarded to {@link buildSchema}. Use this to hide sensitive input
+   * columns from the auto-generated `Insert`/`Update` types; defaults to
+   * hiding `users.{passwordHash,id,createdAt}` and `sessions.{token,userId}`.
+   * The `users` defaults are mass-assignment defense-in-depth: even if a
+   * future role gets `users.update`, callers can't forge `id` or rewrite
+   * `createdAt`. `email` and `active` remain settable because admin needs
+   * them. A caller-supplied value replaces the default entirely (no merge).
+   */
+  hiddenInputColumns?: BuildSchemaOptions["hiddenInputColumns"];
   /** Forwarded to {@link buildSchema} — name overrides for generated types. */
   typeNames?: BuildSchemaOptions["typeNames"];
   /** Forwarded to {@link buildSchema} — bespoke Query fields. */
@@ -139,6 +150,15 @@ export interface CreateAppOptions {
    * @default true
    */
   graphqlRequireAuth?: boolean;
+  /**
+   * Maximum number of rows a single list/relation query is allowed to return.
+   * Caps `args.limit` server-side — a client request with a larger value
+   * (or no limit at all) is clamped silently to this cap. Defends against
+   * unbounded data dumps and pathological resolver fan-out.
+   *
+   * @default 200
+   */
+  maxListLimit?: number;
 }
 
 export interface CreatedApp {
@@ -172,7 +192,8 @@ export function createApp(opts: CreateAppOptions): CreatedApp {
     db,
     schema,
     rbac: rbacConfig,
-    hiddenOutputColumns = { users: ["passwordHash"] },
+    hiddenOutputColumns = { users: ["passwordHash"], sessions: ["token"] },
+    hiddenInputColumns = { users: ["passwordHash"], sessions: ["token", "userId"] },
     typeNames,
     extraQueryFields,
     extraMutationFields,
@@ -182,6 +203,7 @@ export function createApp(opts: CreateAppOptions): CreatedApp {
     graphqlMaxDepth = 10,
     graphqlAllowIntrospection = process.env.NODE_ENV !== "production",
     graphqlRequireAuth = true,
+    maxListLimit = 200,
   } = opts;
   const loggingEnabled = loggerOpt !== false;
   const log = logger.child({ component: "framework.app" });
@@ -198,10 +220,12 @@ export function createApp(opts: CreateAppOptions): CreatedApp {
 
   const { schema: gqlSchema } = buildSchema(db, schema, {
     hiddenOutputColumns,
+    hiddenInputColumns,
     typeNames,
     extraQueryFields,
     extraMutationFields,
     rbac: { enforce: rbac.enforce },
+    maxListLimit,
   });
 
   const rdbFor = buildRbacDb({ db, schema, enforce: rbac.enforce });
@@ -288,6 +312,7 @@ export function createApp(opts: CreateAppOptions): CreatedApp {
   );
 
   app.use(graphqlEndpoint, sessionMiddleware(db, sessionSchema));
+  app.use(graphqlEndpoint, csrfProtection);
   app.all(graphqlEndpoint, async (c) => {
     if (graphqlRequireAuth && !c.get("user")) {
       // Reject anonymous traffic before query parsing — closes the parser as

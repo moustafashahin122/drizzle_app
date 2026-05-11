@@ -27,7 +27,7 @@ import type { User, users as usersTableType } from "../tables.js";
 import type { RbacDb } from "../graphql/rbac/rbacDb.js";
 import type { BuiltRbac } from "../graphql/rbac/rbac.js";
 import type { ColumnMap } from "../graphql/builder/filters.js";
-import { csrfProtection, requireAuth, sessionMiddleware, type AuthEnv } from "../auth/middleware.js";
+import { csrfProtection, requireAuth, requireAdmin, sessionMiddleware, type AuthEnv } from "../auth/middleware.js";
 import type { SudoDb, SessionSchema } from "../auth/session.js";
 
 function publicUser(user: User): Omit<User, "passwordHash"> {
@@ -66,11 +66,16 @@ export function buildAdminRoutes(deps: AdminRoutesDeps) {
   app.use("*", sessionMiddleware(db, schema));
   app.use("*", csrfProtection);
   app.use("*", requireAuth);
+  // Every /admin route is admin-only. The per-endpoint `users` permission
+  // checks below are kept as defense-in-depth, but this top-level gate is the
+  // policy: no non-admin role gets access to the admin sub-app, regardless of
+  // what RBAC grants they may have on `users`.
+  app.use("*", requireAdmin((userId) => rbac.isAdmin(userId)));
 
   const rdbForReq = (c: any): RbacDb =>
     rdbFor({ user: c.get("user"), batch: new Map() });
 
-  const requirePerm = (c: any, action: "read" | "update") =>
+  const requirePerm = (c: any, action: "read" | "update" | "delete") =>
     rbac.enforce(
       { user: c.get("user"), batch: new Map() },
       "users",
@@ -143,6 +148,9 @@ export function buildAdminRoutes(deps: AdminRoutesDeps) {
         .where(eq(usersTable.id, id))
         .returning();
       if (!rows.length) return c.json({ error: "Not found" }, 404);
+      if (set.passwordHash) {
+        await db.delete(schema.sessions).where(eq(schema.sessions.userId, id));
+      }
       return c.json({ user: publicUser(rows[0]) });
     } catch (err: any) {
       if (String(err?.message ?? "").includes("UNIQUE")) {
@@ -158,6 +166,13 @@ export function buildAdminRoutes(deps: AdminRoutesDeps) {
     if (!Number.isFinite(id)) return c.json({ error: "Invalid id" }, 400);
 
     try {
+      // Pre-flight the RBAC check so the sudo session-delete below cannot run
+      // for a caller who would have been denied the user-delete (otherwise we'd
+      // give unauthorized callers a free way to invalidate any user's sessions).
+      await requirePerm(c, "delete");
+      // Sessions must go first — `sessions.user_id` has a FK to `users.id`, so
+      // with `foreign_keys=ON` the user delete fails while children exist.
+      await db.delete(schema.sessions).where(eq(schema.sessions.userId, id));
       const rdb = rdbForReq(c);
       const rows: User[] = await rdb
         .delete(usersTable)
@@ -216,6 +231,11 @@ export function buildAdminRoutes(deps: AdminRoutesDeps) {
       if (!rbac.hasRole(roleKey)) {
         return c.json({ error: `Unknown role '${roleKey}'` }, 400);
       }
+      const callerUser = c.get("user")!;
+      const callerIsAdmin = rbac.listUserRoles(callerUser.id).includes("admin");
+      if (roleKey === "admin" && !callerIsAdmin) {
+        return c.json({ error: "Only admins can grant the admin role" }, 403);
+      }
       const [target] = await db
         .select()
         .from(usersTable)
@@ -239,6 +259,11 @@ export function buildAdminRoutes(deps: AdminRoutesDeps) {
       await requirePerm(c, "update");
       if (!rbac.hasRole(roleKey)) {
         return c.json({ error: `Unknown role '${roleKey}'` }, 400);
+      }
+      const callerUser = c.get("user")!;
+      const callerIsAdmin = rbac.listUserRoles(callerUser.id).includes("admin");
+      if (roleKey === "admin" && !callerIsAdmin) {
+        return c.json({ error: "Only admins can grant the admin role" }, 403);
       }
       const [target] = await db
         .select()

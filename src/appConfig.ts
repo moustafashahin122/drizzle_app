@@ -17,7 +17,7 @@ import { recordRules } from "./recordRules.js";
 export const appConfig = {
   schema,
   rbac: { roles, accessRights, recordRules },
-  hiddenOutputColumns: { users: ["passwordHash"] },
+  hiddenOutputColumns: { users: ["passwordHash"], sessions: ["token"] },
   publicDir: "./public",
 } as const;
 

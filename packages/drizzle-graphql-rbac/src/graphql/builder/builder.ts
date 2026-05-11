@@ -95,6 +95,14 @@ export interface BuildSchemaOptions {
    */
   hiddenOutputColumns?: Record<string, readonly string[]>;
   /**
+   * Per-table list of column field names to omit from the **input** types
+   * (`<TypeName>Insert` and `<TypeName>Update`). Use for fields that must
+   * never be settable by GraphQL clients, even if RBAC would otherwise
+   * allow the mutation (e.g. `users.passwordHash`, `sessions.token`). The
+   * output type and the OrderBy input are unaffected.
+   */
+  hiddenInputColumns?: Record<string, readonly string[]>;
+  /**
    * Extra root Query fields to merge into the schema. Receives the map of
    * generated object types keyed by JS schema key, so callers can compose
    * payloads that reference auto-generated types (e.g. an `AuthPayload` that
@@ -147,6 +155,15 @@ export interface BuildSchemaOptions {
    * @default 100
    */
   relationBatchSize?: number;
+  /**
+   * Maximum number of rows a single list/relation query is allowed to return.
+   * Caps `args.limit` server-side — a client request with a larger value
+   * (or no limit at all) is clamped silently to this cap. Defends against
+   * unbounded data dumps and pathological resolver fan-out.
+   *
+   * @default 200
+   */
+  maxListLimit?: number;
 }
 
 /** Capitalize first character of a string. */
@@ -198,12 +215,14 @@ export function buildSchema(
   });
 
   const relationBatchSize = options.relationBatchSize ?? 100;
+  const maxListLimit = options.maxListLimit ?? 200;
 
   // Pass 1: build object types (with relation field thunks) + input types.
   for (const [jsKey, table] of intro.tablesByKey) {
     const sqlName = getTableName(table);
     const typeName = options.typeNames?.[jsKey] ?? cap(jsKey);
     const hiddenOutput = new Set(options.hiddenOutputColumns?.[jsKey] ?? []);
+    const hiddenInput = new Set(options.hiddenInputColumns?.[jsKey] ?? []);
     const meta = buildTableMeta(
       jsKey,
       table,
@@ -213,7 +232,9 @@ export function buildSchema(
       db,
       domainCtxFor,
       hiddenOutput,
+      hiddenInput,
       relationBatchSize,
+      maxListLimit,
     );
     metas.set(sqlName, meta);
   }
@@ -223,7 +244,7 @@ export function buildSchema(
   const mutationFields: GraphQLFieldConfigMap<unknown, unknown> = {};
   const rbac = options.rbac;
   for (const meta of metas.values()) {
-    addRootFields(meta, queryFields, mutationFields, db, domainCtxFor(meta), rbac);
+    addRootFields(meta, queryFields, mutationFields, db, domainCtxFor(meta), rbac, maxListLimit);
   }
 
   if (options.extraQueryFields || options.extraMutationFields) {

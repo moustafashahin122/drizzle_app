@@ -77,3 +77,21 @@ export const requireAuth: MiddlewareHandler<AuthEnv> = async (c, next) => {
   }
   await next();
 };
+
+/**
+ * 403 when the authenticated user does not hold an admin role. Mount AFTER
+ * `requireAuth` — this middleware assumes `c.get("user")` is non-null. The
+ * `isAdmin` predicate is parameterized so the framework's RBAC engine, or any
+ * caller-supplied notion of admin, can be plugged in.
+ */
+export function requireAdmin(
+  isAdmin: (userId: number) => boolean,
+): MiddlewareHandler<AuthEnv> {
+  return async (c, next) => {
+    const user = c.get("user");
+    if (!user || !isAdmin(user.id)) {
+      return c.json({ error: "Admin only" }, 403);
+    }
+    await next();
+  };
+}

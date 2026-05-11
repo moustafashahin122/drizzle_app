@@ -22,6 +22,10 @@ const SESSION_MS = SESSION_DAYS * 86_400_000;
 const SESSION_REFRESH_MS = SESSION_MS / 2;
 export const SESSION_COOKIE_NAME = "sid";
 
+// Env-gated: add `Secure` to auth cookies in production (HTTPS); dev (HTTP) stays unchanged.
+// Computed lazily so tests (and any wrapper that sets NODE_ENV after module load) see the right value.
+const secureSuffix = () => (process.env.NODE_ENV === "production" ? "; Secure" : "");
+
 export interface SessionSchema {
   users: typeof usersTable;
   sessions: typeof sessionsTable;
@@ -39,12 +43,12 @@ export const newExpiresAt = () => new Date(Date.now() + SESSION_MS).toISOString(
 
 /** Build the `Set-Cookie` header value for the session cookie. */
 export function buildSessionCookie(token: string): string {
-  return `${SESSION_COOKIE_NAME}=${token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${SESSION_DAYS * 86400}`;
+  return `${SESSION_COOKIE_NAME}=${token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${SESSION_DAYS * 86400}${secureSuffix()}`;
 }
 
 /** Header value that clears the session cookie (Max-Age=0). */
 export function buildClearSessionCookie(): string {
-  return `${SESSION_COOKIE_NAME}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0`;
+  return `${SESSION_COOKIE_NAME}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0${secureSuffix()}`;
 }
 
 export const CSRF_COOKIE_NAME = "csrf_token";
@@ -52,12 +56,12 @@ export const CSRF_HEADER_NAME = "x-csrf-token";
 
 /** Build a CSRF cookie (NOT HttpOnly so client JS can echo it in a header). */
 export function buildCsrfCookie(token: string): string {
-  return `${CSRF_COOKIE_NAME}=${token}; SameSite=Strict; Path=/; Max-Age=${SESSION_DAYS * 86400}`;
+  return `${CSRF_COOKIE_NAME}=${token}; SameSite=Strict; Path=/; Max-Age=${SESSION_DAYS * 86400}${secureSuffix()}`;
 }
 
 /** Header value that clears the CSRF cookie. */
 export function buildClearCsrfCookie(): string {
-  return `${CSRF_COOKIE_NAME}=; SameSite=Strict; Path=/; Max-Age=0`;
+  return `${CSRF_COOKIE_NAME}=; SameSite=Strict; Path=/; Max-Age=0${secureSuffix()}`;
 }
 
 /** Extract a named cookie value from a Cookie header. */

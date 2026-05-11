@@ -17,8 +17,12 @@ import { users } from "../schema.js";
 const log = logger.child({ component: "app.seed.admin" });
 
 const email = process.env.ADMIN_EMAIL ?? "admin@example.com";
-const password = process.env.ADMIN_PASSWORD ?? "admin123";
+const password = process.env.ADMIN_PASSWORD;
 const name = process.env.ADMIN_NAME ?? "Admin";
+
+if (!password) {
+  throw new Error("ADMIN_PASSWORD env var is required");
+}
 
 const passwordHash = await bcrypt.hash(password, 10);
 
@@ -34,5 +38,5 @@ if (existing) {
   log.info({ email, userId: created.id }, "created admin user");
 }
 
-log.info({ email, password }, "admin credentials");
+log.info({ email }, "admin credentials");
 log.info("the 'admin' role is assigned in memory by server.ts on startup");

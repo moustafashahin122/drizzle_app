@@ -39,6 +39,37 @@ const BCRYPT_ROUNDS = 12;
 // emails too — equalizes timing and frustrates user-enumeration.
 const DUMMY_HASH = bcrypt.hashSync("dummy-password-for-timing", BCRYPT_ROUNDS);
 
+// Naive in-memory limiter — fine for a single-process deploy; replace with a
+// shared store if you horizontally scale.
+const LOGIN_WINDOW_MS = 60_000;
+const LOGIN_MAX_PER_IP_EMAIL = 10;
+const LOGIN_MAX_PER_IP = 30;
+const loginAttemptsByIpEmail = new Map<string, number[]>();
+const loginAttemptsByIp = new Map<string, number[]>();
+
+/** Test-only: clears the in-memory login rate-limit state so tests can run in isolation. */
+export function __resetRateLimitForTests(): void {
+  loginAttemptsByIpEmail.clear();
+  loginAttemptsByIp.clear();
+}
+
+function pruneAndCount(bucket: Map<string, number[]>, key: string, now: number): number {
+  const arr = bucket.get(key);
+  if (!arr) return 0;
+  const cutoff = now - LOGIN_WINDOW_MS;
+  let i = 0;
+  while (i < arr.length && arr[i] < cutoff) i++;
+  if (i > 0) arr.splice(0, i);
+  if (arr.length === 0) bucket.delete(key);
+  return arr.length;
+}
+
+function recordFailure(bucket: Map<string, number[]>, key: string, now: number) {
+  let arr = bucket.get(key);
+  if (!arr) bucket.set(key, (arr = []));
+  arr.push(now);
+}
+
 function newCsrfToken(): string {
   return randomBytes(32).toString("hex");
 }
@@ -105,6 +136,18 @@ export function buildAuthRoutes(deps: AuthRoutesDeps) {
       return c.json({ error: "email and password are required" }, 400);
     }
 
+    const ip =
+      c.req.header("x-forwarded-for")?.split(",")[0]?.trim() ||
+      c.req.header("x-real-ip") ||
+      "unknown";
+    const ipEmailKey = `${ip}|${email.toLowerCase()}`;
+    const now = Date.now();
+    const ipEmailCount = pruneAndCount(loginAttemptsByIpEmail, ipEmailKey, now);
+    const ipCount = pruneAndCount(loginAttemptsByIp, ip, now);
+    if (ipEmailCount >= LOGIN_MAX_PER_IP_EMAIL || ipCount >= LOGIN_MAX_PER_IP) {
+      return c.json({ error: "Too many attempts, try again in a minute" }, 429);
+    }
+
     const [user] = await db
       .select()
       .from(schema.users)
@@ -114,12 +157,20 @@ export function buildAuthRoutes(deps: AuthRoutesDeps) {
       // Compare against a dummy hash so the timing for unknown / inactive
       // emails matches the success path.
       bcrypt.compareSync(password, DUMMY_HASH);
+      recordFailure(loginAttemptsByIpEmail, ipEmailKey, now);
+      recordFailure(loginAttemptsByIp, ip, now);
       return c.json({ error: "Invalid credentials" }, 401);
     }
     const ok = await bcrypt.compare(password, user.passwordHash);
     if (!ok) {
+      recordFailure(loginAttemptsByIpEmail, ipEmailKey, now);
+      recordFailure(loginAttemptsByIp, ip, now);
       return c.json({ error: "Invalid credentials" }, 401);
     }
+
+    // Successful login resets the user's buckets.
+    loginAttemptsByIpEmail.delete(ipEmailKey);
+    loginAttemptsByIp.delete(ip);
 
     const { token } = await issueSession(db, schema, user.id);
     c.header("Set-Cookie", buildSessionCookie(token), { append: true });

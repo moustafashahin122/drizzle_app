@@ -5,12 +5,13 @@ import { drizzle } from "drizzle-orm/better-sqlite3";
 import { sqliteTable, integer, text } from "drizzle-orm/sqlite-core";
 import { sql } from "drizzle-orm";
 
-import { buildAuthRoutes } from "./routes.js";
+import { buildAuthRoutes, __resetRateLimitForTests } from "./routes.js";
 import {
   resolveSessionFromToken,
   parseSessionCookie,
   parseCookieValue,
   CSRF_COOKIE_NAME,
+  SESSION_COOKIE_NAME,
 } from "./session.js";
 
 /** Extract a cookie value by name from a list of Set-Cookie strings. */
@@ -220,5 +221,225 @@ describe("session helpers", () => {
     assert.equal(parseSessionCookie(" foo=1; sid=abc; bar=2 "), "abc");
     assert.equal(parseSessionCookie(""), null);
     assert.equal(parseSessionCookie(null), null);
+  });
+});
+
+describe("auth REST — login rate limiting", () => {
+  // The implementation's per-(IP+email) limit is 10 and per-IP limit is 30.
+  const PER_IP_EMAIL = 10;
+  const PER_IP = 30;
+  const RL_EMAIL = "ratelimit@x.com";
+  const RL_PASSWORD = "rl-secret-123";
+
+  before(async () => {
+    // Register a known user we can drive successful logins against.
+    __resetRateLimitForTests();
+    await call("POST", "/register", {
+      body: { name: "RL", email: RL_EMAIL, password: RL_PASSWORD },
+      headers: { "x-forwarded-for": "10.0.0.99" },
+    });
+  });
+
+  it("locks out after 10 failures for the same (IP, email)", async () => {
+    __resetRateLimitForTests();
+    const ip = "10.0.1.1";
+    for (let i = 0; i < PER_IP_EMAIL; i++) {
+      const r = await call("POST", "/login", {
+        body: { email: RL_EMAIL, password: "WRONG" },
+        headers: { "x-forwarded-for": ip },
+      });
+      assert.equal(r.status, 401, `attempt ${i + 1} should be 401`);
+    }
+    const over = await call("POST", "/login", {
+      body: { email: RL_EMAIL, password: "WRONG" },
+      headers: { "x-forwarded-for": ip },
+    });
+    assert.equal(over.status, 429);
+    // Pin the exact documented envelope so a future refactor can't silently
+    // change the body shape while keeping the 429 status.
+    assert.deepEqual(over.body, { error: "Too many attempts, try again in a minute" });
+
+    // Same email from a DIFFERENT IP within the same window must NOT be
+    // locked out — proves the bucket is keyed on (IP, email), not email alone.
+    const otherIp = await call("POST", "/login", {
+      body: { email: RL_EMAIL, password: "WRONG" },
+      headers: { "x-forwarded-for": "10.0.1.99" },
+    });
+    assert.equal(otherIp.status, 401);
+  });
+
+  it("successful login resets the per-(IP, email) bucket", async () => {
+    __resetRateLimitForTests();
+    const ip = "10.0.1.2";
+    // 9 failures (one shy of the limit).
+    for (let i = 0; i < PER_IP_EMAIL - 1; i++) {
+      const r = await call("POST", "/login", {
+        body: { email: RL_EMAIL, password: "WRONG" },
+        headers: { "x-forwarded-for": ip },
+      });
+      assert.equal(r.status, 401);
+    }
+    // Successful login clears the bucket.
+    const ok = await call("POST", "/login", {
+      body: { email: RL_EMAIL, password: RL_PASSWORD },
+      headers: { "x-forwarded-for": ip },
+    });
+    assert.equal(ok.status, 200);
+    // 10 more failures should all be 401 (proves bucket was reset to 0, not 1).
+    for (let i = 0; i < PER_IP_EMAIL; i++) {
+      const r = await call("POST", "/login", {
+        body: { email: RL_EMAIL, password: "WRONG" },
+        headers: { "x-forwarded-for": ip },
+      });
+      assert.equal(r.status, 401, `post-reset attempt ${i + 1} should be 401`);
+    }
+    // And the 11th post-reset attempt should now trip the limiter — pins the
+    // reset boundary precisely (reset → 0, not → 1 and not "permanently off").
+    const reLock = await call("POST", "/login", {
+      body: { email: RL_EMAIL, password: "WRONG" },
+      headers: { "x-forwarded-for": ip },
+    });
+    assert.equal(reLock.status, 429);
+  });
+
+  it("per-(IP, email) bucket isolates different emails on the same IP", async () => {
+    __resetRateLimitForTests();
+    const ip = "10.0.1.3";
+    const emailA = RL_EMAIL;
+    const emailB = "ratelimit-b@x.com";
+    // Limit-minus-one failures on email A.
+    for (let i = 0; i < PER_IP_EMAIL - 1; i++) {
+      const r = await call("POST", "/login", {
+        body: { email: emailA, password: "WRONG" },
+        headers: { "x-forwarded-for": ip },
+      });
+      assert.equal(r.status, 401);
+    }
+    // A single failure on email B (unknown email) — bucket is independent, expect 401.
+    const b = await call("POST", "/login", {
+      body: { email: emailB, password: "WRONG" },
+      headers: { "x-forwarded-for": ip },
+    });
+    assert.equal(b.status, 401);
+  });
+
+  it("per-IP bucket trips after 30 failures across many emails from one IP", async () => {
+    __resetRateLimitForTests();
+    const ip = "10.0.1.4";
+    // Use 30 distinct emails so the per-(IP, email) bucket never hits its own limit.
+    for (let i = 0; i < PER_IP; i++) {
+      const r = await call("POST", "/login", {
+        body: { email: `noone-${i}@x.com`, password: "WRONG" },
+        headers: { "x-forwarded-for": ip },
+      });
+      assert.equal(r.status, 401, `IP-axis attempt ${i + 1} should be 401`);
+    }
+    // A brand-new email from the same IP should now be rate-limited by the per-IP bucket.
+    const over = await call("POST", "/login", {
+      body: { email: "fresh-email@x.com", password: "WRONG" },
+      headers: { "x-forwarded-for": ip },
+    });
+    assert.equal(over.status, 429);
+    assert.deepEqual(over.body, { error: "Too many attempts, try again in a minute" });
+
+    // A brand-new email + correct password from a DIFFERENT IP must still
+    // succeed in the same window — proves the per-IP lockout is per-IP-scoped,
+    // not a global kill-switch.
+    const otherIp = await call("POST", "/login", {
+      body: { email: RL_EMAIL, password: RL_PASSWORD },
+      headers: { "x-forwarded-for": "10.0.1.49" },
+    });
+    assert.equal(otherIp.status, 200);
+  });
+});
+
+describe("auth cookies — Secure flag is env-gated", () => {
+  const SECURE_EMAIL = "secure-test@x.com";
+  const SECURE_PASSWORD = "sec-secret-123";
+  let prevEnv: string | undefined;
+
+  before(async () => {
+    __resetRateLimitForTests();
+    prevEnv = process.env.NODE_ENV;
+    // Register the user in dev mode so its cookies don't interfere; we re-login per test.
+    process.env.NODE_ENV = "test";
+    await call("POST", "/register", {
+      body: { name: "Sec", email: SECURE_EMAIL, password: SECURE_PASSWORD },
+      headers: { "x-forwarded-for": "10.0.2.99" },
+    });
+    process.env.NODE_ENV = prevEnv;
+  });
+
+  // Match `; Secure` as a complete cookie attribute (preceded by `; `, ended by
+  // `;` or end-of-string) so a stray substring like `Secured` can't false-pass.
+  const SECURE_ATTR = /; Secure(?:;|$)/;
+
+  it("Set-Cookie `; Secure` flag tracks NODE_ENV across login + logout", async (t) => {
+    const cases = [
+      { nodeEnv: "production", flow: "login", ip: "10.0.2.1", expectSecure: true },
+      { nodeEnv: "production", flow: "logout", ip: "10.0.2.3", expectSecure: true },
+      { nodeEnv: "development", flow: "login", ip: "10.0.2.2", expectSecure: false },
+    ] as const;
+
+    for (const c of cases) {
+      await t.test(`NODE_ENV=${c.nodeEnv} flow=${c.flow}`, async () => {
+        const orig = process.env.NODE_ENV;
+        process.env.NODE_ENV = c.nodeEnv;
+        try {
+          __resetRateLimitForTests();
+          const login = await call("POST", "/login", {
+            body: { email: SECURE_EMAIL, password: SECURE_PASSWORD },
+            headers: { "x-forwarded-for": c.ip },
+          });
+          assert.equal(login.status, 200);
+
+          // Pick the cookies under inspection based on the flow. For "login"
+          // it's the freshly-issued sid/csrf cookies; for "logout" it's the
+          // clearing (Max-Age=0) cookies that the /logout response writes.
+          let sidCookie: string | undefined;
+          let csrfCookie: string | undefined;
+          if (c.flow === "login") {
+            sidCookie = login.setCookieList.find((s) =>
+              s.startsWith(`${SESSION_COOKIE_NAME}=`),
+            );
+            csrfCookie = login.setCookieList.find((s) =>
+              s.startsWith(`${CSRF_COOKIE_NAME}=`),
+            );
+          } else {
+            const token = cookieFromList(login.setCookieList, SESSION_COOKIE_NAME)!;
+            const csrf = login.csrf!;
+            const out = await call("POST", "/logout", {
+              headers: {
+                cookie: `${SESSION_COOKIE_NAME}=${token}; ${CSRF_COOKIE_NAME}=${csrf}`,
+                "x-csrf-token": csrf,
+                "x-forwarded-for": c.ip,
+              },
+            });
+            assert.equal(out.status, 200);
+            sidCookie = out.setCookieList.find(
+              (s) => s.startsWith(`${SESSION_COOKIE_NAME}=`) && /Max-Age=0/.test(s),
+            );
+            csrfCookie = out.setCookieList.find(
+              (s) => s.startsWith(`${CSRF_COOKIE_NAME}=`) && /Max-Age=0/.test(s),
+            );
+          }
+          assert.ok(sidCookie, `expected ${c.flow} sid Set-Cookie`);
+          assert.ok(csrfCookie, `expected ${c.flow} csrf Set-Cookie`);
+
+          // Both cookies must flip together — login-set and logout-clear stay
+          // symmetric, because a browser will not clear a `Secure` cookie via
+          // a non-`Secure` clear instruction.
+          if (c.expectSecure) {
+            assert.match(sidCookie!, SECURE_ATTR);
+            assert.match(csrfCookie!, SECURE_ATTR);
+          } else {
+            assert.equal(SECURE_ATTR.test(sidCookie!), false, `sid: ${sidCookie}`);
+            assert.equal(SECURE_ATTR.test(csrfCookie!), false, `csrf: ${csrfCookie}`);
+          }
+        } finally {
+          process.env.NODE_ENV = orig;
+        }
+      });
+    }
   });
 });

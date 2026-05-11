@@ -70,6 +70,7 @@ export function buildRelationField(
   db: DrizzleLike,
   refCtx: DomainContext,
   relationBatchSize: number,
+  maxListLimit: number,
 ): GraphQLFieldConfig<any, any> {
 
   const isMany = rel.kind === "many";
@@ -91,6 +92,13 @@ export function buildRelationField(
       const localCols = rel.fields;
       const refCols = rel.references;
       if (!localCols?.length || !refCols?.length) return isMany ? [] : null;
+
+      // Clamp the caller's limit to the configured cap for many-relations.
+      // `one` relations don't expose a `limit` arg. Copy; don't mutate.
+      if (isMany) {
+        const effectiveLimit = Math.min(args?.limit ?? maxListLimit, maxListLimit);
+        args = { ...(args ?? {}), limit: effectiveLimit };
+      }
 
       const keys: unknown[] = [];
       for (let i = 0; i < refCols.length; i++) {

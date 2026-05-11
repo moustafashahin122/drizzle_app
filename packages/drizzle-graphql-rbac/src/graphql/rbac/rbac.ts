@@ -75,6 +75,8 @@ export interface BuiltRbac {
   revokeRole(userId: number, roleKey: string): boolean;
   /** True iff the engine knows about `roleKey`. */
   hasRole(roleKey: string): boolean;
+  /** True iff the user currently holds any role whose `isAdmin` flag is set. */
+  isAdmin(userId: number): boolean;
 }
 
 interface RoleEntry {
@@ -235,5 +237,6 @@ export function buildRbac(config: RbacConfig): BuiltRbac {
       return true;
     },
     hasRole: (roleKey: string) => rolesByKey.has(roleKey),
+    isAdmin: (userId: number) => rolesForUser(userId).isAdmin,
   };
 }

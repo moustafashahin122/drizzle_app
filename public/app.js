@@ -12,9 +12,13 @@ async function jsonOrError(res) {
 
 /** GraphQL fetch wrapper — used by the todo + admin pages for data queries. */
 export async function gql(query, variables = {}) {
+  const csrf = document.cookie.split("; ").find((c) => c.startsWith("csrf_token="))?.split("=")[1];
   const res = await fetch("/graphql", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      ...(csrf ? { "X-CSRF-Token": csrf } : {}),
+    },
     credentials: "same-origin",
     body: JSON.stringify({ query, variables }),
   });

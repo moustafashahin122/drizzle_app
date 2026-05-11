@@ -46,6 +46,7 @@ export function addRootFields(
   db: DrizzleLike,
   ctx: DomainContext,
   rbac: BuildSchemaOptions["rbac"],
+  maxListLimit: number,
 ) {
   // Resolve once: a function that returns the rbac extra-where for a given
   // request context, or undefined when rbac is disabled / bypassed for this
@@ -56,7 +57,7 @@ export function addRootFields(
         (await rbac.enforce(gqlCtx, meta.jsKey, action, meta.columns)).where
     : null;
 
-  queryFields[meta.jsKey] = buildListQueryField(meta, db, ctx, guard);
+  queryFields[meta.jsKey] = buildListQueryField(meta, db, ctx, guard, maxListLimit);
   queryFields[`${meta.jsKey}Single`] = buildSingleQueryField(meta, db, ctx, guard);
   mutationFields[`insertInto${meta.typeName}`] = buildInsertMutationField(meta, db, guard);
   mutationFields[`update${meta.typeName}`] = buildUpdateMutationField(meta, db, ctx, guard);
@@ -84,6 +85,7 @@ function buildListQueryField(
   db: DrizzleLike,
   ctx: DomainContext,
   guard: Guard,
+  maxListLimit: number,
 ): GraphQLFieldConfig<unknown, unknown> {
   return {
     type: listType(meta),
@@ -92,7 +94,11 @@ function buildListQueryField(
       const extra = guard ? await guard(gqlCtx, "read") : undefined;
       const userWhere = whereDomainToSql(args?.where, meta, ctx, gqlCtx);
       const where = combineWhere(extra, userWhere);
-      return applyListArgs(selectProjected(db, meta, info), args, meta.columns, where);
+      // Clamp the caller's limit to the configured cap to defend against
+      // unbounded data dumps. Copy args; don't mutate the incoming object.
+      const effectiveLimit = Math.min(args?.limit ?? maxListLimit, maxListLimit);
+      const clampedArgs = { ...args, limit: effectiveLimit };
+      return applyListArgs(selectProjected(db, meta, info), clampedArgs, meta.columns, where);
     },
   };
 }

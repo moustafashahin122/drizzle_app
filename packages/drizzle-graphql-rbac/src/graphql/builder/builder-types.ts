@@ -49,6 +49,7 @@ function buildObjectFields(
   domainCtxFor: (m: TableMeta) => DomainContext,
   hiddenOutput: Set<string>,
   relationBatchSize: number,
+  maxListLimit: number,
 ): GraphQLFieldConfigMap<any, any> {
   const fields: GraphQLFieldConfigMap<any, any> = {};
   for (const [name, col] of Object.entries(meta.columns)) {
@@ -67,7 +68,7 @@ function buildObjectFields(
     // Relation field replaces a same-named scalar column on the output type.
     // The scalar FK column remains usable in `set` / Insert / Update inputs
     // (and inside a domain leaf) because they iterate the unchanged column map.
-    fields[rel.fieldName] = buildRelationField(rel, meta, refMeta, db, domainCtxFor(refMeta), relationBatchSize);
+    fields[rel.fieldName] = buildRelationField(rel, meta, refMeta, db, domainCtxFor(refMeta), relationBatchSize, maxListLimit);
   }
   return fields;
 }
@@ -87,7 +88,9 @@ export function buildTableMeta(
   db: DrizzleLike,
   domainCtxFor: (m: TableMeta) => DomainContext,
   hiddenOutput: Set<string>,
+  hiddenInput: Set<string>,
   relationBatchSize: number,
+  maxListLimit: number,
 ): TableMeta {
   const sqlName = getTableName(table);
   const columns = getTableColumns(table) as ColumnMap;
@@ -95,10 +98,10 @@ export function buildTableMeta(
 
   const objectType = new GraphQLObjectType({
     name: typeName,
-    fields: () => buildObjectFields(meta, intro, metas, db, domainCtxFor, hiddenOutput, relationBatchSize),
+    fields: () => buildObjectFields(meta, intro, metas, db, domainCtxFor, hiddenOutput, relationBatchSize, maxListLimit),
   });
-  const insertInput = buildInsertInput(typeName, columns);
-  const updateInput = buildUpdateInput(typeName, columns);
+  const insertInput = buildInsertInput(typeName, columns, hiddenInput);
+  const updateInput = buildUpdateInput(typeName, columns, hiddenInput);
   const orderByInput = buildOrderByInput(typeName, columns);
 
   const meta: TableMeta = {
