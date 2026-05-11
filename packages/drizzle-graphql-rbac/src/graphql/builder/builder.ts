@@ -824,6 +824,11 @@ function buildInsertMutationField(
   db: DrizzleLike,
   guard: Guard,
 ): GraphQLFieldConfig<unknown, unknown> {
+  // Primary-key columns of the table. Used to re-fetch inserted rows for
+  // create-domain post-check. Computed once per schema build.
+  const pkEntries: Array<[string, Column]> = Object.entries(meta.columns).filter(
+    ([, c]) => (c as any).primary,
+  );
   return {
     type: listType(meta),
     args: {
@@ -834,8 +839,77 @@ function buildInsertMutationField(
       },
     },
     resolve: async (_, args, gqlCtx) => {
-      if (guard) await guard(gqlCtx, "create");
-      return db.insert(meta.table).values(args.values).returning();
+      // ACL check (and capture optional create-domain SQL for post-check).
+      const createWhere = guard ? await guard(gqlCtx, "create") : undefined;
+
+      // Fast path: no create-domain (admin bypass, no rules, or rbac disabled).
+      // Behavior unchanged.
+      if (!createWhere) {
+        return db.insert(meta.table).values(args.values).returning();
+      }
+
+      // Need transactional post-check: insert, then verify each row matches the
+      // create-domain by re-selecting through PK + create-domain AND. If any
+      // row fails, the throw rolls the tx back.
+      if (!pkEntries.length) {
+        // No primary key to re-fetch by — refuse rather than silently accept.
+        throw new Error("Insert blocked by record rule");
+      }
+      // Drizzle's `db.transaction(...)` callback dispatch differs by driver:
+      // better-sqlite3 invokes it synchronously and refuses a promise return
+      // value; node-postgres / mysql2 / libsql expect an async callback. We
+      // sniff the dialect to pick the right shape — both code paths do the
+      // same per-row PK + create-domain re-select.
+      const anyDb = db as any;
+      const isSync = anyDb?.dialect?.constructor?.name === "SQLiteSyncDialect";
+      const checkRow = (tx: any, row: any): SQL => {
+        const pkConds: SQL[] = [];
+        for (const [name, col] of pkEntries) {
+          pkConds.push(eq(col, row[name] as any));
+        }
+        const pkSql = pkConds.length === 1 ? pkConds[0] : and(...pkConds)!;
+        return combineWhere(pkSql, createWhere)!;
+      };
+      if (isSync) {
+        return anyDb.transaction((tx: any) => {
+          const inserted: any[] = tx
+            .insert(meta.table)
+            .values(args.values)
+            .returning()
+            .all();
+          for (const row of inserted) {
+            const matchWhere = checkRow(tx, row);
+            const matched: any[] = tx
+              .select()
+              .from(meta.table)
+              .where(matchWhere)
+              .limit(1)
+              .all();
+            if (!matched.length) {
+              throw new Error("Insert blocked by record rule");
+            }
+          }
+          return inserted;
+        });
+      }
+      return await anyDb.transaction(async (tx: any) => {
+        const inserted: any[] = await tx
+          .insert(meta.table)
+          .values(args.values)
+          .returning();
+        for (const row of inserted) {
+          const matchWhere = checkRow(tx, row);
+          const matched: any[] = await tx
+            .select()
+            .from(meta.table)
+            .where(matchWhere)
+            .limit(1);
+          if (!matched.length) {
+            throw new Error("Insert blocked by record rule");
+          }
+        }
+        return inserted;
+      });
     },
   };
 }
@@ -857,6 +931,13 @@ function buildUpdateMutationField(
       const extra = guard ? await guard(gqlCtx, "update") : undefined;
       const userWhere = whereDomainToSql(args?.where, meta, ctx, gqlCtx);
       const combined = combineWhere(extra, userWhere);
+      // `where` is a nullable arg — a missing user filter combined with no
+      // RBAC restriction would otherwise emit an unbounded UPDATE.
+      if (!combined) {
+        throw new Error(
+          "Refusing UPDATE with empty WHERE — RBAC misconfiguration",
+        );
+      }
       return db.update(meta.table).set(args.set).where(combined).returning();
     },
   };
@@ -876,6 +957,12 @@ function buildDeleteMutationField(
       const extra = guard ? await guard(gqlCtx, "delete") : undefined;
       const userWhere = whereDomainToSql(args?.where, meta, ctx, gqlCtx);
       const combined = combineWhere(extra, userWhere);
+      // Same defensive guard as update — refuse an unbounded DELETE.
+      if (!combined) {
+        throw new Error(
+          "Refusing DELETE with empty WHERE — RBAC misconfiguration",
+        );
+      }
       return db.delete(meta.table).where(combined).returning();
     },
   };
