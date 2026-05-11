@@ -29,11 +29,64 @@ import {
   GraphQLInt,
   GraphQLNonNull,
   GraphQLString,
+  type GraphQLInputObjectType,
+  type GraphQLObjectType,
   type GraphQLOutputType,
   type GraphQLInputType,
 } from "graphql";
-import type { Column } from "drizzle-orm";
+import type { Column, SQL } from "drizzle-orm";
+import type { ColumnMap } from "./filters.js";
+import type { ExtractedRelation } from "./relations.js";
 import { GraphQLBigIntStr, GraphQLJSON } from "./scalars.js";
+
+/**
+ * Structural shape of a Drizzle DB instance accepted by the builder.
+ *
+ * Any object exposing the standard Drizzle query builders (`select`, `insert`,
+ * `update`, `delete`) is acceptable — works across SQLite, Postgres, and MySQL
+ * dialects. Mutations rely on `.returning()` being available on the dialect.
+ */
+export interface DrizzleLike {
+  select: (...args: any[]) => any;
+  insert: (...args: any[]) => any;
+  update: (...args: any[]) => any;
+  delete: (...args: any[]) => any;
+}
+
+/**
+ * Internal per-table working set carried between passes of the builder.
+ *
+ * Holds both the Drizzle handles (table reference, columns, primary-key columns)
+ * and the GraphQL types derived from them so that root resolvers and relation
+ * resolvers can refer back to the same constructed types.
+ */
+export interface TableMeta {
+  /** JS export key in the user's schema namespace (also the root query field name). */
+  jsKey: string;
+  /** GraphQL ObjectType name (defaults to `cap(jsKey)`; mutations are named `insertInto<typeName>`, etc.). */
+  typeName: string;
+  /** Drizzle table reference, passed through to query builders. */
+  table: any;
+  /** Map of GraphQL field name → Drizzle Column (the field name equals the Drizzle JS key). */
+  columns: ColumnMap;
+  /** Relations declared on this table (forward + inverse, after introspection). */
+  relations: ExtractedRelation[];
+  objectType: GraphQLObjectType;
+  insertInput: GraphQLInputObjectType;
+  updateInput: GraphQLInputObjectType;
+  orderByInput: GraphQLInputObjectType;
+}
+
+/**
+ * RBAC guard closure resolved once per table — given a GraphQL request context
+ * and the action being performed, returns the optional extra `where` clause to
+ * AND into the resolver's query (or `undefined` when the action is permitted
+ * without a row filter). `null` means RBAC is disabled or this resource is on
+ * the bypass list, so resolvers should skip the call entirely.
+ */
+export type Guard =
+  | ((ctx: any, action: "create" | "read" | "update" | "delete") => Promise<SQL | undefined>)
+  | null;
 
 /**
  * Map a Drizzle column to its base (unwrapped) GraphQL type.

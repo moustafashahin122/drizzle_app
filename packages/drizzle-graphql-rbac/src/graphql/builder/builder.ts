@@ -11,31 +11,29 @@
  *
  * Typical Flow
  * ------------
- * 1. {@link introspectSchema} walks the schema namespace and produces a
- *    {@link SchemaIntrospection}: the set of tables (by SQL name and by JS
+ * 1. `introspectSchema` walks the schema namespace and produces a
+ *    `SchemaIntrospection`: the set of tables (by SQL name and by JS
  *    export key) and a relation map (explicit `relations()` plus auto-detected
  *    single-column FKs, both forward "one" and inverse "many").
- * 2. **Pass 1** — for each table, {@link buildSchema} constructs:
- *      - a {@link GraphQLObjectType} with a *lazy* fields-thunk that mixes
- *        scalar columns and relation fields (so cyclic types resolve through
- *        the same registered object types — this is what enables recursion);
- *      - an `Insert` input ({@link buildInsertInput}) — required = `notNull &&
- *        !hasDefault && !generated`;
- *      - an `Update` input ({@link buildUpdateInput}) — every column optional;
- *      - an `OrderBy` input from {@link buildOrderByInput} in `./filters.js`.
- *        There is no per-table `Where` input — `where` is a single JSON arg
- *        carrying an Odoo-style domain (see "Filtering syntax" below).
- * 3. **Pass 2** — {@link addRootFields} wires per-table root fields onto
+ * 2. **Pass 1** (`./builder-types.ts`) — for each table, construct a
+ *    {@link GraphQLObjectType} with a *lazy* fields-thunk that mixes scalar
+ *    columns and relation fields (so cyclic types resolve through the same
+ *    registered object types — this is what enables recursion), plus
+ *    `Insert` / `Update` / `OrderBy` input types.
+ * 3. **Pass 2** (`./builder-resolvers.ts`) — wire per-table root fields onto
  *    `Query` and `Mutation`:
  *      - `<jsKey>(where?: JSON, orderBy?, limit?, offset?): [<Type>!]!`
  *      - `<jsKey>Single(where?: JSON, orderBy?): <Type>`
  *      - `insertInto<Type>(values: [<Type>Insert!]!): [<Type>!]!`
  *      - `update<Type>(set: <Type>Update!, where?: JSON): [<Type>!]!`
  *      - `deleteFrom<Type>(where?: JSON): [<Type>!]!`
- * 4. Resolvers translate the `where` JSON via
- *    `parseDomain` + `domainToSql` (from `../domain/domain.js`) and call
- *    Drizzle's `db.select()/insert()/update()/delete()` — mutations use
- *    `.returning()` so they emit the affected rows.
+ *    Resolvers translate the `where` JSON via `parseDomain` + `domainToSql`
+ *    (from `../domain/domain.js`) and call Drizzle's
+ *    `db.select()/insert()/update()/delete()` — mutations use `.returning()`
+ *    so they emit the affected rows.
+ * 4. Relation fields (`./builder-relations.ts`) resolve recursively through
+ *    the same registered ObjectType, with a per-request batch cache that
+ *    coalesces sibling lookups into single `WHERE fk IN (...)` queries.
  *
  * Filtering syntax
  * ----------------
@@ -48,17 +46,6 @@
  * GraphQL request context (`gqlCtx.user.id`). Full reference:
  * `../domain/README.md`.
  *
- * Recursive relation resolution
- * -----------------------------
- * Each relation field on a parent {@link GraphQLObjectType} resolves by reading
- * the parent row's local columns and querying the referenced table with `eq()`
- * conditions joined to any `where` the caller passed at the relation site.
- * Because the relation field's `type` references the **same** registered
- * `GraphQLObjectType` for the referenced table, GraphQL execution naturally
- * recurses into nested relations on that type — so e.g. `todos { assigneeId {
- * todos { assigneeId { name } } } }` works out of the box without any extra
- * registration. See {@link buildRelationField}.
- *
  * Notes
  * -----
  * - A relation field with the same name as a scalar column **replaces** that
@@ -67,65 +54,25 @@
  *   and Update inputs (and inside a domain leaf, e.g.
  *   `[["assigneeId", "=", 5]]`) because those iterate the unchanged column
  *   map.
- * - The relation resolver issues one query per relation field per parent row
- *   (no DataLoader batching). Acceptable for small/medium response sizes;
- *   batch externally if needed.
  * - Composite foreign keys are skipped by the auto-FK detector; declare
  *   relations explicitly via Drizzle's `relations(...)` for those.
  */
 import {
-  GraphQLInputObjectType,
-  GraphQLList,
-  GraphQLNonNull,
   GraphQLObjectType,
   GraphQLSchema,
-  GraphQLInt,
-  type GraphQLFieldConfig,
   type GraphQLFieldConfigMap,
-  type GraphQLInputFieldConfigMap,
-  type GraphQLResolveInfo,
-  type SelectionSetNode,
-  type FragmentDefinitionNode,
 } from "graphql";
-import {
-  and,
-  eq,
-  getTableColumns,
-  getTableName,
-  inArray,
-  type Column,
-  type SQL,
-} from "drizzle-orm";
-import {
-  applyListArgs,
-  buildOrderByInput,
-  combineWhere,
-  type ColumnMap,
-} from "./filters.js";
-import { introspectSchema, type ExtractedRelation } from "./relations.js";
-import { columnToBaseType, wrapNonNull } from "./types.js";
-import { jsKeyOf } from "./util.js";
-import {
-  domainToSql,
-  parseDomain,
-  type DomainContext,
-  type DomainPlaceholders,
-} from "../domain/domain.js";
-import { GraphQLJSON } from "./scalars.js";
+import { getTableName } from "drizzle-orm";
+import type { SQL } from "drizzle-orm";
+import type { ColumnMap } from "./filters.js";
+import { introspectSchema } from "./relations.js";
+import { buildTableMeta } from "./builder-types.js";
+import { addRootFields } from "./builder-resolvers.js";
+import type { DomainContext } from "../domain/domain.js";
+import type { DrizzleLike, TableMeta } from "./types.js";
 
-/**
- * Structural shape of a Drizzle DB instance accepted by {@link buildSchema}.
- *
- * Any object exposing the standard Drizzle query builders (`select`, `insert`,
- * `update`, `delete`) is acceptable — works across SQLite, Postgres, and MySQL
- * dialects. Mutations rely on `.returning()` being available on the dialect.
- */
-export interface DrizzleLike {
-  select: (...args: any[]) => any;
-  insert: (...args: any[]) => any;
-  update: (...args: any[]) => any;
-  delete: (...args: any[]) => any;
-}
+export type { DrizzleLike } from "./types.js";
+export type { BatchCache } from "./builder-relations.js";
 
 /**
  * Optional knobs for {@link buildSchema}.
@@ -172,9 +119,9 @@ export interface BuildSchemaOptions {
    * `resource` is the table's JS schema key (the same key used for the
    * `Query.<jsKey>` root field).
    *
-   * Insert resolvers only run the ACL check — record rules on `create` would
-   * require post-insert validation in a transaction, which the auto-CRUD
-   * surface does not yet model. ACLs alone are sufficient for the common case.
+   * Insert resolvers run the ACL check and, when a create-domain is returned,
+   * perform a transactional post-check that re-fetches each inserted row
+   * through `(PK AND createWhere)` and rolls back if any row fails to match.
    */
   rbac?: {
     enforce: (
@@ -194,30 +141,6 @@ export interface BuildSchemaOptions {
 
 /** Capitalize first character of a string. */
 const cap = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
-
-/**
- * Internal per-table working set carried between passes of {@link buildSchema}.
- *
- * Holds both the Drizzle handles (table reference, columns, primary-key columns)
- * and the GraphQL types derived from them so that root resolvers and relation
- * resolvers can refer back to the same constructed types.
- */
-interface TableMeta {
-  /** JS export key in the user's schema namespace (also the root query field name). */
-  jsKey: string;
-  /** GraphQL ObjectType name (defaults to `cap(jsKey)`; mutations are named `insertInto<typeName>`, etc.). */
-  typeName: string;
-  /** Drizzle table reference, passed through to query builders. */
-  table: any;
-  /** Map of GraphQL field name → Drizzle Column (the field name equals the Drizzle JS key). */
-  columns: ColumnMap;
-  /** Relations declared on this table (forward + inverse, after introspection). */
-  relations: ExtractedRelation[];
-  objectType: GraphQLObjectType;
-  insertInput: GraphQLInputObjectType;
-  updateInput: GraphQLInputObjectType;
-  orderByInput: GraphQLInputObjectType;
-}
 
 /**
  * Build a GraphQL schema from a Drizzle DB and a Drizzle schema namespace.
@@ -251,10 +174,10 @@ export function buildSchema(
   const intro = introspectSchema(schema);
   const metas = new Map<string, TableMeta>(); // keyed by SQL table name
 
-  // Shared {@link DomainContext} factory — used by every resolver that
-  // translates a JSON domain so dotted-field relation filters resolve to the
-  // correct referenced table info. Declared before pass 1 so the closures
-  // captured by GraphQL field thunks have a stable reference.
+  // Shared DomainContext factory — used by every resolver that translates a
+  // JSON domain so dotted-field relation filters resolve to the correct
+  // referenced table info. Declared before pass 1 so the closures captured by
+  // GraphQL field thunks have a stable reference.
   const domainCtxFor = (meta: TableMeta): DomainContext => ({
     db,
     relations: meta.relations,
@@ -268,29 +191,17 @@ export function buildSchema(
   for (const [jsKey, table] of intro.tablesByKey) {
     const sqlName = getTableName(table);
     const typeName = options.typeNames?.[jsKey] ?? cap(jsKey);
-    const columns = getTableColumns(table) as ColumnMap;
-    const relations = intro.relations.get(sqlName) ?? [];
-
     const hiddenOutput = new Set(options.hiddenOutputColumns?.[jsKey] ?? []);
-    const objectType = new GraphQLObjectType({
-      name: typeName,
-      fields: () => buildObjectFields(meta, intro, metas, db, domainCtxFor, hiddenOutput),
-    });
-    const insertInput = buildInsertInput(typeName, columns);
-    const updateInput = buildUpdateInput(typeName, columns);
-    const orderByInput = buildOrderByInput(typeName, columns);
-
-    const meta: TableMeta = {
+    const meta = buildTableMeta(
       jsKey,
-      typeName,
       table,
-      columns,
-      relations,
-      objectType,
-      insertInput,
-      updateInput,
-      orderByInput,
-    };
+      typeName,
+      intro,
+      metas,
+      db,
+      domainCtxFor,
+      hiddenOutput,
+    );
     metas.set(sqlName, meta);
   }
 
@@ -316,654 +227,5 @@ export function buildSchema(
         ? new GraphQLObjectType({ name: "Mutation", fields: mutationFields })
         : undefined,
     }),
-  };
-}
-
-/**
- * Build the `<TypeName>Insert` input. Each field is required iff the column is
- * `notNull` AND has no default AND is not generated — defaults are passed
- * through to the database when the field is omitted at the GraphQL layer.
- */
-function buildInsertInput(typeName: string, columns: ColumnMap): GraphQLInputObjectType {
-  return new GraphQLInputObjectType({
-    name: `${typeName}Insert`,
-    fields: () => {
-      const fields: GraphQLInputFieldConfigMap = {};
-      for (const [name, col] of Object.entries(columns)) {
-        const c: any = col;
-        const required = c.notNull && !c.hasDefault && !(c as any).generated;
-        const base = columnToBaseType(col);
-        fields[name] = { type: wrapNonNull(base, required) };
-      }
-      return fields;
-    },
-  });
-}
-
-/**
- * Build the `<TypeName>Update` input. Every column field is optional so callers
- * can pass partial updates; only provided fields are sent to `db.update().set()`.
- */
-function buildUpdateInput(typeName: string, columns: ColumnMap): GraphQLInputObjectType {
-  return new GraphQLInputObjectType({
-    name: `${typeName}Update`,
-    fields: () => {
-      const fields: GraphQLInputFieldConfigMap = {};
-      for (const [name, col] of Object.entries(columns)) {
-        fields[name] = { type: columnToBaseType(col) };
-      }
-      return fields;
-    },
-  });
-}
-
-/**
- * Lazy fields-thunk used by every per-table {@link GraphQLObjectType}.
- *
- * Emits one field per scalar column (default resolver reads from the source
- * row), then overlays relation fields. A relation field with the same name as
- * a scalar column **replaces** the scalar on the output type (the scalar value
- * is still reachable through `where` / `set` / Insert / Update inputs).
- *
- * Called via the GraphQL `fields: () => ...` thunk so that referenced object
- * types created in the same pass can be referenced before they are fully
- * registered — this is what enables cyclic relation types and recursive
- * traversal.
- */
-function buildObjectFields(
-  meta: TableMeta,
-  intro: ReturnType<typeof introspectSchema>,
-  metas: Map<string, TableMeta>,
-  db: DrizzleLike,
-  domainCtxFor: (m: TableMeta) => DomainContext,
-  hiddenOutput: Set<string>,
-): GraphQLFieldConfigMap<any, any> {
-  const fields: GraphQLFieldConfigMap<any, any> = {};
-  for (const [name, col] of Object.entries(meta.columns)) {
-    if (hiddenOutput.has(name)) continue;
-    fields[name] = {
-      type: wrapNonNull(columnToBaseType(col), (col as any).notNull),
-      resolve: (src) => src?.[name],
-    };
-  }
-
-  const sqlName = getTableName(meta.table);
-  const rels = intro.relations.get(sqlName) ?? [];
-  for (const rel of rels) {
-    const refMeta = metas.get(getTableName(rel.referencedTable));
-    if (!refMeta) continue;
-    // Relation field replaces a same-named scalar column on the output type.
-    // The scalar FK column remains usable in `set` / Insert / Update inputs
-    // (and inside a domain leaf) because they iterate the unchanged column map.
-    fields[rel.fieldName] = buildRelationField(rel, meta, refMeta, db, domainCtxFor(refMeta));
-  }
-  return fields;
-}
-
-/**
- * Default placeholder map for resolver-supplied domains. Pulls
- * `current_user.id` off the GraphQL request context so callers can write
- * domain rules that mirror RBAC conventions.
- */
-function placeholdersFor(gqlCtx: any): DomainPlaceholders {
-  return { "current_user.id": gqlCtx?.user?.id ?? null };
-}
-
-/**
- * Walk a selection set (resolving fragment spreads + inline fragments) and
- * collect the underlying field names the client asked for. Aliases are
- * ignored — we want the source field name to map back to a column / relation.
- */
-function collectRequestedFieldNames(
-  selectionSet: SelectionSetNode,
-  fragments: Record<string, FragmentDefinitionNode>,
-  out: Set<string>,
-): void {
-  for (const sel of selectionSet.selections) {
-    if (sel.kind === "Field") {
-      const name = sel.name.value;
-      if (!name.startsWith("__")) out.add(name);
-    } else if (sel.kind === "InlineFragment") {
-      if (sel.selectionSet) collectRequestedFieldNames(sel.selectionSet, fragments, out);
-    } else if (sel.kind === "FragmentSpread") {
-      const frag = fragments[sel.name.value];
-      if (frag) collectRequestedFieldNames(frag.selectionSet, fragments, out);
-    }
-  }
-}
-
-/**
- * Derive a Drizzle `select()` projection from a GraphQL selection set on
- * `meta`'s object type, so the SQL only fetches columns the client actually
- * needs. Always retains:
- *  - primary-key columns (needed for dedup / dataloader bucketing / inverse
- *    relations that target the PK);
- *  - the local FK columns of any requested relation field (the relation
- *    resolver reads them off the parent row at traversal time).
- *
- * Returns `undefined` (caller falls back to selecting all columns) when no
- * usable selection set is available — e.g. when called from a context where
- * `info` was not threaded through.
- */
-function projectionForSelection(
-  meta: TableMeta,
-  info: GraphQLResolveInfo | undefined,
-): Record<string, Column> | undefined {
-  if (!info) return undefined;
-  const requested = new Set<string>();
-  for (const fn of info.fieldNodes) {
-    if (fn.selectionSet) {
-      collectRequestedFieldNames(fn.selectionSet, info.fragments ?? {}, requested);
-    }
-  }
-  if (!requested.size) return undefined;
-
-  const proj: Record<string, Column> = {};
-  // Primary key columns are unconditionally projected.
-  for (const [k, c] of Object.entries(meta.columns)) {
-    if ((c as any).primary) proj[k] = c;
-  }
-
-  const relByName = new Map(meta.relations.map((r) => [r.fieldName, r]));
-
-  for (const f of requested) {
-    const col = meta.columns[f];
-    if (col) {
-      proj[f] = col;
-      continue;
-    }
-    const rel = relByName.get(f);
-    if (rel?.fields?.length) {
-      // Local-side columns the relation resolver will read off the parent row.
-      // For "one" relations these are the FK columns; for "many" inverse
-      // relations they're the local PK/unique columns (typically already in
-      // the projection via the PK pass above).
-      for (const lc of rel.fields) {
-        const k = jsKeyOf(meta.columns, lc);
-        if (k) proj[k] = lc;
-      }
-    }
-  }
-  return proj;
-}
-
-/** Build a Drizzle SELECT chain projecting only the columns implied by `info`. */
-function selectProjected(
-  db: DrizzleLike,
-  meta: TableMeta,
-  info: GraphQLResolveInfo | undefined,
-): any {
-  const proj = projectionForSelection(meta, info);
-  return proj ? db.select(proj).from(meta.table) : db.select().from(meta.table);
-}
-
-/**
- * Translate the JSON `where` arg on a list/single/update/delete/many-relation
- * resolver into a Drizzle SQL fragment, or `undefined` when no usable where
- * was supplied. Throws a `GraphQLError`-friendly `Error` on malformed domains.
- */
-function whereDomainToSql(
-  rawWhere: unknown,
-  meta: TableMeta,
-  ctx: DomainContext,
-  gqlCtx: any,
-): SQL | undefined {
-  if (rawWhere == null) return undefined;
-  if (!Array.isArray(rawWhere)) {
-    throw new Error("where must be a JSON Odoo-style domain array");
-  }
-  return domainToSql(parseDomain(rawWhere), meta.columns, placeholdersFor(gqlCtx), ctx);
-}
-
-/**
- * Build a relation field config for a parent table.
- *
- * "one" relations resolve to the single referenced row (or `null`); "many"
- * relations resolve to a non-null list and accept their own `where`,
- * `orderBy`, `limit`, `offset` arguments — composable with any conditions
- * implied by the parent row's local key. Both kinds resolve recursively
- * because the field's GraphQL type is the same registered ObjectType used at
- * the root, so nested selections traverse through {@link buildObjectFields}
- * again.
- *
- * Local/foreign columns come from the {@link ExtractedRelation} — populated
- * by {@link introspectSchema} from explicit `relations(...)` declarations,
- * auto-detected inline FKs (forward and inverse), or back-fill from a paired
- * `one`/`many` declaration. If a relation reaches this resolver without
- * resolved columns, it means the schema can't actually express the join, and
- * the field returns `null` / `[]` rather than guessing.
- */
-function buildRelationField(
-  rel: ExtractedRelation,
-  parentMeta: TableMeta,
-  refMeta: TableMeta,
-  db: DrizzleLike,
-  refCtx: DomainContext,
-): GraphQLFieldConfig<any, any> {
-
-  const isMany = rel.kind === "many";
-  const baseType = isMany
-    ? new GraphQLNonNull(new GraphQLList(new GraphQLNonNull(refMeta.objectType)))
-    : refMeta.objectType;
-
-  return {
-    type: baseType,
-    args: isMany
-      ? {
-          where: { type: GraphQLJSON },
-          orderBy: { type: refMeta.orderByInput },
-          limit: { type: GraphQLInt },
-          offset: { type: GraphQLInt },
-        }
-      : undefined,
-    resolve: async (parent, args, context, info) => {
-      const localCols = rel.fields;
-      const refCols = rel.references;
-      if (!localCols?.length || !refCols?.length) return isMany ? [] : null;
-
-      const keys: unknown[] = [];
-      for (let i = 0; i < refCols.length; i++) {
-        const localKey = jsKeyOf(parentMeta.columns, localCols[i]);
-        if (!localKey) return isMany ? [] : null;
-        const v = parent?.[localKey];
-        if (v === undefined || v === null) return isMany ? [] : null;
-        keys.push(v);
-      }
-
-      const userWhere = isMany
-        ? whereDomainToSql(args?.where, refMeta, refCtx, context)
-        : undefined;
-
-      // Batch when (a) we have a per-request cache, (b) the join is single-column,
-      // and (c) we don't need per-parent limit/offset (those can't be expressed
-      // as a single IN-query without window functions / lateral joins).
-      const batch: BatchCache | undefined = context?.batch;
-      const canBatch =
-        !!batch &&
-        refCols.length === 1 &&
-        !(isMany && (args?.limit != null || args?.offset != null));
-
-      if (!canBatch) {
-        const conds: SQL[] = [];
-        for (let i = 0; i < refCols.length; i++) conds.push(eq(refCols[i], keys[i] as any));
-        const joinSql = conds.length === 1 ? conds[0] : and(...conds);
-        const where = combineWhere(joinSql, userWhere);
-        const rows = await applyListArgs(
-          selectProjected(db, refMeta, info),
-          args,
-          refMeta.columns,
-          where,
-        );
-        return isMany ? rows : rows[0] ?? null;
-      }
-
-      // Cache key includes the projected columns so two siblings that select
-      // different subfields don't share a loader (otherwise the second caller
-      // would see a row missing its requested columns).
-      const projection = projectionForSelection(refMeta, info);
-      const projKeys = projection ? Object.keys(projection).sort().join(",") : "*";
-      const cacheKey = `${getTableName(parentMeta.table)}.${rel.fieldName}|${
-        isMany ? "many" : "one"
-      }|${JSON.stringify(args?.where ?? null)}|${JSON.stringify(args?.orderBy ?? null)}|${projKeys}`;
-      let loader = batch!.get(cacheKey) as RelationLoader | undefined;
-      if (!loader) {
-        loader = createRelationLoader(rel, refMeta, db, isMany, args, userWhere, projection);
-        batch!.set(cacheKey, loader);
-      }
-      return loader.load(keys[0]);
-    },
-  };
-}
-
-/**
- * Per-request batch cache. The GraphQL execution layer hands a fresh `Map` (on
- * the context's `batch` field) to each request; relation resolvers stash one
- * loader per `(parentTable, relation, args)` key in it so sibling parent rows
- * coalesce their child lookups into a single `WHERE fk IN (...)` query.
- */
-export type BatchCache = Map<string, unknown>;
-
-interface RelationLoader {
-  load(key: unknown): Promise<unknown>;
-}
-
-/**
- * Build a DataLoader-style batched loader for a relation field.
- *
- * Parent resolvers all `await load(key)` synchronously within a tick; the
- * loader queues their keys, then on the next microtask runs a single
- * `SELECT ... WHERE refCol IN (queuedKeys)` query (composed with any caller
- * `where`/`orderBy`), groups rows by `refCol`, and resolves each pending
- * promise with that parent's slice (one row for `one` relations, an array for
- * `many`). All callers sharing the cache key see the same loader, so siblings
- * with identical args coalesce into a single round-trip.
- */
-function createRelationLoader(
-  rel: ExtractedRelation,
-  refMeta: TableMeta,
-  db: DrizzleLike,
-  isMany: boolean,
-  args: any,
-  userWhere: SQL | undefined,
-  projection: Record<string, Column> | undefined,
-): RelationLoader {
-  const refCol = rel.references![0];
-  const refKeyName = jsKeyOf(refMeta.columns, refCol);
-  // Ensure the join column is in the projection — even if the client didn't
-  // request it, the loader needs it to bucket rows back to their parents.
-  let proj = projection;
-  if (proj && refKeyName && !(refKeyName in proj)) {
-    proj = { ...proj, [refKeyName]: refCol };
-  }
-  type Pending = { key: unknown; resolve: (v: unknown) => void; reject: (e: unknown) => void };
-  let queue: Pending[] = [];
-  let scheduled = false;
-
-  const flush = async () => {
-    const pending = queue;
-    queue = [];
-    scheduled = false;
-    try {
-      if (!refKeyName) {
-        for (const p of pending) p.resolve(isMany ? [] : null);
-        return;
-      }
-      const uniqueKeys = Array.from(new Set(pending.map((p) => p.key)));
-      const joinSql = inArray(refCol, uniqueKeys as any[]);
-      const where = combineWhere(joinSql, userWhere);
-      const baseSelect = proj
-        ? db.select(proj).from(refMeta.table as any)
-        : db.select().from(refMeta.table as any);
-      const rows: any[] = await applyListArgs(
-        baseSelect,
-        // limit/offset are dropped at the per-batch level (they were only
-        // safe to apply per-parent, which the canBatch gate already excluded
-        // for `many` relations; for `one` relations args is undefined).
-        args ? { orderBy: args.orderBy } : undefined,
-        refMeta.columns,
-        where,
-      );
-      if (isMany) {
-        const buckets = new Map<unknown, any[]>();
-        for (const row of rows) {
-          const k = row[refKeyName];
-          let arr = buckets.get(k);
-          if (!arr) buckets.set(k, (arr = []));
-          arr.push(row);
-        }
-        for (const p of pending) p.resolve(buckets.get(p.key) ?? []);
-      } else {
-        const byKey = new Map<unknown, any>();
-        for (const row of rows) {
-          const k = row[refKeyName];
-          if (!byKey.has(k)) byKey.set(k, row);
-        }
-        for (const p of pending) p.resolve(byKey.get(p.key) ?? null);
-      }
-    } catch (err) {
-      for (const p of pending) p.reject(err);
-    }
-  };
-
-  return {
-    load(key) {
-      return new Promise((resolve, reject) => {
-        queue.push({ key, resolve, reject });
-        if (!scheduled) {
-          scheduled = true;
-          queueMicrotask(flush);
-        }
-      });
-    },
-  };
-}
-
-/**
- * Attach the standard CRUD root fields for a table to the Query and Mutation
- * field maps:
- *
- * - `Query.<jsKey>(where?, orderBy?, limit?, offset?): [<Type>!]!`
- * - `Query.<jsKey>Single(where?, orderBy?): <Type>` (returns first match or null)
- * - `Mutation.insertInto<TypeName>(values: [<Type>Insert!]!): [<Type>!]!`
- * - `Mutation.update<TypeName>(set: <Type>Update!, where?): [<Type>!]!`
- * - `Mutation.deleteFrom<TypeName>(where?): [<Type>!]!`
- *
- * All mutation resolvers use Drizzle's `.returning()` so the response contains
- * the affected rows directly.
- */
-function addRootFields(
-  meta: TableMeta,
-  queryFields: GraphQLFieldConfigMap<unknown, unknown>,
-  mutationFields: GraphQLFieldConfigMap<unknown, unknown>,
-  db: DrizzleLike,
-  ctx: DomainContext,
-  rbac: BuildSchemaOptions["rbac"],
-) {
-  // Resolve once: a function that returns the rbac extra-where for a given
-  // request context, or undefined when rbac is disabled / bypassed for this
-  // resource.
-  const bypass = rbac?.bypassResources?.has(meta.jsKey);
-  const guard = rbac && !bypass
-    ? async (gqlCtx: any, action: "create" | "read" | "update" | "delete") =>
-        (await rbac.enforce(gqlCtx, meta.jsKey, action, meta.columns)).where
-    : null;
-
-  queryFields[meta.jsKey] = buildListQueryField(meta, db, ctx, guard);
-  queryFields[`${meta.jsKey}Single`] = buildSingleQueryField(meta, db, ctx, guard);
-  mutationFields[`insertInto${meta.typeName}`] = buildInsertMutationField(meta, db, guard);
-  mutationFields[`update${meta.typeName}`] = buildUpdateMutationField(meta, db, ctx, guard);
-  mutationFields[`deleteFrom${meta.typeName}`] = buildDeleteMutationField(meta, db, ctx, guard);
-}
-
-type Guard =
-  | ((ctx: any, action: "create" | "read" | "update" | "delete") => Promise<SQL | undefined>)
-  | null;
-
-/** Non-null list of the table's object type — used as the return type of all list/mutation root fields. */
-function listType(meta: TableMeta) {
-  return new GraphQLNonNull(new GraphQLList(new GraphQLNonNull(meta.objectType)));
-}
-
-/** Standard `(where?, orderBy?, limit?, offset?)` arg map for list queries. */
-function listArgsConfig(meta: TableMeta) {
-  return {
-    where: { type: GraphQLJSON },
-    orderBy: { type: meta.orderByInput },
-    limit: { type: GraphQLInt },
-    offset: { type: GraphQLInt },
-  };
-}
-
-/** `Query.<jsKey>(where?, orderBy?, limit?, offset?)` — paginated list. */
-function buildListQueryField(
-  meta: TableMeta,
-  db: DrizzleLike,
-  ctx: DomainContext,
-  guard: Guard,
-): GraphQLFieldConfig<unknown, unknown> {
-  return {
-    type: listType(meta),
-    args: listArgsConfig(meta),
-    resolve: async (_, args, gqlCtx, info) => {
-      const extra = guard ? await guard(gqlCtx, "read") : undefined;
-      const userWhere = whereDomainToSql(args?.where, meta, ctx, gqlCtx);
-      const where = combineWhere(extra, userWhere);
-      return applyListArgs(selectProjected(db, meta, info), args, meta.columns, where);
-    },
-  };
-}
-
-/** `Query.<jsKey>Single(where?, orderBy?)` — first matching row or null. */
-function buildSingleQueryField(
-  meta: TableMeta,
-  db: DrizzleLike,
-  ctx: DomainContext,
-  guard: Guard,
-): GraphQLFieldConfig<unknown, unknown> {
-  return {
-    type: meta.objectType,
-    args: { where: { type: GraphQLJSON }, orderBy: { type: meta.orderByInput } },
-    resolve: async (_, args, gqlCtx, info) => {
-      const extra = guard ? await guard(gqlCtx, "read") : undefined;
-      const userWhere = whereDomainToSql(args?.where, meta, ctx, gqlCtx);
-      const where = combineWhere(extra, userWhere);
-      const rows = await applyListArgs(
-        selectProjected(db, meta, info),
-        args,
-        meta.columns,
-        where,
-      ).limit(1);
-      return rows[0] ?? null;
-    },
-  };
-}
-
-/** `Mutation.insertInto<TypeName>(values)` — bulk insert, returns inserted rows. */
-function buildInsertMutationField(
-  meta: TableMeta,
-  db: DrizzleLike,
-  guard: Guard,
-): GraphQLFieldConfig<unknown, unknown> {
-  // Primary-key columns of the table. Used to re-fetch inserted rows for
-  // create-domain post-check. Computed once per schema build.
-  const pkEntries: Array<[string, Column]> = Object.entries(meta.columns).filter(
-    ([, c]) => (c as any).primary,
-  );
-  return {
-    type: listType(meta),
-    args: {
-      values: {
-        type: new GraphQLNonNull(
-          new GraphQLList(new GraphQLNonNull(meta.insertInput)),
-        ),
-      },
-    },
-    resolve: async (_, args, gqlCtx) => {
-      // ACL check (and capture optional create-domain SQL for post-check).
-      const createWhere = guard ? await guard(gqlCtx, "create") : undefined;
-
-      // Fast path: no create-domain (admin bypass, no rules, or rbac disabled).
-      // Behavior unchanged.
-      if (!createWhere) {
-        return db.insert(meta.table).values(args.values).returning();
-      }
-
-      // Need transactional post-check: insert, then verify each row matches the
-      // create-domain by re-selecting through PK + create-domain AND. If any
-      // row fails, the throw rolls the tx back.
-      if (!pkEntries.length) {
-        // No primary key to re-fetch by — refuse rather than silently accept.
-        throw new Error("Insert blocked by record rule");
-      }
-      // Drizzle's `db.transaction(...)` callback dispatch differs by driver:
-      // better-sqlite3 invokes it synchronously and refuses a promise return
-      // value; node-postgres / mysql2 / libsql expect an async callback. We
-      // sniff the dialect to pick the right shape — both code paths do the
-      // same per-row PK + create-domain re-select.
-      const anyDb = db as any;
-      const isSync = anyDb?.dialect?.constructor?.name === "SQLiteSyncDialect";
-      const checkRow = (tx: any, row: any): SQL => {
-        const pkConds: SQL[] = [];
-        for (const [name, col] of pkEntries) {
-          pkConds.push(eq(col, row[name] as any));
-        }
-        const pkSql = pkConds.length === 1 ? pkConds[0] : and(...pkConds)!;
-        return combineWhere(pkSql, createWhere)!;
-      };
-      if (isSync) {
-        return anyDb.transaction((tx: any) => {
-          const inserted: any[] = tx
-            .insert(meta.table)
-            .values(args.values)
-            .returning()
-            .all();
-          for (const row of inserted) {
-            const matchWhere = checkRow(tx, row);
-            const matched: any[] = tx
-              .select()
-              .from(meta.table)
-              .where(matchWhere)
-              .limit(1)
-              .all();
-            if (!matched.length) {
-              throw new Error("Insert blocked by record rule");
-            }
-          }
-          return inserted;
-        });
-      }
-      return await anyDb.transaction(async (tx: any) => {
-        const inserted: any[] = await tx
-          .insert(meta.table)
-          .values(args.values)
-          .returning();
-        for (const row of inserted) {
-          const matchWhere = checkRow(tx, row);
-          const matched: any[] = await tx
-            .select()
-            .from(meta.table)
-            .where(matchWhere)
-            .limit(1);
-          if (!matched.length) {
-            throw new Error("Insert blocked by record rule");
-          }
-        }
-        return inserted;
-      });
-    },
-  };
-}
-
-/** `Mutation.update<TypeName>(set, where?)` — partial update, returns affected rows. */
-function buildUpdateMutationField(
-  meta: TableMeta,
-  db: DrizzleLike,
-  ctx: DomainContext,
-  guard: Guard,
-): GraphQLFieldConfig<unknown, unknown> {
-  return {
-    type: listType(meta),
-    args: {
-      set: { type: new GraphQLNonNull(meta.updateInput) },
-      where: { type: GraphQLJSON },
-    },
-    resolve: async (_, args, gqlCtx) => {
-      const extra = guard ? await guard(gqlCtx, "update") : undefined;
-      const userWhere = whereDomainToSql(args?.where, meta, ctx, gqlCtx);
-      const combined = combineWhere(extra, userWhere);
-      // `where` is a nullable arg — a missing user filter combined with no
-      // RBAC restriction would otherwise emit an unbounded UPDATE.
-      if (!combined) {
-        throw new Error(
-          "Refusing UPDATE with empty WHERE — RBAC misconfiguration",
-        );
-      }
-      return db.update(meta.table).set(args.set).where(combined).returning();
-    },
-  };
-}
-
-/** `Mutation.deleteFrom<TypeName>(where?)` — delete by predicate, returns deleted rows. */
-function buildDeleteMutationField(
-  meta: TableMeta,
-  db: DrizzleLike,
-  ctx: DomainContext,
-  guard: Guard,
-): GraphQLFieldConfig<unknown, unknown> {
-  return {
-    type: listType(meta),
-    args: { where: { type: GraphQLJSON } },
-    resolve: async (_, args, gqlCtx) => {
-      const extra = guard ? await guard(gqlCtx, "delete") : undefined;
-      const userWhere = whereDomainToSql(args?.where, meta, ctx, gqlCtx);
-      const combined = combineWhere(extra, userWhere);
-      // Same defensive guard as update — refuse an unbounded DELETE.
-      if (!combined) {
-        throw new Error(
-          "Refusing DELETE with empty WHERE — RBAC misconfiguration",
-        );
-      }
-      return db.delete(meta.table).where(combined).returning();
-    },
   };
 }
