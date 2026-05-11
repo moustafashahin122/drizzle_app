@@ -6,7 +6,7 @@
  * rules, and runtime options are guaranteed identical across environments.
  *
  * The only thing that varies between prod and test is the Drizzle handle:
- * `src/db.ts` opens `todo.db`; `src/testing/appTestCase.ts` opens an
+ * `src/sudoDb.ts` opens `todo.db`; `src/testing/appTestCase.ts` opens an
  * in-memory sqlite via the framework's shared singleton.
  */
 import * as schema from "./schema.js";

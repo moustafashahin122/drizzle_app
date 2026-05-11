@@ -29,7 +29,7 @@ import {
   buildSessionCookie,
   destroySession,
   issueSession,
-  type SessionDb,
+  type SudoDb,
   type SessionSchema,
 } from "./session.js";
 import { csrfProtection, requireAuth, sessionMiddleware, type AuthEnv } from "./middleware.js";
@@ -50,7 +50,7 @@ function publicUser(user: User): Omit<User, "passwordHash"> {
 }
 
 export interface AuthRoutesDeps {
-  db: SessionDb;
+  db: SudoDb;
   schema: SessionSchema;
 }
 

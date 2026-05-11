@@ -11,7 +11,8 @@
 import bcrypt from "bcryptjs";
 import { eq } from "drizzle-orm";
 import { logger } from "drizzle-graphql-rbac";
-import { db, users } from "../db.js";
+import { sudoDb } from "../sudoDb.js";
+import { users } from "../schema.js";
 
 const log = logger.child({ component: "app.seed.demo" });
 
@@ -19,13 +20,13 @@ const DEMO_PASSWORD = process.env.DEMO_PASSWORD ?? "demo123";
 
 async function ensureUser(name: string, email: string, password: string): Promise<number> {
   const passwordHash = await bcrypt.hash(password, 10);
-  const [existing] = await db.select().from(users).where(eq(users.email, email)).limit(1);
+  const [existing] = await sudoDb.select().from(users).where(eq(users.email, email)).limit(1);
   if (existing) {
-    await db.update(users).set({ passwordHash, active: true }).where(eq(users.id, existing.id));
+    await sudoDb.update(users).set({ passwordHash, active: true }).where(eq(users.id, existing.id));
     log.info({ email, userId: existing.id }, "updated user; password reset");
     return existing.id;
   }
-  const [created] = await db
+  const [created] = await sudoDb
     .insert(users)
     .values({ name, email, passwordHash, active: true })
     .returning();

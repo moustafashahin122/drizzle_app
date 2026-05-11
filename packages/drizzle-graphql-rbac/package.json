@@ -11,7 +11,7 @@
     "./testing": "./src/testing/index.ts"
   },
   "scripts": {
-    "test": "node --import tsx --test src/auth/*.test.ts src/admin/*.test.ts src/graphql/builder/*.test.ts src/graphql/rbac/*.test.ts src/graphql/domain/*.test.ts"
+    "test": "node --import tsx --test src/*.test.ts src/auth/*.test.ts src/admin/*.test.ts src/graphql/builder/*.test.ts src/graphql/rbac/*.test.ts src/graphql/domain/*.test.ts"
   },
   "peerDependencies": {
     "better-sqlite3": ">=11",

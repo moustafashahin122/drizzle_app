@@ -17,13 +17,14 @@
  * @example
  * import { createApp } from "drizzle-graphql-rbac";
  * import { serve } from "@hono/node-server";
- * import * as schema from "./db.js";
+ * import { sudoDb } from "./db.js";
+ * import * as schema from "./schema.js";
  * import { roles } from "./roles.js";
  * import { accessRights } from "./accessRights.js";
  * import { recordRules } from "./recordRules.js";
  *
- * const { app, rbac } = createApp({
- *   db: schema.db,
+ * const { app, rbac, rdbFor } = createApp({
+ *   db: sudoDb,
  *   schema,
  *   rbac: { roles, accessRights, recordRules },
  * });
@@ -34,6 +35,7 @@
 import { Hono } from "hono";
 import { logger as honoLogger } from "hono/logger";
 import { createYoga } from "graphql-yoga";
+import { NoSchemaIntrospectionCustomRule } from "graphql/validation";
 import { buildSchema, type BuildSchemaOptions } from "./graphql/builder/builder.js";
 import { depthLimit } from "./graphql/index.js";
 import { buildRbac, type BuiltRbac, type RbacContext } from "./graphql/rbac/rbac.js";
@@ -43,7 +45,7 @@ import { buildRbacDb, type RbacDb } from "./graphql/rbac/rbacDb.js";
 import { buildAuthRoutes } from "./auth/routes.js";
 import { buildAdminRoutes } from "./admin/routes.js";
 import { sessionMiddleware, type AuthEnv } from "./auth/middleware.js";
-import type { SessionDb, SessionSchema } from "./auth/session.js";
+import type { SudoDb, SessionSchema } from "./auth/session.js";
 import { logger } from "./logger.js";
 import type {
   User,
@@ -66,7 +68,7 @@ function pickHttpStatus(parts: readonly string[]): number | null {
 
 export interface CreateAppOptions {
   /** A Drizzle DB instance (any dialect). */
-  db: SessionDb;
+  db: SudoDb;
   /**
    * The full schema namespace: framework tables (users, sessions) plus any
    * app-specific tables. Pass via `import * as schema from "./db.js"`.
@@ -117,6 +119,26 @@ export interface CreateAppOptions {
    * @default 10
    */
   graphqlMaxDepth?: number;
+  /**
+   * Allow GraphQL schema introspection (`__schema` / `__type` selections and
+   * the GraphiQL IDE). When `false`, both the `NoSchemaIntrospectionCustomRule`
+   * is enforced at validation time and the GraphiQL HTML/JS endpoint is
+   * disabled (since GraphiQL relies on introspection).
+   *
+   * @default `process.env.NODE_ENV !== "production"` — introspection is on in
+   * dev/test, off in production.
+   */
+  graphqlAllowIntrospection?: boolean;
+  /**
+   * Reject unauthenticated requests to the GraphQL endpoint at the HTTP layer
+   * (returns `401 { "error": "Authentication required" }`) before the query
+   * is even parsed. RBAC `enforce` still rejects anonymous callers inside
+   * resolvers, but the HTTP gate is defense-in-depth and removes the query
+   * parser as an unauthenticated attack surface.
+   *
+   * @default true
+   */
+  graphqlRequireAuth?: boolean;
 }
 
 export interface CreatedApp {
@@ -130,6 +152,13 @@ export interface CreatedApp {
    * the framework's GraphQL/REST handlers build from `sessionMiddleware`).
    */
   rdbFor: (ctx: RbacContext) => RbacDb;
+  /**
+   * The raw, unwrapped Drizzle handle, re-exported under a name that flags
+   * its bypass semantics. Use it only in pre-user bootstrap paths (startup
+   * role seeding, seed scripts, anywhere that must run before a user
+   * context exists). Per-request code should go through `rdbFor`.
+   */
+  sudoDb: SudoDb;
 }
 
 /**
@@ -151,6 +180,8 @@ export function createApp(opts: CreateAppOptions): CreatedApp {
     graphqlEndpoint = "/graphql",
     logger: loggerOpt = true,
     graphqlMaxDepth = 10,
+    graphqlAllowIntrospection = process.env.NODE_ENV !== "production",
+    graphqlRequireAuth = true,
   } = opts;
   const loggingEnabled = loggerOpt !== false;
   const log = logger.child({ component: "framework.app" });
@@ -190,12 +221,21 @@ export function createApp(opts: CreateAppOptions): CreatedApp {
   const yoga = createYoga<ServerCtx, YogaContext>({
     schema: gqlSchema,
     graphqlEndpoint,
-    graphiql: true,
+    // GraphiQL serves an interactive query console and depends on
+    // introspection to power its autocomplete; keep them in lock-step so
+    // production never exposes either.
+    graphiql: graphqlAllowIntrospection,
     logging: loggingEnabled,
     plugins: [
       {
         onValidate({ addValidationRule }) {
           addValidationRule(depthLimit(graphqlMaxDepth));
+          if (!graphqlAllowIntrospection) {
+            // Rejects any selection of `__schema` / `__type` at validation
+            // time, so the parser still runs but the schema shape is not
+            // discoverable through query traffic.
+            addValidationRule(NoSchemaIntrospectionCustomRule);
+          }
         },
       },
     ],
@@ -249,6 +289,12 @@ export function createApp(opts: CreateAppOptions): CreatedApp {
 
   app.use(graphqlEndpoint, sessionMiddleware(db, sessionSchema));
   app.all(graphqlEndpoint, async (c) => {
+    if (graphqlRequireAuth && !c.get("user")) {
+      // Reject anonymous traffic before query parsing — closes the parser as
+      // an unauthenticated attack surface. Resolver-level RBAC `enforce` would
+      // also reject this caller, but only after parse + validate + execute.
+      return c.json({ error: "Authentication required" }, 401);
+    }
     return yoga.fetch(c.req.raw, {
       user: c.get("user"),
       session: c.get("session"),
@@ -261,5 +307,5 @@ export function createApp(opts: CreateAppOptions): CreatedApp {
     });
   }
 
-  return { app, rbac, rdbFor };
+  return { app, rbac, rdbFor, sudoDb: db };
 }

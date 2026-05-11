@@ -26,15 +26,15 @@ import { setupAppTestCase, createUser } from "./testing/appTestCase.js";
 // ---------------------------------------------------------------------------
 
 const tc = setupAppTestCase(async (base) => {
-  const carol = await createUser(base.db, { name: "Carol", email: "carol@example.com" });
-  const alice = await createUser(base.db, { name: "Alice", email: "alice@example.com" });
-  const bob   = await createUser(base.db, { name: "Bob",   email: "bob@example.com" });
+  const carol = await createUser(base.sudoDb, { name: "Carol", email: "carol@example.com" });
+  const alice = await createUser(base.sudoDb, { name: "Alice", email: "alice@example.com" });
+  const bob   = await createUser(base.sudoDb, { name: "Bob",   email: "bob@example.com" });
 
   base.rbac.assignRole(carol.id, "manager");
   base.rbac.assignRole(alice.id, "demo");
   base.rbac.assignRole(bob.id,   "demo");
 
-  const inserted = await base.db
+  const inserted = await base.sudoDb
     .insert(base.schema.todos)
     .values([
       { title: "alice-1", assigneeId: alice.id },
@@ -64,8 +64,20 @@ const M_DELETE = `mutation($w: JSON) { deleteFromTodos(where: $w) { id title } }
 const DENY_PATTERN = /rbac|forbidden|access|denied|auth/i;
 const titles = (rows: Array<{ title: string }>) => rows.map((r) => r.title).sort();
 
-/** A response should have no data for the given root field and a recognizably-deny error. */
+/**
+ * A response should have no data for the given root field and a
+ * recognizably-deny error. Two envelopes are accepted:
+ *   - resolver-level GraphQL deny: `{ data: { <root>: null }, errors: [{ message }] }`
+ *   - HTTP-layer auth gate:        `{ error: "Authentication required" }` (no data, no errors)
+ *
+ * Both shapes encode "operation refused"; the test only cares that the row
+ * effect is the same.
+ */
 function assertDenied(body: any, rootField: string, label: string) {
+  if (body && typeof body.error === "string" && body.data === undefined) {
+    assert.match(body.error, DENY_PATTERN, `${label}: HTTP error doesn't look like a deny ("${body.error}")`);
+    return;
+  }
   assert.equal(body.data?.[rootField] ?? null, null, `${label}: expected ${rootField} = null`);
   const msg = body.errors?.[0]?.message ?? "";
   assert.ok(msg, `${label}: expected an error message`);
@@ -73,10 +85,10 @@ function assertDenied(body: any, rootField: string, label: string) {
 }
 
 const dbAllTodos = () =>
-  tc.db.select().from(tc.schema.todos).orderBy(tc.schema.todos.id);
+  tc.sudoDb.select().from(tc.schema.todos).orderBy(tc.schema.todos.id);
 
 const dbTodoById = (id: number) =>
-  tc.db
+  tc.sudoDb
     .select()
     .from(tc.schema.todos)
     .where(eq(tc.schema.todos.id, id))
@@ -107,9 +119,16 @@ describe("todos.read — role-based row scoping", () => {
     });
   }
 
-  it("anonymous query returns todos:null + deny error", async () => {
-    const { body } = await tc.runHttp(Q_TODOS);
-    assertDenied(body, "todos", "anon read");
+  it("anonymous query is rejected at the HTTP layer with 401 (parser never reached)", async () => {
+    const { status, body } = await tc.runHttp(Q_TODOS);
+    // The /graphql endpoint refuses unauthenticated traffic before parsing —
+    // resolver-level RBAC would also throw "Not authenticated", but this is
+    // defense-in-depth. The response is a plain JSON error, not a GraphQL
+    // errors[] envelope, so there is no `data` field at all.
+    assert.equal(status, 401);
+    assert.equal(body?.error, "Authentication required");
+    assert.equal(body?.data, undefined);
+    assert.equal(body?.errors, undefined);
   });
 
   it("demo where(assigneeId=otherUser) returns nothing — rule AND-ed with user filter", async () => {
@@ -415,7 +434,7 @@ describe("todos — savepoint rollback between tests", () => {
   });
 
   it("the next test does not see the previous insert (rolled back)", async () => {
-    const found = await tc.db
+    const found = await tc.sudoDb
       .select()
       .from(tc.schema.todos)
       .where(eq(tc.schema.todos.title, "ephemeral"));

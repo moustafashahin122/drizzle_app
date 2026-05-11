@@ -15,7 +15,7 @@ import {
   resolveSessionFromToken,
   CSRF_COOKIE_NAME,
   CSRF_HEADER_NAME,
-  type SessionDb,
+  type SudoDb,
   type SessionSchema,
 } from "./session.js";
 
@@ -53,7 +53,7 @@ export type AuthEnv = { Variables: AuthVariables };
  * and the GraphQL endpoint.
  */
 export function sessionMiddleware(
-  db: SessionDb,
+  db: SudoDb,
   schema: SessionSchema,
 ): MiddlewareHandler<AuthEnv> {
   return async (c, next) => {

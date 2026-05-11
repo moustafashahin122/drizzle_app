@@ -64,7 +64,7 @@ import * as schema from "../schema.js";
 
 /** Lazy-built singleton: one app per process, regardless of how many suites import this. */
 interface AppHandle {
-  db: ReturnType<typeof drizzle>;
+  sudoDb: ReturnType<typeof drizzle>;
   app: ReturnType<typeof createApp>["app"];
   rbac: BuiltRbac;
   rdbFor: ReturnType<typeof createApp>["rdbFor"];
@@ -79,7 +79,7 @@ export function buildAppOnce(): Promise<AppHandle> {
   cached = (async () => {
     const sqlite = getSharedSqlite();
     sqlite.pragma("foreign_keys = ON");
-    const db = drizzle(sqlite, { schema: appConfig.schema });
+    const sudoDb = drizzle(sqlite, { schema: appConfig.schema });
 
     // Materialize the schema DDL into the shared in-memory handle. We can't
     // use the returned `apply()` because it routes statements through
@@ -88,12 +88,12 @@ export function buildAppOnce(): Promise<AppHandle> {
     // that; on an already-populated DB the diff is empty so this is a no-op.
     const { statementsToExecute } = await kitApi.pushSQLiteSchema(
       appConfig.schema,
-      db,
+      sudoDb,
     );
     for (const stmt of statementsToExecute) sqlite.exec(stmt);
 
     const { app, rbac, rdbFor } = createApp({
-      db,
+      db: sudoDb,
       ...appConfig,
       // Tests never serve static files and don't need request logging noise.
       publicDir: null,
@@ -104,20 +104,27 @@ export function buildAppOnce(): Promise<AppHandle> {
     // `createApp` doesn't expose its internal schema. Reusing the already-
     // built `rbac.enforce` keeps role memberships consistent between
     // runHttp and runDirect.
-    const { schema: graphqlSchema } = buildGraphqlSchema(db, appConfig.schema, {
+    const { schema: graphqlSchema } = buildGraphqlSchema(sudoDb, appConfig.schema, {
       hiddenOutputColumns: appConfig.hiddenOutputColumns,
       rbac: { enforce: rbac.enforce },
     });
 
-    return { db, app, rbac, rdbFor, graphqlSchema, schema };
+    return { sudoDb, app, rbac, rdbFor, graphqlSchema, schema };
   })();
   return cached;
 }
 
 /** Shape returned to each suite's `setUp` (and via the `tc` proxy to each test). */
 export interface AppTestCtx<Seed> {
-  /** Drizzle handle over the shared in-memory sqlite. */
-  db: AppHandle["db"];
+  /**
+   * Raw Drizzle handle over the shared in-memory sqlite. Named `sudoDb`
+   * because direct use bypasses RBAC — appropriate for fixture seeding and
+   * post-condition checks, not for exercising RBAC semantics. For that, use
+   * `rdbFor(ctx)` or run the operation through `runHttp` / `runDirect`.
+   */
+  sudoDb: AppHandle["sudoDb"];
+  /** Per-request RBAC-bound db factory. Construct one per simulated user. */
+  rdbFor: AppHandle["rdbFor"];
   /** Hono app — call `app.fetch(new Request(...))`. */
   app: AppHandle["app"];
   /** RBAC engine — `assignRole(userId, key)` to grant memberships. */
@@ -170,7 +177,7 @@ export function setupAppTestCase<Seed extends Record<string, unknown> = {}>(
     clearAllRbacMemberships(h.rbac);
 
     const mintToken = async (userId: number) => {
-      const { token } = await issueSession(h.db, h.schema, userId);
+      const { token } = await issueSession(h.sudoDb, h.schema, userId);
       return token;
     };
 
@@ -206,7 +213,8 @@ export function setupAppTestCase<Seed extends Record<string, unknown> = {}>(
     };
 
     const base: Omit<AppTestCtx<undefined>, "seed"> = {
-      db: h.db,
+      sudoDb: h.sudoDb,
+      rdbFor: h.rdbFor,
       app: h.app,
       rbac: h.rbac,
       schema: h.schema,
@@ -225,11 +233,11 @@ export function setupAppTestCase<Seed extends Record<string, unknown> = {}>(
  * tests can capture the auto-incremented `id`.
  */
 export async function createUser(
-  db: AppHandle["db"],
+  sudoDb: AppHandle["sudoDb"],
   attrs: { name: string; email: string; password?: string },
 ) {
   const passwordHash = await bcrypt.hash(attrs.password ?? "secret123", 4);
-  const [row] = await db
+  const [row] = await sudoDb
     .insert(schema.users)
     .values({ name: attrs.name, email: attrs.email, passwordHash })
     .returning();

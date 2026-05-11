@@ -14,6 +14,7 @@
  */
 import Database from "better-sqlite3";
 import { drizzle } from "drizzle-orm/better-sqlite3";
+import { relations } from "drizzle-orm";
 import { sqliteTable, integer, text } from "drizzle-orm/sqlite-core";
 
 import {
@@ -37,7 +38,19 @@ export const todos = sqliteTable("todos", {
   ownerId: integer("owner_id").references(() => users.id),
 });
 
-export const allTables = { users, todos };
+// Explicit relations() — required for Drizzle's native `db.query.<table>.findMany({ with: ... })`
+// API. We name the forward "one" relation after the FK column (`ownerId`) so it
+// coincides with our framework's auto-promoted relation name; the inverse "many"
+// is named `todos` on the users side. The introspector merges these with any
+// auto-detected FK relations (same name → de-duped).
+export const usersRelations = relations(users, ({ many }) => ({
+  todos: many(todos),
+}));
+export const todosRelations = relations(todos, ({ one }) => ({
+  ownerId: one(users, { fields: [todos.ownerId], references: [users.id] }),
+}));
+
+export const allTables = { users, todos, usersRelations, todosRelations };
 
 // Apply schema to the shared handle on first import. `IF NOT EXISTS` keeps
 // this idempotent if multiple files reach into the same singleton in one
@@ -54,7 +67,10 @@ applySchemaSql(`
 
 /** Shared sqlite + drizzle. Test files import these directly; no per-file DB. */
 export const sqlite = getSharedSqlite();
-export const db = drizzle(sqlite);
+// Pass `schema` so the relational query API (`db.query.<jsKey>.findMany`) is
+// available — required for the `RbacDb.query.*` tests. Regular select/insert/
+// update/delete APIs behave identically regardless of this argument.
+export const db = drizzle(sqlite, { schema: allTables });
 export type Db = typeof db;
 
 /**

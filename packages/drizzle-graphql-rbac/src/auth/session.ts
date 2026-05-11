@@ -27,7 +27,7 @@ export interface SessionSchema {
   sessions: typeof sessionsTable;
 }
 
-export interface SessionDb {
+export interface SudoDb {
   select: (...args: any[]) => any;
   insert: (...args: any[]) => any;
   update: (...args: any[]) => any;
@@ -105,7 +105,7 @@ export function extractBearerToken(authorization: string | null | undefined): st
  * for shipping the token to the client (cookie + JSON body).
  */
 export async function issueSession(
-  db: SessionDb,
+  db: SudoDb,
   schema: SessionSchema,
   userId: number,
 ): Promise<{ token: string; session: Session }> {
@@ -123,7 +123,7 @@ export async function issueSession(
  * Never throws — callers expect a "guest" context, not an error.
  */
 export async function resolveSessionFromToken(
-  db: SessionDb,
+  db: SudoDb,
   schema: SessionSchema,
   token: string | null,
 ): Promise<{ user: User | null; session: Session | null }> {
@@ -159,7 +159,7 @@ export async function resolveSessionFromToken(
 
 /** Delete a session row by id. Idempotent — missing id is silently ignored. */
 export async function destroySession(
-  db: SessionDb,
+  db: SudoDb,
   schema: SessionSchema,
   sessionId: number,
 ): Promise<void> {

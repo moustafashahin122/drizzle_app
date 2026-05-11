@@ -88,8 +88,13 @@ describe("buildSchema — root surface", () => {
 
 describe("buildSchema — list query", () => {
   it("returns all rows when no args given", async () => {
-    const data: any = await run(`{ todos { id title } }`);
+    const data: any = await run(`{ todos(orderBy: { id: ASC }) { id title } }`);
     assert.equal(data.todos.length, 4);
+    assert.deepEqual(
+      data.todos.map((t: any) => t.title),
+      ["write tests", "review PR", "deploy", "orphan"],
+      "zero-arg list must return every seeded title in insertion order",
+    );
   });
 
   it("filters by where (JSON domain)", async () => {

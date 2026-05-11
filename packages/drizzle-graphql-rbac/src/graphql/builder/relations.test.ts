@@ -48,8 +48,14 @@ describe("introspectSchema — auto FK detection", () => {
     const fwd = postsRels.find((r) => r.fieldName === "authorId");
     assert.ok(fwd, "expected a forward 'authorId' relation on posts");
     assert.equal(fwd!.kind, "one");
+    // Pin column identity, not just arity — a wrong column would still satisfy
+    // a length check. Source column is the FK on posts; reference is users.id.
     assert.equal(fwd!.fields?.length, 1);
     assert.equal(fwd!.references?.length, 1);
+    assert.strictEqual(fwd!.fields![0], posts.authorId);
+    assert.strictEqual(fwd!.references![0], users.id);
+    assert.equal(fwd!.sourceTable, posts);
+    assert.equal(fwd!.referencedTable, users);
   });
 
   it("creates an inverse 'many' relation on the referenced table", () => {
@@ -59,6 +65,12 @@ describe("introspectSchema — auto FK detection", () => {
     assert.equal(inv!.kind, "many");
     assert.equal(inv!.fields?.length, 1);
     assert.equal(inv!.references?.length, 1);
+    // The many side mirrors the one side: parent join uses users.id, child match
+    // uses posts.authorId. Asserting both pins the join direction.
+    assert.strictEqual(inv!.fields![0], users.id);
+    assert.strictEqual(inv!.references![0], posts.authorId);
+    assert.equal(inv!.sourceTable, users);
+    assert.equal(inv!.referencedTable, posts);
   });
 
   it("does not invent relations for tables without FKs", () => {
@@ -95,8 +107,8 @@ describe("introspectSchema — explicit relations() declarations", () => {
     const author = postsRels.find((r) => r.fieldName === "author");
     assert.ok(author, "expected author relation");
     assert.equal(author!.kind, "one");
-    assert.equal(author!.fields?.length, 1);
-    assert.equal(author!.references?.length, 1);
+    assert.strictEqual(author!.fields![0], posts.authorId);
+    assert.strictEqual(author!.references![0], users.id);
   });
 
   it("back-fills the paired 'many' side with mirrored fields/references", () => {
@@ -104,8 +116,10 @@ describe("introspectSchema — explicit relations() declarations", () => {
     const authored = usersRels.find((r) => r.fieldName === "authoredPosts");
     assert.ok(authored, "expected authoredPosts relation");
     assert.equal(authored!.kind, "many");
-    assert.ok(authored!.fields?.length, "many side should be back-filled");
-    assert.ok(authored!.references?.length, "many side should be back-filled");
+    // Back-fill must mirror the one-side: many.fields = one.references and
+    // many.references = one.fields. A length-only check passes for a swap.
+    assert.strictEqual(authored!.fields![0], users.id);
+    assert.strictEqual(authored!.references![0], posts.authorId);
   });
 
   it("explicit relations take precedence over auto-FK same-named field", () => {

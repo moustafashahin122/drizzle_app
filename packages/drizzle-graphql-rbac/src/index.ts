@@ -41,7 +41,7 @@ export {
   destroySession,
   SESSION_COOKIE_NAME,
 } from "./auth/session.js";
-export type { SessionDb, SessionSchema } from "./auth/session.js";
+export type { SudoDb, SessionSchema } from "./auth/session.js";
 
 // CSRF primitives + constants (callers may need to set/read these directly).
 export {

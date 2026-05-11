@@ -1,5 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import Database from "better-sqlite3";
+import { drizzle } from "drizzle-orm/better-sqlite3";
 import { sqliteTable, integer, text } from "drizzle-orm/sqlite-core";
 
 import { parseDomain, domainToSql } from "./domain.js";
@@ -47,10 +49,26 @@ describe("domain — parser", () => {
 describe("domain — translator", () => {
   const cols = { ownerId: todos.ownerId } as unknown as ColumnMap;
 
-  it("substitutes a placeholder value before building SQL", () => {
+  it("substitutes a placeholder value before building SQL (filters rows accordingly)", async () => {
+    const sqlite = new Database(":memory:");
+    sqlite.exec(`
+      CREATE TABLE todos (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, owner_id INTEGER);
+      INSERT INTO todos (title, owner_id) VALUES ('a', 42), ('b', 7), ('c', 42);
+    `);
+    const db = drizzle(sqlite);
     const node = parseDomain([["ownerId", "=", "current_user.id"]]);
-    const sql = domainToSql(node, cols, { "current_user.id": 42 });
-    assert.ok(sql);
+
+    // Placeholder=42: must keep the two ownerId=42 rows, drop the ownerId=7 row.
+    const sqlFor42 = domainToSql(node, cols, { "current_user.id": 42 });
+    assert.ok(sqlFor42, "non-null placeholder must yield SQL");
+    const rows42 = await db.select().from(todos).where(sqlFor42!);
+    assert.deepEqual(rows42.map((r) => r.title).sort(), ["a", "c"]);
+
+    // Placeholder=999: yields a valid filter that matches zero rows.
+    const sqlFor999 = domainToSql(node, cols, { "current_user.id": 999 });
+    assert.ok(sqlFor999);
+    const rows999 = await db.select().from(todos).where(sqlFor999!);
+    assert.equal(rows999.length, 0);
   });
 
   it("drops `=` against null-resolved placeholders (safe default)", () => {

@@ -28,7 +28,7 @@ import type { RbacDb } from "../graphql/rbac/rbacDb.js";
 import type { BuiltRbac } from "../graphql/rbac/rbac.js";
 import type { ColumnMap } from "../graphql/builder/filters.js";
 import { csrfProtection, requireAuth, sessionMiddleware, type AuthEnv } from "../auth/middleware.js";
-import type { SessionDb, SessionSchema } from "../auth/session.js";
+import type { SudoDb, SessionSchema } from "../auth/session.js";
 
 function publicUser(user: User): Omit<User, "passwordHash"> {
   const { passwordHash: _omit, ...rest } = user;
@@ -45,7 +45,7 @@ function errorResponse(err: any): { status: ContentfulStatusCode; body: { error:
 
 export interface AdminRoutesDeps {
   /** Raw db, used for session resolution. */
-  db: SessionDb;
+  db: SudoDb;
   schema: SessionSchema;
   /** The `users` Drizzle table — passed in so this module has no hard dependency on `../db.js`. */
   usersTable: typeof usersTableType;

@@ -21,17 +21,21 @@
  * (`then`/`catch`/`finally`) is the finalization point — that's when RBAC runs
  * and the combined `where` is attached.
  *
- * Escape hatch: `rdb.raw` is the underlying unwrapped `db`. Use it for the
+ * Escape hatch: `rdb.sudo` is the underlying unwrapped `db`. Use it for the
  * pre-auth bootstrap (resolving the session itself), seed scripts, and the
- * RBAC engine — anything that must run before there is a user.
+ * RBAC engine — anything that must run before there is a user. Every other
+ * call site is expected to go through the enforced verbs above.
  */
 import {
+  and,
   getTableColumns,
+  getTableName,
   is,
   Table,
   type SQL,
 } from "drizzle-orm";
 import { combineWhere, type ColumnMap } from "../builder/filters.js";
+import { introspectSchema, type ExtractedRelation } from "../builder/relations.js";
 import type { Action, RbacContext, RbacEnforce } from "./rbac.js";
 
 export interface RbacDbDeps {
@@ -56,6 +60,10 @@ interface ResourceInfo {
 
 interface ResolvedDeps extends RbacDbDeps {
   byTable: Map<unknown, ResourceInfo>;
+  /** jsKey → Drizzle Table. Used to resolve `rdb.query.<jsKey>` to a target. */
+  tableByJsKey: Map<string, Table>;
+  /** jsKey → (relation fieldName → ExtractedRelation). Drives `with`-walking. */
+  relByJsKey: Map<string, Map<string, ExtractedRelation>>;
 }
 
 /**
@@ -70,15 +78,30 @@ interface ResolvedDeps extends RbacDbDeps {
  */
 export function buildRbacDb(deps: RbacDbDeps): (ctx: RbacContext) => RbacDb {
   const byTable = new Map<unknown, ResourceInfo>();
+  const tableByJsKey = new Map<string, Table>();
   for (const [jsKey, value] of Object.entries(deps.schema)) {
     if (value && is(value as any, Table)) {
-      byTable.set(value, {
+      const t = value as Table;
+      byTable.set(t, {
         jsKey,
-        columns: getTableColumns(value as any) as ColumnMap,
+        columns: getTableColumns(t) as ColumnMap,
       });
+      tableByJsKey.set(jsKey, t);
     }
   }
-  const resolved: ResolvedDeps = { ...deps, byTable };
+  // Introspect declared relations + inline-FK auto-relations so `rdb.query.*`
+  // can resolve a relation field name on the parent table back to the target
+  // table (and from there to its jsKey / columns / record-rule extra-where).
+  const intro = introspectSchema(deps.schema);
+  const relByJsKey = new Map<string, Map<string, ExtractedRelation>>();
+  for (const [sqlName, rels] of intro.relations) {
+    const jsKey = intro.keyByTableName.get(sqlName);
+    if (!jsKey) continue;
+    const m = new Map<string, ExtractedRelation>();
+    for (const r of rels) m.set(r.fieldName, r);
+    relByJsKey.set(jsKey, m);
+  }
+  const resolved: ResolvedDeps = { ...deps, byTable, tableByJsKey, relByJsKey };
   return (ctx) => new RbacDb(resolved, ctx);
 }
 
@@ -91,15 +114,25 @@ export function buildRbacDb(deps: RbacDbDeps): (ctx: RbacContext) => RbacDb {
  * Method chains mirror the Drizzle builder API (`.from`, `.where`, `.set`,
  * `.values`, `.returning`, `.limit`, `.offset`, `.orderBy`, joins). The chain
  * is finalized — and RBAC actually runs — only when the caller awaits it
- * (`then` / `catch` / `finally`). Use {@link RbacDb.raw} to bypass the
+ * (`then` / `catch` / `finally`). Use {@link RbacDb.sudo} to bypass the
  * wrapper entirely.
+ *
+ * Raw-SQL escapes (`db.execute`, `db.$with`, `db.run`, `db.all`, `db.get`,
+ * `db.batch`) are intentionally **not** exposed on `RbacDb`: they cannot be
+ * semantically gated and silent passthrough would be a footgun. Call them
+ * through `rdb.sudo.execute(...)` etc., which makes the bypass visible at
+ * the call site.
  */
 export class RbacDb {
-  /** Escape hatch: the raw, unwrapped Drizzle db. */
-  readonly raw: any;
+  /**
+   * Per-call sudo escape: the raw, unwrapped Drizzle db. Reach for this only
+   * in pre-user bootstrap paths (session resolution, seed scripts, server
+   * startup). All other call sites should go through the enforced verbs.
+   */
+  readonly sudo: any;
 
   constructor(private deps: ResolvedDeps, private ctx: RbacContext) {
-    this.raw = deps.db;
+    this.sudo = deps.db;
   }
 
   private resolve(table: unknown): ResourceInfo {
@@ -190,6 +223,133 @@ export class RbacDb {
       () => this.runEnforce(info.jsKey, "create", info.columns),
     );
   }
+
+  /**
+   * Drizzle relational query API, RBAC-enforced.
+   *
+   * `rdb.query.<jsKey>.findMany(opts)` / `.findFirst(opts)` resolves `<jsKey>`
+   * to its target table, runs `enforce(ctx, jsKey, "read")`, and AND-injects
+   * the record-rule SQL into `opts.where`. The walker then descends into
+   * `opts.with` — each relation key is resolved through the introspected
+   * relation graph to its target table, which gets its own enforce + where
+   * injection, recursively.
+   *
+   * Bypassed resources fall through to the raw `db.query.<jsKey>` API.
+   *
+   * Note: relational queries that use a callback-form `where` (e.g.
+   * `where: (t, { eq }) => eq(t.x, 1)`) are still supported — the callback is
+   * wrapped to AND-combine with the record-rule SQL.
+   */
+  /**
+   * RBAC-enforced transaction. The callback receives a tx-bound `RbacDb`
+   * sharing this instance's `ctx` and enforcement config; every verb invoked
+   * on `rtx` runs against the transaction's `tx` handle.
+   *
+   * **Sync dialects (better-sqlite3):** the driver's `tx.transaction(cb)` is
+   * strictly synchronous — it does not await a promise returned from `cb`.
+   * RBAC `enforce` is async, so a tx-bound `RbacDb` cannot honor the sync
+   * contract. This method therefore throws on sync dialects; use
+   * `rdb.sudo.transaction(syncCb)` for those (which inherits sudo semantics
+   * for the entire block) and run any enforce checks before/after the tx.
+   */
+  transaction<T>(cb: (rtx: RbacDb) => Promise<T>): Promise<T> {
+    const dialectName = (this.deps.db as any)?.dialect?.constructor?.name;
+    if (dialectName === "SQLiteSyncDialect") {
+      throw new Error(
+        "rbacDb: .transaction is unsupported on sync dialects (better-sqlite3). " +
+        "Use rdb.sudo.transaction(syncCb) instead — the sync driver cannot await async RBAC enforce.",
+      );
+    }
+    return this.deps.db.transaction(async (tx: any) => {
+      const txDeps: ResolvedDeps = { ...this.deps, db: tx };
+      const rtx = new RbacDb(txDeps, this.ctx);
+      return cb(rtx);
+    });
+  }
+
+  get query(): any {
+    const self = this;
+    return new Proxy({}, {
+      get(_t, prop) {
+        if (typeof prop !== "string") return undefined;
+        const table = self.deps.tableByJsKey.get(prop);
+        if (!table) return self.deps.db.query?.[prop];
+        const info = self.deps.byTable.get(table)!;
+        if (self.bypassed(info.jsKey)) return self.deps.db.query[prop];
+        return {
+          findMany: (opts: any = {}) => self.runRelQuery("findMany", info, opts),
+          findFirst: (opts: any = {}) => self.runRelQuery("findFirst", info, opts),
+        };
+      },
+    });
+  }
+
+  private async runRelQuery(
+    method: "findMany" | "findFirst",
+    info: ResourceInfo,
+    opts: any,
+  ): Promise<any> {
+    const extra = await this.runEnforce(info.jsKey, "read", info.columns);
+    const rewritten = await this.rewriteRelOpts(info.jsKey, opts, extra);
+    return this.deps.db.query[info.jsKey][method](rewritten);
+  }
+
+  private async rewriteRelOpts(
+    jsKey: string,
+    opts: any,
+    extra: SQL | undefined,
+  ): Promise<any> {
+    const out = opts ? { ...opts } : {};
+    if (extra !== undefined) out.where = combineRelWhere(out.where, extra);
+    if (opts?.with) out.with = await this.rewriteRelWith(jsKey, opts.with);
+    return out;
+  }
+
+  private async rewriteRelWith(
+    parentJsKey: string,
+    withObj: Record<string, unknown>,
+  ): Promise<Record<string, unknown>> {
+    const parentRelations = this.deps.relByJsKey.get(parentJsKey);
+    const out: Record<string, unknown> = {};
+    for (const [fieldName, value] of Object.entries(withObj)) {
+      const rel = parentRelations?.get(fieldName);
+      // Unknown relation: pass through and let Drizzle error if it's invalid.
+      if (!rel) { out[fieldName] = value; continue; }
+      const targetInfo = this.deps.byTable.get(rel.referencedTable);
+      if (!targetInfo || this.bypassed(targetInfo.jsKey)) {
+        out[fieldName] = value;
+        continue;
+      }
+      const extra = await this.runEnforce(
+        targetInfo.jsKey,
+        "read",
+        targetInfo.columns,
+      );
+      const sub: any = value === true ? {} : { ...(value as object) };
+      if (extra !== undefined) sub.where = combineRelWhere(sub.where, extra);
+      if (sub.with) sub.with = await this.rewriteRelWith(targetInfo.jsKey, sub.with);
+      out[fieldName] = sub;
+    }
+    return out;
+  }
+}
+
+/**
+ * Combine a user-supplied relational-query `where` (which Drizzle accepts as
+ * either a `SQL` value or a `(fields, operators) => SQL` callback) with an
+ * extra SQL fragment from the record-rule engine. Result preserves the
+ * caller's form: callback in → callback out, value in → AND-combined value
+ * out.
+ */
+function combineRelWhere(userWhere: any, extra: SQL): any {
+  if (userWhere === undefined) return extra;
+  if (typeof userWhere === "function") {
+    return (fields: any, ops: any) => {
+      const u = userWhere(fields, ops);
+      return u !== undefined ? ops.and(u, extra) : extra;
+    };
+  }
+  return and(userWhere as SQL, extra);
 }
 
 // ---------------------------------------------------------------------------

@@ -65,10 +65,9 @@ describe("combineWhere", () => {
     assert.equal(combineWhere(undefined, a), a);
   });
 
-  it("AND-combines when both are supplied", () => {
-    const out = combineWhere(sql`a = 1`, sql`b = 2`);
-    assert.ok(out);
-  });
+  // The "both supplied → AND" path is exercised end-to-end by the
+  // `applyListArgs AND-combines two where fragments via combineWhere` case
+  // below, which asserts on actual filtered rows rather than truthiness.
 });
 
 describe("applyListArgs (integration with in-memory SQLite)", () => {

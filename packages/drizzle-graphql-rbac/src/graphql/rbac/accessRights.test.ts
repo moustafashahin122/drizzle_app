@@ -144,8 +144,16 @@ describe("access rights — verb-level gating with no record rules", () => {
       const rdb = rdbFor(ctxFor(carol.id));
       const rows = await rdb.select().from(todos);
       assert.equal(rows.length, 4);
-      const owners = new Set(rows.map((r: any) => r.ownerId));
-      assert.ok(owners.has(alice.id) && owners.has(bob.id) && owners.has(carol.id));
+      // Full tuples by title — a Set-based check would still pass if a row
+      // were silently swapped or duplicated.
+      const byTitle = Object.fromEntries(rows.map((r: any) => [r.title, r]));
+      assert.deepEqual(Object.keys(byTitle).sort(), [
+        "alice-1", "alice-2", "bob-1", "carol-1",
+      ]);
+      assert.equal(byTitle["alice-1"].ownerId, alice.id);
+      assert.equal(byTitle["alice-2"].ownerId, alice.id);
+      assert.equal(byTitle["bob-1"].ownerId,   bob.id);
+      assert.equal(byTitle["carol-1"].ownerId, carol.id);
     });
 
     it("can update a user's row (cross-owner allowed at ACL layer)", async () => {
