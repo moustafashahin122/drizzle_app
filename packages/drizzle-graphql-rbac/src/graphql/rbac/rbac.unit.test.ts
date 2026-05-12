@@ -24,6 +24,7 @@ import {
   defineRecordRules,
 } from "./config.js";
 import {
+  DOMAIN_OWN,
   assignRole,
   ctxFor,
   freshDb,
@@ -44,7 +45,7 @@ async function insertUser(targetDb: Db, name = "u"): Promise<number> {
 describe("rbac — engine unit", () => {
   describe("enforce", () => {
     it("admin via membership bypasses ACL even without grants", async () => {
-      const { db } = freshDb();
+      const { db } = await freshDb();
       const rbac = buildRbac({
         roles: defineRoles({ admin: { isAdmin: true } }),
         accessRights: {},
@@ -57,7 +58,7 @@ describe("rbac — engine unit", () => {
     });
 
     it("granting role with no record rule → unrestricted ({ where: undefined })", async () => {
-      const { db } = freshDb();
+      const { db } = await freshDb();
       const rbac = buildRbac({
         roles: defineRoles({ reader: {} }),
         accessRights: defineAccessRights({ reader: { todos: { read: true } } }),
@@ -72,7 +73,7 @@ describe("rbac — engine unit", () => {
     it("rule whose domain compiles to null SQL is treated as unrestricted", async () => {
       // Leaf references a column that does NOT exist on the columns map →
       // domainToSql returns undefined → enforce returns `{}` (unrestricted).
-      const { db } = freshDb();
+      const { db } = await freshDb();
       const rbac = buildRbac({
         roles: defineRoles({ reader: {} }),
         accessRights: defineAccessRights({ reader: { todos: { read: true } } }),
@@ -87,7 +88,7 @@ describe("rbac — engine unit", () => {
     });
 
     it("denies action that the user's role does not permit", async () => {
-      const { db } = freshDb();
+      const { db } = await freshDb();
       const rbac = buildRbac({
         roles: defineRoles({ reader: {} }),
         accessRights: defineAccessRights({ reader: { todos: { read: true } } }),
@@ -102,7 +103,7 @@ describe("rbac — engine unit", () => {
     });
 
     it("denies resource that the user's role does not cover", async () => {
-      const { db } = freshDb();
+      const { db } = await freshDb();
       const rbac = buildRbac({
         roles: defineRoles({ reader: {} }),
         accessRights: defineAccessRights({ reader: { todos: { read: true } } }),
@@ -117,12 +118,12 @@ describe("rbac — engine unit", () => {
     });
 
     it("returns the rule's SQL when the role has a record rule for this (resource, action)", async () => {
-      const { db } = freshDb();
+      const { db } = await freshDb();
       const rbac = buildRbac({
         roles: defineRoles({ reader: {} }),
         accessRights: defineAccessRights({ reader: { todos: { read: true } } }),
         recordRules: defineRecordRules({
-          reader: { todos: { read: { domain: [["ownerId", "=", "current_user.id"]] } } },
+          reader: { todos: { read: { domain: DOMAIN_OWN as any } } },
         }),
       });
       const uid = await insertUser(db);
@@ -144,7 +145,7 @@ describe("rbac — engine unit", () => {
     });
 
     it("denies authenticated user with no role", async () => {
-      const { db } = freshDb();
+      const { db } = await freshDb();
       const rbac = buildRbac({
         roles: defineRoles({ reader: {} }),
         accessRights: defineAccessRights({ reader: { todos: { read: true } } }),
@@ -159,7 +160,7 @@ describe("rbac — engine unit", () => {
     });
 
     it("works without ctx.batch (cache is optional)", async () => {
-      const { db } = freshDb();
+      const { db } = await freshDb();
       const rbac = buildRbac({
         roles: defineRoles({ reader: {} }),
         accessRights: defineAccessRights({ reader: { todos: { read: true } } }),
@@ -174,7 +175,7 @@ describe("rbac — engine unit", () => {
     });
 
     it("memoizes successful results in ctx.batch so repeated calls reuse them", async () => {
-      const { db } = freshDb();
+      const { db } = await freshDb();
       const rbac = buildRbac({
         roles: defineRoles({ reader: {} }),
         accessRights: defineAccessRights({ reader: { todos: { read: true } } }),
@@ -190,7 +191,7 @@ describe("rbac — engine unit", () => {
     });
 
     it("cache key isolates (resource, action) pairs for the same user", async () => {
-      const { db } = freshDb();
+      const { db } = await freshDb();
       const rbac = buildRbac({
         roles: defineRoles({ rw: {} }),
         accessRights: defineAccessRights({
@@ -198,7 +199,7 @@ describe("rbac — engine unit", () => {
         }),
         recordRules: defineRecordRules({
           rw: {
-            todos: { read: { domain: [["ownerId", "=", "current_user.id"]] } },
+            todos: { read: { domain: DOMAIN_OWN as any } },
           },
         }),
       });
@@ -220,7 +221,7 @@ describe("rbac — engine unit", () => {
     });
 
     it("cache is per-user — two callers do not poach each other's memos", async () => {
-      const { db } = freshDb();
+      const { db } = await freshDb();
       const rbac = buildRbac({
         roles: defineRoles({ reader: {}, denied: {} }),
         accessRights: defineAccessRights({ reader: { todos: { read: true } } }),
@@ -243,12 +244,12 @@ describe("rbac — engine unit", () => {
     });
 
     it("placeholder current_user.id is bound to ctx.user.id in the produced SQL", async () => {
-      const { db } = freshDb();
+      const { db } = await freshDb();
       const rbac = buildRbac({
         roles: defineRoles({ reader: {} }),
         accessRights: defineAccessRights({ reader: { todos: { read: true } } }),
         recordRules: defineRecordRules({
-          reader: { todos: { read: { domain: [["ownerId", "=", "current_user.id"]] } } },
+          reader: { todos: { read: { domain: DOMAIN_OWN as any } } },
         }),
       });
       const meId    = await insertUser(db, "Me");
@@ -269,7 +270,7 @@ describe("rbac — engine unit", () => {
     });
 
     it("memoizes forbidden results so repeated calls throw without re-evaluating", async () => {
-      const { db } = freshDb();
+      const { db } = await freshDb();
       const rbac = buildRbac({
         roles: defineRoles({ reader: {} }),
         accessRights: defineAccessRights({ reader: { todos: { read: true } } }),

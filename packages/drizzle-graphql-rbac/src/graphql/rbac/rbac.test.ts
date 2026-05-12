@@ -24,19 +24,20 @@ import {
 } from "./config.js";
 
 import {
+  DOMAIN_OWN,
   allTables,
   assignRole,
+  byTitle,
   db,
   todos,
   users,
   anonCtx,
   ctxFor,
-  freshDb,
+  isolatedRbac,
   seedReaderAdmin,
   transactionCase,
 } from "./__helpers__.js";
 
-const ownRows = [["ownerId", "=", "current_user.id"]];
 const baseConfig = {
   roles: defineRoles({
     reader: {},
@@ -46,7 +47,7 @@ const baseConfig = {
     reader: { todos: { read: true } },
   }),
   recordRules: defineRecordRules({
-    reader: { todos: { read: { domain: ownRows } } },
+    reader: { todos: { read: { domain: DOMAIN_OWN as any } } },
   }),
 };
 
@@ -59,20 +60,6 @@ const tc = transactionCase(async () => {
   return { db, rbac, schema, run, cast };
 });
 
-/**
- * Self-contained alt-config harness for tests that need a different rbac
- * config than the shared baseline (e.g. reader+update). Lives outside the
- * shared transactionCase because the config itself is part of the contract
- * under test.
- */
-function makeIsolated(cfg: Parameters<typeof buildRbac>[0]) {
-  const { db: d } = freshDb();
-  const r = buildRbac(cfg);
-  const sch = buildSchema(d, allTables, { rbac: { enforce: r.enforce } }).schema;
-  const run = (source: string, contextValue: any, variableValues?: Record<string, unknown>) =>
-    graphql({ schema: sch, source, contextValue, variableValues });
-  return { db: d, rbac: r, schema: sch, run };
-}
 
 describe("rbac — enforcement (GraphQL layer)", () => {
   describe("deny paths", () => {
@@ -110,19 +97,19 @@ describe("rbac — enforcement (GraphQL layer)", () => {
     type Row = { id: number; title: string; ownerId: { id: number; name: string } };
     const rows = (r.data as any).todos as Row[];
     assert.equal(rows.length, 4, "admin must see all four rows, unfiltered");
-    const byTitle = Object.fromEntries(rows.map((t) => [t.title, t]));
-    assert.deepEqual(Object.keys(byTitle).sort(), [
+    const indexed = byTitle(rows);
+    assert.deepEqual(Object.keys(indexed).sort(), [
       "alice-1", "alice-2", "bob-1", "carol-1",
     ]);
     // Relation primary keys come back as GraphQL ID (string); coerce when comparing.
     const ownerNum = (r: Row) => Number(r.ownerId.id);
-    assert.equal(ownerNum(byTitle["alice-1"]), alice.id);
-    assert.equal(byTitle["alice-1"].ownerId.name, "Alice");
-    assert.equal(ownerNum(byTitle["alice-2"]), alice.id);
-    assert.equal(ownerNum(byTitle["bob-1"]),   bob.id);
-    assert.equal(byTitle["bob-1"].ownerId.name, "Bob");
-    assert.equal(ownerNum(byTitle["carol-1"]), carol.id);
-    assert.equal(byTitle["carol-1"].ownerId.name, "Carol");
+    assert.equal(ownerNum(indexed["alice-1"]), alice.id);
+    assert.equal(indexed["alice-1"].ownerId.name, "Alice");
+    assert.equal(ownerNum(indexed["alice-2"]), alice.id);
+    assert.equal(ownerNum(indexed["bob-1"]),   bob.id);
+    assert.equal(indexed["bob-1"].ownerId.name, "Bob");
+    assert.equal(ownerNum(indexed["carol-1"]), carol.id);
+    assert.equal(indexed["carol-1"].ownerId.name, "Carol");
   });
 
   it("reader sees only own rows; record rule filters out other owners", async () => {
@@ -198,8 +185,7 @@ describe("rbac — enforcement (GraphQL layer)", () => {
   it("update record rule narrows mutation scope to the reader's own rows", async () => {
     // Reader needs `update` here — build an alt-config schema rather than
     // mutating the shared baseline. Self-contained: its own DB + rbac.
-    const own = [["ownerId", "=", "current_user.id"]];
-    const iso = makeIsolated({
+    const iso = await isolatedRbac({
       roles: defineRoles({ reader: {} }),
       accessRights: defineAccessRights({
         reader: { todos: { read: true, update: true } },
@@ -207,8 +193,8 @@ describe("rbac — enforcement (GraphQL layer)", () => {
       recordRules: defineRecordRules({
         reader: {
           todos: {
-            read:   { domain: own },
-            update: { domain: own },
+            read:   { domain: DOMAIN_OWN as any },
+            update: { domain: DOMAIN_OWN as any },
           },
         },
       }),

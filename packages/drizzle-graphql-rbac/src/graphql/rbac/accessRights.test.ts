@@ -24,6 +24,7 @@ import {
 
 import {
   allTables,
+  byTitle,
   db,
   todos,
   users,
@@ -61,13 +62,13 @@ describe("access rights — verb-level gating with no record rules", () => {
       const rows = await rdb.select().from(todos);
 
       assert.equal(rows.length, 4, "user with read+no-rule must see every row");
-      const byTitle = Object.fromEntries(rows.map((r: any) => [r.title, r]));
-      assert.deepEqual(Object.keys(byTitle).sort(), [
+      const indexed = byTitle(rows as any[]);
+      assert.deepEqual(Object.keys(indexed).sort(), [
         "alice-1", "alice-2", "bob-1", "carol-1",
       ]);
-      assert.equal(byTitle["alice-1"].ownerId, alice.id);
-      assert.equal(byTitle["bob-1"].ownerId,   bob.id);
-      assert.equal(byTitle["carol-1"].ownerId, carol.id);
+      assert.equal(indexed["alice-1"].ownerId, alice.id);
+      assert.equal(indexed["bob-1"].ownerId,   bob.id);
+      assert.equal(indexed["carol-1"].ownerId, carol.id);
     });
 
     it("can create a todo; row persists with the supplied FK", async () => {
@@ -146,14 +147,14 @@ describe("access rights — verb-level gating with no record rules", () => {
       assert.equal(rows.length, 4);
       // Full tuples by title — a Set-based check would still pass if a row
       // were silently swapped or duplicated.
-      const byTitle = Object.fromEntries(rows.map((r: any) => [r.title, r]));
-      assert.deepEqual(Object.keys(byTitle).sort(), [
+      const indexed = byTitle(rows as any[]);
+      assert.deepEqual(Object.keys(indexed).sort(), [
         "alice-1", "alice-2", "bob-1", "carol-1",
       ]);
-      assert.equal(byTitle["alice-1"].ownerId, alice.id);
-      assert.equal(byTitle["alice-2"].ownerId, alice.id);
-      assert.equal(byTitle["bob-1"].ownerId,   bob.id);
-      assert.equal(byTitle["carol-1"].ownerId, carol.id);
+      assert.equal(indexed["alice-1"].ownerId, alice.id);
+      assert.equal(indexed["alice-2"].ownerId, alice.id);
+      assert.equal(indexed["bob-1"].ownerId,   bob.id);
+      assert.equal(indexed["carol-1"].ownerId, carol.id);
     });
 
     it("can update a user's row (cross-owner allowed at ACL layer)", async () => {

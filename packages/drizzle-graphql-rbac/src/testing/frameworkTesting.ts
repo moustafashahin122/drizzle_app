@@ -25,7 +25,6 @@
  * hooks. Each test file decides whether to wrap them in `before`,
  * `transactionCase`, or per-test setup.
  */
-import { createRequire } from "node:module";
 import Database from "better-sqlite3";
 import { drizzle, type BetterSQLite3Database } from "drizzle-orm/better-sqlite3";
 import bcrypt from "bcryptjs";
@@ -46,15 +45,7 @@ import {
 import { syncRoles, setUserRole } from "../graphql/rbac/persistence.js";
 import { getSharedSqlite } from "./transactionCase.js";
 import { jsonFetch, cookieValue } from "./httpTestUtils.js";
-
-// drizzle-kit's ESM bundle has a broken dynamic-require polyfill; the CJS
-// entry works under ESM via createRequire. Same workaround appTestCase uses.
-const kitApi = createRequire(import.meta.url)("drizzle-kit/api") as {
-  pushSQLiteSchema: (
-    imports: Record<string, unknown>,
-    drizzleInstance: unknown,
-  ) => Promise<{ statementsToExecute: string[] }>;
-};
+import { pushDrizzleSchema } from "./schemaPush.js";
 
 /** The framework's table namespace, ready to spread into a schema config. */
 export const frameworkSchema = { roles, users, sessions } as const;
@@ -63,20 +54,10 @@ export type FrameworkDb = BetterSQLite3Database<FrameworkSchema>;
 
 /**
  * Apply the framework DDL (from `tables.ts`) to a sqlite handle via
- * drizzle-kit. Idempotent — drizzle-kit emits no statements on an
- * already-materialized schema, so safe to call repeatedly.
+ * drizzle-kit. Idempotent — safe to call repeatedly.
  */
-export async function pushFrameworkSchema(sqlite: Database.Database): Promise<void> {
-  sqlite.pragma("foreign_keys = ON");
-  const db = drizzle(sqlite, { schema: frameworkSchema });
-  // Routing statements through `db.all()` rejects DDL ("statement does not
-  // return data"); exec the raw SQL instead. On an already-populated DB the
-  // statement list is empty so this is a no-op.
-  const { statementsToExecute } = await kitApi.pushSQLiteSchema(
-    frameworkSchema as unknown as Record<string, unknown>,
-    db,
-  );
-  for (const stmt of statementsToExecute) sqlite.exec(stmt);
+export function pushFrameworkSchema(sqlite: Database.Database): Promise<void> {
+  return pushDrizzleSchema(sqlite, frameworkSchema as unknown as Record<string, unknown>);
 }
 
 /**

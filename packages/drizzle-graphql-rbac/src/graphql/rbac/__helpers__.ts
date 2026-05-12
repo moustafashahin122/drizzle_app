@@ -17,13 +17,17 @@ import Database from "better-sqlite3";
 import { drizzle } from "drizzle-orm/better-sqlite3";
 import { eq, relations } from "drizzle-orm";
 import { sqliteTable, integer, text, type AnySQLiteColumn } from "drizzle-orm/sqlite-core";
+import { graphql, type GraphQLSchema } from "graphql";
 
 import {
-  applySchemaSql,
   getSharedSqlite,
   transactionCase,
 } from "../../testing/index.js";
+import { pushDrizzleSchema } from "../../testing/schemaPush.js";
+import { buildSchema } from "../builder/builder.js";
+import { buildRbac } from "./rbac.js";
 import type { BuiltRbac, RbacContext, ResolvedUserRole } from "./rbac.js";
+import type { RbacConfig } from "./config.js";
 
 // Re-export so test files keep their existing import.
 export { transactionCase };
@@ -62,51 +66,20 @@ export const todosRelations = relations(todos, ({ one }) => ({
 
 export const allTables = { users, roles, todos, usersRelations, todosRelations };
 
-// Apply schema to the shared handle on first import. `IF NOT EXISTS` so
-// modules sharing the handle can call this safely.
-applySchemaSql(`
-  CREATE TABLE IF NOT EXISTS roles (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL UNIQUE,
-    is_admin INTEGER NOT NULL DEFAULT 0
-  );
-  CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL,
-    role_id INTEGER REFERENCES roles(id) ON DELETE SET NULL
-  );
-  CREATE TABLE IF NOT EXISTS todos (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    title TEXT NOT NULL,
-    owner_id INTEGER REFERENCES users(id)
-  );
-`);
-
-/** Shared sqlite + drizzle. */
+/** Shared sqlite + drizzle. Schema is pushed once at module load below. */
 export const sqlite = getSharedSqlite();
 export const db = drizzle(sqlite, { schema: allTables });
 export type Db = typeof db;
 
+// Materialize the rbac test schema onto the shared handle. Top-level await
+// here means every importer transitively awaits this push before running.
+// drizzle-kit's push is idempotent on an already-materialized schema.
+await pushDrizzleSchema(sqlite, allTables);
+
 /** Build an isolated DB with the engine's test schema. */
-export function freshDb(): { sqlite: Database.Database; db: Db } {
+export async function freshDb(): Promise<{ sqlite: Database.Database; db: Db }> {
   const s = new Database(":memory:");
-  s.exec(`
-    CREATE TABLE roles (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      name TEXT NOT NULL UNIQUE,
-      is_admin INTEGER NOT NULL DEFAULT 0
-    );
-    CREATE TABLE users (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      name TEXT NOT NULL,
-      role_id INTEGER REFERENCES roles(id) ON DELETE SET NULL
-    );
-    CREATE TABLE todos (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      title TEXT NOT NULL,
-      owner_id INTEGER REFERENCES users(id)
-    );
-  `);
+  await pushDrizzleSchema(s, allTables);
   return { sqlite: s, db: drizzle(s, { schema: allTables }) };
 }
 
@@ -255,4 +228,58 @@ export async function seedReaderAdmin(rbac: BuiltRbac, targetDb: Db = db) {
   await assignRole(rbac, cast.alice.id, "reader", targetDb);
   await assignRole(rbac, cast.bob.id,   "admin", targetDb);
   return cast;
+}
+
+// ---------------------------------------------------------------------------
+// Shared domain constants — every rbac test that scopes by ownership ends up
+// writing one of these. Hoisting them here makes the intent obvious at the
+// call site (`recordRules: { todos: { read: { domain: DOMAIN_OWN } } }`) and
+// keeps the placeholder spelling consistent.
+// ---------------------------------------------------------------------------
+
+/** Row matches when its `ownerId` column equals the current user's id. */
+export const DOMAIN_OWN: ReadonlyArray<readonly [string, string, string]> = [
+  ["ownerId", "=", "current_user.id"],
+];
+
+/** Row matches when its `id` column equals the current user's id. */
+export const DOMAIN_SELF: ReadonlyArray<readonly [string, string, string]> = [
+  ["id", "=", "current_user.id"],
+];
+
+/**
+ * Index rows by their `title` column. Used everywhere we assert that a
+ * specific titled row has a specific shape — replaces the
+ * `Object.fromEntries(rows.map(r => [r.title, r]))` idiom.
+ */
+export function byTitle<R extends { title: string }>(rows: readonly R[]): Record<string, R> {
+  return Object.fromEntries(rows.map((r) => [r.title, r])) as Record<string, R>;
+}
+
+/**
+ * Self-contained rbac + GraphQL harness over a fresh isolated DB. Used by
+ * tests whose config is part of the contract under test (so they can't
+ * share the suite-level transactionCase ctx). Returns the schema, the
+ * built rbac, the DB, and a thin `run(...)` over `graphql(...)`.
+ *
+ * Promoted from `makeIsolated` (formerly inlined in `rbac.test.ts`).
+ */
+export interface IsolatedRbac {
+  db: Db;
+  rbac: BuiltRbac;
+  schema: GraphQLSchema;
+  run: (
+    source: string,
+    contextValue: any,
+    variableValues?: Record<string, unknown>,
+  ) => ReturnType<typeof graphql>;
+}
+
+export async function isolatedRbac(cfg: RbacConfig): Promise<IsolatedRbac> {
+  const { db: d } = await freshDb();
+  const r = buildRbac(cfg);
+  const sch = buildSchema(d, allTables, { rbac: { enforce: r.enforce } }).schema;
+  const run: IsolatedRbac["run"] = (source, contextValue, variableValues) =>
+    graphql({ schema: sch, source, contextValue, variableValues });
+  return { db: d, rbac: r, schema: sch, run };
 }

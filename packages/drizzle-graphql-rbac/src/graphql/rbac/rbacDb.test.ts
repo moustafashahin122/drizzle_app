@@ -28,8 +28,11 @@ import {
 } from "./config.js";
 
 import {
+  DOMAIN_OWN,
+  DOMAIN_SELF,
   allTables,
   assignRole,
+  byTitle,
   db,
   todos,
   users,
@@ -38,8 +41,6 @@ import {
   transactionCase,
 } from "./__helpers__.js";
 
-const own = [["ownerId", "=", "current_user.id"]];
-const selfOnly = [["id", "=", "current_user.id"]];
 const rbacConfig = {
   roles: defineRoles({
     reader: {},
@@ -50,8 +51,8 @@ const rbacConfig = {
   }),
   recordRules: defineRecordRules({
     reader: {
-      todos: { read: { domain: own } },
-      users: { read: { domain: selfOnly } },
+      todos: { read: { domain: DOMAIN_OWN as any } },
+      users: { read: { domain: DOMAIN_SELF as any } },
     },
   }),
 };
@@ -70,13 +71,13 @@ describe("rbacDb — proxy-specific contracts", () => {
     const rows = await rdb.select().from(todos);
 
     assert.equal(rows.length, 4);
-    const byTitle = Object.fromEntries(rows.map((r: any) => [r.title, r]));
-    assert.deepEqual(Object.keys(byTitle).sort(), [
+    const indexed = byTitle(rows as any[]);
+    assert.deepEqual(Object.keys(indexed).sort(), [
       "alice-1", "alice-2", "bob-1", "carol-1",
     ]);
-    assert.equal(byTitle["alice-1"].ownerId, alice.id);
-    assert.equal(byTitle["bob-1"].ownerId,   bob.id);
-    assert.equal(byTitle["carol-1"].ownerId, carol.id);
+    assert.equal(indexed["alice-1"].ownerId, alice.id);
+    assert.equal(indexed["bob-1"].ownerId,   bob.id);
+    assert.equal(indexed["carol-1"].ownerId, carol.id);
   });
 
   it("forwards orderBy and limit through the proxy, preserving order and length", async () => {
@@ -104,13 +105,13 @@ describe("rbacDb — proxy-specific contracts", () => {
     const rows = await rdb.select().from(todos);
 
     assert.equal(rows.length, 4);
-    const byTitle = Object.fromEntries(rows.map((r: any) => [r.title, r]));
-    assert.deepEqual(Object.keys(byTitle).sort(), [
+    const indexed = byTitle(rows as any[]);
+    assert.deepEqual(Object.keys(indexed).sort(), [
       "alice-1", "alice-2", "bob-1", "carol-1",
     ]);
-    assert.equal(byTitle["alice-1"].ownerId, alice.id);
-    assert.equal(byTitle["bob-1"].ownerId,   bob.id);
-    assert.equal(byTitle["carol-1"].ownerId, carol.id);
+    assert.equal(indexed["alice-1"].ownerId, alice.id);
+    assert.equal(indexed["bob-1"].ownerId,   bob.id);
+    assert.equal(indexed["carol-1"].ownerId, carol.id);
   });
 
   it("rdb.sudo is the unwrapped db — reads and writes skip enforcement", async () => {

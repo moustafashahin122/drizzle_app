@@ -30,15 +30,15 @@ import {
 } from "./config.js";
 
 import {
+  DOMAIN_OWN,
   allTables,
+  byTitle,
   db,
   todos,
   ctxFor,
   seedUserManager,
   transactionCase,
 } from "./__helpers__.js";
-
-const own = [["ownerId", "=", "current_user.id"]];
 
 const rrConfig = {
   roles: defineRoles({
@@ -55,9 +55,9 @@ const rrConfig = {
     // create has no rule — at create time the row does not yet exist.
     user: {
       todos: {
-        read:   { domain: own },
-        update: { domain: own },
-        delete: { domain: own },
+        read:   { domain: DOMAIN_OWN as any },
+        update: { domain: DOMAIN_OWN as any },
+        delete: { domain: DOMAIN_OWN as any },
       },
     },
     // manager: no rule → no narrowing.
@@ -205,13 +205,13 @@ describe("record rules — row-level scoping with full ACL grants", () => {
       const rows = await rdb.select().from(todos);
 
       assert.equal(rows.length, 4);
-      const byTitle = Object.fromEntries(rows.map((r: any) => [r.title, r]));
-      assert.deepEqual(Object.keys(byTitle).sort(), [
+      const indexed = byTitle(rows as any[]);
+      assert.deepEqual(Object.keys(indexed).sort(), [
         "alice-1", "alice-2", "bob-1", "carol-1",
       ]);
-      assert.equal(byTitle["alice-1"].ownerId, alice.id);
-      assert.equal(byTitle["bob-1"].ownerId,   bob.id);
-      assert.equal(byTitle["carol-1"].ownerId, carol.id);
+      assert.equal(indexed["alice-1"].ownerId, alice.id);
+      assert.equal(indexed["bob-1"].ownerId,   bob.id);
+      assert.equal(indexed["carol-1"].ownerId, carol.id);
     });
 
     it("can update a user's row; the user's read view reflects the change", async () => {

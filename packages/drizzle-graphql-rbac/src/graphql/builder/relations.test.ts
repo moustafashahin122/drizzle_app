@@ -8,17 +8,20 @@ import { introspectSchema } from "./relations.js";
 // Schemas are local to this test so the test doesn't depend on the app's
 // real db.ts (and so we can construct different relation shapes per case).
 
-describe("introspectSchema — table indexing", () => {
-  const users = sqliteTable("users", {
-    id: integer("id").primaryKey(),
-    name: text("name").notNull(),
-  });
-  const posts = sqliteTable("posts", {
-    id: integer("id").primaryKey(),
-    body: text("body").notNull(),
-    authorId: integer("author_id").references(() => users.id),
-  });
+// Shared two-table fixture: a users table and a posts table with a single FK
+// from posts.author_id to users.id. Reused across the indexing, auto-FK, and
+// explicit-relations describe blocks.
+const users = sqliteTable("users", {
+  id: integer("id").primaryKey(),
+  name: text("name").notNull(),
+});
+const posts = sqliteTable("posts", {
+  id: integer("id").primaryKey(),
+  body: text("body").notNull(),
+  authorId: integer("author_id").references(() => users.id),
+});
 
+describe("introspectSchema — table indexing", () => {
   const intro = introspectSchema({ users, posts });
 
   it("indexes tables by SQL name and JS key", () => {
@@ -31,16 +34,6 @@ describe("introspectSchema — table indexing", () => {
 });
 
 describe("introspectSchema — auto FK detection", () => {
-  const users = sqliteTable("users", {
-    id: integer("id").primaryKey(),
-    name: text("name").notNull(),
-  });
-  const posts = sqliteTable("posts", {
-    id: integer("id").primaryKey(),
-    body: text("body").notNull(),
-    authorId: integer("author_id").references(() => users.id),
-  });
-
   const intro = introspectSchema({ users, posts });
 
   it("creates a forward 'one' relation named after the FK column's JS key", () => {
@@ -83,16 +76,6 @@ describe("introspectSchema — auto FK detection", () => {
 });
 
 describe("introspectSchema — explicit relations() declarations", () => {
-  const users = sqliteTable("users", {
-    id: integer("id").primaryKey(),
-    name: text("name").notNull(),
-  });
-  const posts = sqliteTable("posts", {
-    id: integer("id").primaryKey(),
-    body: text("body").notNull(),
-    authorId: integer("author_id").references(() => users.id),
-  });
-
   const usersRelations = relations(users, ({ many }) => ({
     authoredPosts: many(posts),
   }));
