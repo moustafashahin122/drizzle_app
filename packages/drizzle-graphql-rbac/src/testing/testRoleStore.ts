@@ -7,8 +7,7 @@
  * bodies terse, we provide an out-of-band store keyed by the `BuiltRbac`
  * instance: `assignRoleForTests` records `(userId → role)`, `ctxForTest`
  * builds a request-shaped ctx that reads from it, and
- * `clearAllRbacMemberships` (re-exported from `transactionCase`) wipes the
- * map at the suite boundary.
+ * `clearTestRoleAssignments` wipes the map at the suite boundary.
  *
  * Nothing here is consulted by production code. The store exists purely so
  * tests do not have to insert a `users` row + a `roles` row + an FK update
@@ -17,7 +16,6 @@
 import type { BuiltRbac, ResolvedUserRole, RbacContext } from "../graphql/rbac/rbac.js";
 
 const ROLE_STORE = new WeakMap<BuiltRbac, Map<number, ResolvedUserRole>>();
-let nextSyntheticRoleId = 1_000;
 
 function storeFor(rbac: BuiltRbac): Map<number, ResolvedUserRole> {
   let s = ROLE_STORE.get(rbac);
@@ -30,7 +28,6 @@ export function assignRoleForTests(rbac: BuiltRbac, userId: number, roleName: st
   const role = rbac.findRole(roleName);
   if (!role) throw new Error(`rbac: unknown role '${roleName}'`);
   storeFor(rbac).set(userId, {
-    id: nextSyntheticRoleId++,
     name: role.key,
     isAdmin: role.isAdmin,
   });

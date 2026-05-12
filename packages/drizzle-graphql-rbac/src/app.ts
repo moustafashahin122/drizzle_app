@@ -385,9 +385,8 @@ export async function createApp(opts: CreateAppOptions): Promise<CreatedApp> {
   });
 
   if (publicDir) {
-    void import("@hono/node-server/serve-static").then(({ serveStatic }) => {
-      app.use("/*", serveStatic({ root: publicDir }));
-    });
+    const { serveStatic } = await import("@hono/node-server/serve-static");
+    app.use("/*", serveStatic({ root: publicDir }));
   }
 
   const syncRoles = () => syncRolesPersistence(db, roleSchema, rbac.roles());

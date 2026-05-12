@@ -26,7 +26,7 @@ import bcrypt from "bcryptjs";
 import { asc, eq, getTableColumns } from "drizzle-orm";
 import type { User, users as usersTableType, roles as rolesTableType } from "../tables.js";
 import type { RbacDb } from "../graphql/rbac/rbacDb.js";
-import type { BuiltRbac } from "../graphql/rbac/rbac.js";
+import type { BuiltRbac, RbacContext } from "../graphql/rbac/rbac.js";
 import type { ColumnMap } from "../graphql/builder/filters.js";
 import {
   requireAuth,
@@ -102,16 +102,16 @@ export function buildAdminRoutes(deps: AdminRoutesDeps) {
     return c.json(r.body, r.status);
   });
 
-  const rdbForReq = (c: Context<AuthEnv>): RbacDb =>
-    rdbFor({ user: c.get("user"), role: c.get("role"), batch: new Map() });
+  const ctxFor = (c: Context<AuthEnv>): RbacContext => ({
+    user: c.get("user"),
+    role: c.get("role"),
+    batch: new Map(),
+  });
+
+  const rdbForReq = (c: Context<AuthEnv>): RbacDb => rdbFor(ctxFor(c));
 
   const requirePerm = (c: Context<AuthEnv>, action: "read" | "update" | "delete") =>
-    rbac.enforce(
-      { user: c.get("user"), role: c.get("role"), batch: new Map() },
-      "users",
-      action,
-      usersColumns,
-    );
+    rbac.enforce(ctxFor(c), "users", action, usersColumns);
 
   const parseIdParam = (c: Context<AuthEnv>): number => {
     const id = Number(c.req.param("id"));
