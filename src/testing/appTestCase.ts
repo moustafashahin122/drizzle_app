@@ -19,5 +19,4 @@ export const { buildAppOnce, setupAppTestCase, createUser } = harness;
 export {
   applySchemaSql,
   getSharedSqlite,
-  clearAllRbacMemberships,
 } from "drizzle-graphql-rbac/testing";

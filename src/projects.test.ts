@@ -19,9 +19,9 @@ const tc = setupAppTestCase(async (base) => {
   const alice = await createUser(base.sudoDb, { name: "Alice", email: "alice@example.com" });
   const bob   = await createUser(base.sudoDb, { name: "Bob",   email: "bob@example.com" });
 
-  base.rbac.assignRole(carol.id, "manager");
-  base.rbac.assignRole(alice.id, "demo");
-  base.rbac.assignRole(bob.id,   "demo");
+  await base.assignRole(carol.id, "manager");
+  await base.assignRole(alice.id, "demo");
+  await base.assignRole(bob.id,   "demo");
 
   const [project] = await base.sudoDb
     .insert(base.schema.projects)

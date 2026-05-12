@@ -24,9 +24,9 @@
  *     │
  *     └─ process exit
  *
- * RBAC role memberships are in-memory and NOT rolled back by savepoints.
- * `setupAppTestCase` calls `clearAllRbacMemberships` before each suite's
- * setUp so suites start from an empty RBAC slate.
+ * RBAC role state lives in the DB (`roles` table + `users.role_id`) so it
+ * is rolled back by the same savepoints that handle every other DB write.
+ * No separate reset hook is needed.
  */
 import { createRequire } from "node:module";
 import { drizzle as drizzleSqlite } from "drizzle-orm/better-sqlite3";
@@ -36,11 +36,9 @@ import { createApp, type CreateAppOptions, type CreatedApp } from "../app.js";
 import { buildSchema as buildGraphqlSchema } from "../graphql/builder/builder.js";
 import { issueSession } from "../auth/session.js";
 import type { BuiltRbac } from "../graphql/rbac/rbac.js";
-import {
-  getSharedSqlite,
-  transactionCase,
-  clearAllRbacMemberships,
-} from "./transactionCase.js";
+import { setUserRole } from "../graphql/rbac/persistence.js";
+import { eq } from "drizzle-orm";
+import { getSharedSqlite, transactionCase } from "./transactionCase.js";
 
 // `drizzle-kit/api`'s ESM bundle uses a broken dynamic-require polyfill that
 // throws on `require("fs")` under native ESM. The CJS entry works, so we
@@ -78,10 +76,16 @@ export interface AppTestCtx<Schema extends AppTestConfig["schema"], Seed> {
   rdbFor: AppHandle<Schema>["rdbFor"];
   /** Hono app — call `app.fetch(new Request(...))`. */
   app: AppHandle<Schema>["app"];
-  /** RBAC engine — `assignRole(userId, key)` to grant memberships. */
+  /** RBAC engine. Read-only at runtime — role registry + enforce hook. */
   rbac: BuiltRbac;
   /** Schema namespace re-export. */
   schema: Schema;
+  /**
+   * Assign a role to a user by writing to `users.role_id` (DB-backed, like
+   * production `setUserRole`). Pass `null` to clear the role. Returns once
+   * the write commits.
+   */
+  assignRole: (userId: number, roleName: string | null) => Promise<void>;
   /**
    * Insert a session row for `userId` and return a Bearer token. Use the
    * returned string as `Authorization: Bearer <token>` to skip cookie
@@ -163,7 +167,7 @@ export function createAppTestHarness<Schema extends AppTestConfig["schema"]>(
       );
       for (const stmt of statementsToExecute) sqlite.exec(stmt);
 
-      const { app, rbac, rdbFor } = createApp({
+      const { app, rbac, rdbFor } = await createApp({
         db: sudoDb,
         ...appConfig,
         // Tests never serve static files and don't need request logging noise.
@@ -196,10 +200,6 @@ export function createAppTestHarness<Schema extends AppTestConfig["schema"]>(
     return transactionCase(async () => {
       const h = await buildAppOnce();
 
-      // Each suite starts from an empty RBAC slate. SAVEPOINTs only roll back
-      // SQL state — role memberships are in-memory and need an explicit reset.
-      clearAllRbacMemberships(h.rbac);
-
       const mintToken = async (userId: number) => {
         const { token } = await issueSession(h.sudoDb, h.schema as any, userId);
         return token;
@@ -223,17 +223,40 @@ export function createAppTestHarness<Schema extends AppTestConfig["schema"]>(
 
       const runDirect: AppTestCtx<Schema, any>["runDirect"] = (query, opts = {}) => {
         const user = opts.user ?? null;
+        // Sync FK lookup mirrors what `sessionMiddleware` does over HTTP.
+        // better-sqlite3 is synchronous under drizzle's thenable façade — using
+        // `.all()` keeps `runDirect` itself sync (no extra await on the test side).
+        let role: { name: string; isAdmin: boolean } | null = null;
+        if (user) {
+          const schema = h.schema as unknown as { roles: any; users: any };
+          const rows = h.sudoDb
+            .select({ name: schema.roles.name, isAdmin: schema.roles.isAdmin })
+            .from(schema.users)
+            .innerJoin(schema.roles, eq(schema.roles.id, schema.users.roleId))
+            .where(eq(schema.users.id, user.id))
+            .limit(1)
+            .all() as Array<{ name: string; isAdmin: boolean | number }>;
+          const row = rows[0];
+          if (row) role = { name: row.name, isAdmin: !!row.isAdmin };
+        }
+        const batch = new Map<string, unknown>();
         return graphql({
           schema: h.graphqlSchema,
           source: query,
           contextValue: {
             user,
+            role,
             session: null,
-            batch: new Map<string, unknown>(),
-            db: h.rdbFor({ user: user as any, batch: new Map() }),
+            batch,
+            db: h.rdbFor({ user: user as any, role, batch }),
           },
           variableValues: opts.variables,
         });
+      };
+
+      const assignRole = async (userId: number, roleName: string | null) => {
+        const schema = h.schema as unknown as { roles: any; users: any };
+        await setUserRole(h.sudoDb, { roles: schema.roles, users: schema.users }, userId, roleName);
       };
 
       const base: Omit<AppTestCtx<Schema, undefined>, "seed"> = {
@@ -245,6 +268,7 @@ export function createAppTestHarness<Schema extends AppTestConfig["schema"]>(
         mintToken,
         runHttp,
         runDirect,
+        assignRole,
       };
 
       const seed = setUp ? await setUp(base) : ({} as any);
@@ -255,11 +279,11 @@ export function createAppTestHarness<Schema extends AppTestConfig["schema"]>(
   const createUser: AppTestHarness<Schema>["createUser"] = async (sudoDb, attrs) => {
     const passwordHash = await bcrypt.hash(attrs.password ?? "secret123", 4);
     const users = (appConfig.schema as any).users;
-    const [row] = await sudoDb
+    const rows = (await sudoDb
       .insert(users)
       .values({ name: attrs.name, email: attrs.email, passwordHash })
-      .returning();
-    return row;
+      .returning()) as any[];
+    return rows[0];
   };
 
   return { buildAppOnce, setupAppTestCase, createUser };

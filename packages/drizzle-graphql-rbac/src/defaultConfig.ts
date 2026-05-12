@@ -38,7 +38,8 @@ export const frameworkDefaultConfig: Partial<ServerConfig> = {
   // Observability
   logger: true,
 
-  // Auto-bootstrap the admin user from ADMIN_EMAIL/ADMIN_PASSWORD when both
-  // are resolved (env or CLI). Opt out with `bootstrapAdmin: false`.
-  bootstrapAdmin: true,
+  // Admin user is NOT created on startup by default. Pass `--create-admin`
+  // (or set `createAdmin: true` in the user config) together with
+  // ADMIN_EMAIL / ADMIN_PASSWORD to upsert the admin user at boot.
+  createAdmin: false,
 };

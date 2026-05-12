@@ -4,10 +4,12 @@
  * Public surface of the framework. The most common entry point is
  * {@link createApp} — it returns a Hono app with REST auth, REST admin user
  * CRUD + role membership, an auto-generated GraphQL endpoint, and RBAC
- * wired through all three. Roles, access rights, record rules, and user→role
- * assignments are all in memory; the engine is built synchronously at startup
- * from the code config (see {@link defineRoles} / {@link defineAccessRights} /
- * {@link defineRecordRules}).
+ * wired through all three. Roles, access rights, and record rules are
+ * declared in code (see {@link defineRoles} / {@link defineAccessRights} /
+ * {@link defineRecordRules}) and the engine is built synchronously at
+ * startup from that config. User→role assignments are persisted to the DB
+ * (`users.role_id` references a row in the `roles` table, which `syncRoles`
+ * reconciles with the in-code config at startup).
  */
 
 // Shared pino logger. Consumers may also construct their own pino instance.
@@ -38,8 +40,8 @@ export type {
 export { frameworkDefaultConfig } from "./defaultConfig.js";
 
 // Framework-owned tables — callers usually re-export these from their own db module.
-export { users, sessions, frameworkTables } from "./tables.js";
-export type { User, NewUser, Session } from "./tables.js";
+export { roles, users, sessions, frameworkTables } from "./tables.js";
+export type { Role, NewRole, User, NewUser, Session } from "./tables.js";
 
 // REST auth primitives.
 export { buildAuthRoutes } from "./auth/routes.js";
@@ -80,17 +82,27 @@ export type {
   RbacEnforce,
   Action,
   BuiltRbac,
+  ResolvedUserRole,
 } from "./graphql/rbac/rbac.js";
 export { buildRbacDb, RbacDb } from "./graphql/rbac/rbacDb.js";
 export type { RbacDbDeps } from "./graphql/rbac/rbacDb.js";
+
+// DB-backed role persistence — sync, lookup, assignment. Exposed so host
+// apps (seed scripts, custom routes) can reconcile or read role state
+// without going through `createApp`.
+export {
+  syncRoles,
+  getUserRole,
+  setUserRole,
+  listRoles,
+} from "./graphql/rbac/persistence.js";
+export type { RolePersistenceSchema } from "./graphql/rbac/persistence.js";
 
 // Framework-owned RBAC entries (the built-in `admin` role) + helper to
 // merge them into a user config when wiring the engine directly.
 export {
   ADMIN_ROLE,
   FRAMEWORK_ROLES,
-  FRAMEWORK_ACCESS_RIGHTS,
-  FRAMEWORK_RECORD_RULES,
   mergeFrameworkRbac,
 } from "./frameworkRbac.js";
 

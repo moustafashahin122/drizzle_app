@@ -203,10 +203,16 @@ await runServer();
 Run it:
 
 ```bash
+# Normal boot — does not touch the users table.
 node --env-file=.env --import tsx server.ts --config ./server.config.ts
+
+# First-time boot — also upsert the admin user from .env and assign the
+# built-in `admin` role. Idempotent; safe to repeat. Failures here are
+# logged but do not stop the server.
+node --env-file=.env --import tsx server.ts --config ./server.config.ts --create-admin
 ```
 
-That's the whole server. GraphiQL is at `/graphql`, REST auth at `/auth/*`, admin at `/admin/*`. When both `ADMIN_EMAIL` and `ADMIN_PASSWORD` resolve, the framework upserts that user and assigns the `admin` role on startup — no manual seeding needed.
+That's the whole server. GraphiQL is at `/graphql`, REST auth at `/auth/*`, admin at `/admin/*`. The framework ships a built-in `admin` role (`isAdmin: true`, full bypass) — see [The framework-owned `admin` role](#the-framework-owned-admin-role) for how it interacts with `--create-admin`.
 
 ---
 
@@ -261,7 +267,7 @@ A baked-in, fully-typed object exported as `frameworkDefaultConfig` (also dynami
 | `hiddenOutputColumns`         | `{ users: ["passwordHash"], sessions: ["token"] }`     |
 | `hiddenInputColumns`          | `{ users: ["passwordHash"], sessions: ["token", "userId"] }` |
 | `logger`                      | `true`                                                 |
-| `bootstrapAdmin`              | `true` (upserts an admin when both secrets are set)    |
+| `createAdmin`                 | `false` — opt in with `--create-admin` once both admin secrets are set |
 
 
 ```ts
@@ -299,11 +305,11 @@ export default defineServerConfig({
   port: 8080,
   csrf: { origin: ["https://app.example.com"] },
   graphqlAllowIntrospection: false,
-  bootstrapAdmin: false, // manage admins via REST/seed scripts instead
+  createAdmin: true, // upsert the admin user on every boot (idempotent)
 });
 ```
 
-The full option set is `ServerConfig`, which extends [`CreateAppOptions`](#the-createapp-api) with `port`, `host`, and `bootstrapAdmin`. **Do not put secrets in this file** — reference them via `process.env.*` only if you really must, but prefer letting the framework's `Secrets` layer resolve them for you.
+The full option set is `ServerConfig`, which extends [`CreateAppOptions`](#the-createapp-api) with `port`, `host`, and `createAdmin`. **Do not put secrets in this file** — reference them via `process.env.*` only if you really must, but prefer letting the framework's `Secrets` layer resolve them for you.
 
 The file can also default-export a JS object (`server.config.js`) if you don't want TS at boot time.
 
@@ -333,11 +339,15 @@ Framework-recognized secrets:
 
 | Secret           | Sources (in precedence order)                        | Used for                                                                   |
 | ---------------- | ---------------------------------------------------- | -------------------------------------------------------------------------- |
-| `adminEmail`     | `--admin-email <s>` → `ADMIN_EMAIL`                  | Admin auto-bootstrap on startup (see below).                               |
-| `adminPassword`  | `--admin-password <s>` → `ADMIN_PASSWORD`            | Admin auto-bootstrap on startup.                                           |
+| `adminEmail`     | `--admin-email <s>` → `ADMIN_EMAIL`                  | Admin user creation (see below).                                           |
+| `adminPassword`  | `--admin-password <s>` → `ADMIN_PASSWORD`            | Admin user creation.                                                       |
 
 
-When both `adminEmail` and `adminPassword` resolve, `runServer` **upserts** that user (bcrypt-hashed) and assigns them the `admin` role before serving the first request. Set `bootstrapAdmin: false` in your config (or `--no-bootstrap-admin` at the CLI) to skip it. Providing only one of the two pair is an error — `runServer` throws with a clear message.
+Admin creation is **opt-in** and only runs when `--create-admin` (or `createAdmin: true` in the config) is set AND both secrets resolve. When triggered, `runServer` upserts that user (bcrypt-hashed) and assigns them the framework's built-in `admin` role before serving the first request. The `admin` role itself is defined inside the framework (`isAdmin: true`, full bypass) — your app should never redefine it.
+
+The bootstrap is **non-fatal**: if the upsert fails (DB locked, missing `users` table, etc.) the error is logged and the server still starts. If `--create-admin` is set but `ADMIN_EMAIL` / `ADMIN_PASSWORD` are missing or only one is provided, a warning is logged and the step is skipped — the server still starts.
+
+Typical operational pattern: deploy with `--create-admin` once (or run a one-shot boot with it), then drop the flag on subsequent restarts.
 
 Your app's own secrets (DB credentials, third-party API keys, …) are read by your config / `db.ts` modules via `process.env.*` — the framework only formally consumes the two above.
 
@@ -371,7 +381,7 @@ Any knob or secret can be supplied on the command line — and the command line 
 | `--graphql-allow-introspection` / `--no-graphql-allow-introspection` | `graphqlAllowIntrospection` | boolean   |
 | `--graphql-require-auth` / `--no-graphql-require-auth`  | `graphqlRequireAuth`             | boolean   |
 | `--max-list-limit <n>`                                  | `maxListLimit`                   | number    |
-| `--bootstrap-admin` / `--no-bootstrap-admin`            | `bootstrapAdmin`                 | boolean   |
+| `--create-admin` / `--no-create-admin`                  | `createAdmin`                    | boolean   |
 | `--admin-email <s>`                                     | secret `adminEmail`              | string    |
 | `--admin-password <s>`                                  | secret `adminPassword`           | string    |
 | `--log-level <s>`                                       | pino level (overrides `LOG_LEVEL`) | string  |
@@ -384,9 +394,12 @@ Boolean flags accept three forms: `--flag` (true), `--flag=false` (or `=0`), and
 node --env-file=.env --import tsx server.ts --config ./server.config.ts \
   --port 8080 --no-graphql-require-auth
 
+# Create the admin user from .env on this boot (non-fatal on error)
+node --env-file=.env --import tsx server.ts --config ./server.config.ts --create-admin
+
 # Inject ad-hoc admin creds without writing to .env
 node --env-file=.env --import tsx server.ts --config ./server.config.ts \
-  --admin-email ops@example.com --admin-password 'temp-rotate-me'
+  --create-admin --admin-email ops@example.com --admin-password 'temp-rotate-me'
 ```
 
 ### Booting
@@ -404,7 +417,7 @@ const { rbac, config, secrets } = await runServer();
 // rbac.assignRole(someUserId, "manager");
 ```
 
-`runServer()` parses CLI flags, loads the config file, merges with `frameworkDefaultConfig`, resolves secrets, builds the app via `createApp`, auto-bootstraps the admin when applicable, and starts a Node listener via `@hono/node-server`. It returns:
+`runServer()` parses CLI flags, loads the config file, merges with `frameworkDefaultConfig`, resolves secrets, builds the app via `createApp`, optionally upserts the admin user (only when `--create-admin` / `createAdmin: true` is set — failures are logged but do not abort startup), and starts a Node listener via `@hono/node-server`. It returns:
 
 - the standard `createApp` handle (`app`, `rbac`, `rdbFor`, `sudoDb`)
 - the resolved `port` and `host`
@@ -589,7 +602,9 @@ There is **no inheritance** — each role's grants stand alone. If `manager` sho
 
 ### The framework-owned `admin` role
 
-`createApp` automatically merges in `admin` (`isAdmin: true`). App authors should not declare a role with key `"admin"` — `mergeFrameworkRbac` throws on collision.
+The framework ships a single built-in role under the key `"admin"` with `isAdmin: true`. `createApp` automatically merges it in via `mergeFrameworkRbac` — app authors must NOT declare a role with key `"admin"` themselves; the merge throws on collision. The constant `ADMIN_ROLE` (`= "admin"`) is exported so tooling and seed scripts can reference the key without hard-coding the literal.
+
+`isAdmin: true` is a **full bypass**: no access-rights check, no record-rule filter, no list cap, no hidden-column trimming. Use it strictly for human operators and service accounts that legitimately need god-mode. Grant ordinary feature access through normal `accessRights` entries on non-admin roles.
 
 If you're calling `buildRbac` directly (lower-level than `createApp`) and want the framework admin, opt in:
 
@@ -599,7 +614,43 @@ import { mergeFrameworkRbac, buildRbac } from "drizzle-graphql-rbac";
 const rbac = buildRbac(mergeFrameworkRbac({ roles, accessRights, recordRules }));
 ```
 
-`isAdmin: true` is a full bypass — no ACL check, no record-rule filter. Don't put it on application roles. Use it for service accounts and dashboard admins; grant feature access through normal `accessRights` entries on non-admin roles.
+#### Creating the admin user
+
+The `admin` *role* always exists. The admin *user* doesn't — `runServer` only creates one when you ask it to. The flow:
+
+1. Put the credentials in `.env` (secrets only — never in the config file):
+
+    ```bash
+    ADMIN_EMAIL=admin@example.com
+    ADMIN_PASSWORD=change-me-in-prod
+    ```
+
+2. Boot with `--create-admin` (or set `createAdmin: true` in your `server.config.ts`):
+
+    ```bash
+    node --env-file=.env --import tsx server.ts --config ./server.config.ts --create-admin
+    ```
+
+What `runServer` does when triggered:
+
+- Bcrypt-hashes the password and **upserts** the row in `users` by email (creates if missing, updates `passwordHash` + `active: true` if present).
+- Assigns the `admin` role to that user in the engine's in-memory membership map.
+- Logs an `info` line with the resolved `userId`.
+
+Safety properties:
+
+- **Opt-in.** Without the flag (or the config knob), the framework never touches the users table on boot — even if `ADMIN_EMAIL` / `ADMIN_PASSWORD` are present in the environment.
+- **Non-fatal.** If the upsert fails (locked DB, missing `users` table, schema mismatch, transient error, …), the failure is logged at `error` and the server still starts. The flag is safe to leave on in CI / restart-on-crash setups.
+- **Half-set is a warning, not a failure.** If `--create-admin` is set but only one of email/password resolves (or both are missing), a `warn` is logged and the step is skipped — the server still starts.
+- **CLI overrides env.** `--admin-email` / `--admin-password` flags take precedence over the `.env` values for the current boot, which is useful for ad-hoc credential rotation.
+
+Typical operational patterns:
+
+- **One-shot seed.** Deploy once with `--create-admin`, then drop the flag on subsequent restarts. Same effect as a manual seed script but with no script to maintain.
+- **Always-on (idempotent).** Set `createAdmin: true` in the config file. Every boot re-asserts the row, so rotating the password is just a `.env` change + a restart.
+- **REST-managed.** Leave the flag off and create the admin via `/auth/register` + an admin role assignment through `/admin/users/:id/roles`. Useful when admin credentials shouldn't live on the host filesystem.
+
+`runServer` can also be programmatically suppressed via `runServer({ skipAdminBootstrap: true })` — useful in tests.
 
 ### Defining access rights
 

@@ -25,6 +25,7 @@ import { applyListArgs, combineWhere } from "./filters.js";
 import type { DomainContext } from "../domain/domain.js";
 import { GraphQLJSON } from "./scalars.js";
 import type { DrizzleLike, Guard, TableMeta } from "./types.js";
+import type { RbacContext } from "../rbac/rbac.js";
 import { selectProjected, whereDomainToSql } from "./util.js";
 
 /**
@@ -83,7 +84,7 @@ function buildListQueryField(
     type: listType(meta),
     args: listArgsConfig(meta),
     resolve: async (_, args, gqlCtx, info) => {
-      const extra = guard ? await guard(gqlCtx, "read") : undefined;
+      const extra = guard ? await guard(gqlCtx as RbacContext, "read") : undefined;
       const userWhere = whereDomainToSql(args?.where, meta, ctx, gqlCtx);
       const where = combineWhere(extra, userWhere);
       // Clamp the caller's limit to the configured cap to defend against
@@ -106,7 +107,7 @@ function buildSingleQueryField(
     type: meta.objectType,
     args: { where: { type: GraphQLJSON }, orderBy: { type: meta.orderByInput } },
     resolve: async (_, args, gqlCtx, info) => {
-      const extra = guard ? await guard(gqlCtx, "read") : undefined;
+      const extra = guard ? await guard(gqlCtx as RbacContext, "read") : undefined;
       const userWhere = whereDomainToSql(args?.where, meta, ctx, gqlCtx);
       const where = combineWhere(extra, userWhere);
       const rows = await applyListArgs(
@@ -139,7 +140,7 @@ function buildInsertMutationField(
       // ACL check only — throws FORBIDDEN if the actor lacks `create` on this
       // resource. Record rules on `create` are not currently modeled, so the
       // returned `where` (if any) is ignored.
-      if (guard) await guard(gqlCtx, "create");
+      if (guard) await guard(gqlCtx as RbacContext, "create");
       return db.insert(meta.table).values(args.values).returning();
     },
   };
@@ -159,7 +160,7 @@ function buildUpdateMutationField(
       where: { type: GraphQLJSON },
     },
     resolve: async (_, args, gqlCtx) => {
-      const extra = guard ? await guard(gqlCtx, "update") : undefined;
+      const extra = guard ? await guard(gqlCtx as RbacContext, "update") : undefined;
       const userWhere = whereDomainToSql(args?.where, meta, ctx, gqlCtx);
       const combined = combineWhere(extra, userWhere);
       // `where` is a nullable arg — a missing user filter combined with no
@@ -186,7 +187,7 @@ function buildDeleteMutationField(
     type: listType(meta),
     args: { where: { type: GraphQLJSON } },
     resolve: async (_, args, gqlCtx) => {
-      const extra = guard ? await guard(gqlCtx, "delete") : undefined;
+      const extra = guard ? await guard(gqlCtx as RbacContext, "delete") : undefined;
       const userWhere = whereDomainToSql(args?.where, meta, ctx, gqlCtx);
       const combined = combineWhere(extra, userWhere);
       // Same defensive guard as update — refuse an unbounded DELETE.

@@ -25,6 +25,7 @@ import {
 
 import {
   allTables,
+  assignRole,
   db,
   todos,
   users,
@@ -215,7 +216,7 @@ describe("rbac — enforcement (GraphQL layer)", () => {
 
     const [u1] = await iso.db.insert(users).values({ name: "Alice" }).returning();
     const [u2] = await iso.db.insert(users).values({ name: "Bob" }).returning();
-    iso.rbac.assignRole(u1.id, "reader");
+    await assignRole(iso.rbac, u1.id, "reader", iso.db);
     await iso.db.insert(todos).values([
       { title: "alice-1", ownerId: u1.id },
       { title: "bob-1",   ownerId: u2.id },
@@ -238,8 +239,8 @@ describe("rbac — enforcement (GraphQL layer)", () => {
   });
 
   describe("config validation (unit)", () => {
-    it("rejects unknown role on assignRole", () => {
-      assert.throws(() => tc.rbac.assignRole(1, "ghost"), /unknown role/);
+    it("rejects unknown role on assignRole", async () => {
+      await assert.rejects(() => assignRole(tc.rbac, 1, "ghost"), /unknown role/);
     });
 
     it("rejects empty roles config at build time", () => {

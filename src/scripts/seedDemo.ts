@@ -11,14 +11,71 @@
  * Run `npm run seed:demo:reset` to wipe the `todos` and `projects` tables
  * before seeding, forcing a fresh demo dataset.
  */
-import { sql } from "drizzle-orm";
-import { logger } from "drizzle-graphql-rbac";
+import bcrypt from "bcryptjs";
+import { eq, sql } from "drizzle-orm";
+import {
+  logger,
+  syncRoles,
+  buildRbacConfig,
+  mergeFrameworkRbac,
+} from "drizzle-graphql-rbac";
 import { sudoDb } from "../sudoDb.js";
-import { projects, todos } from "../schema.js";
-import { DEMO_ADMIN_EMAIL, DEMO_MANAGER_EMAIL, DEMO_USER_EMAIL } from "../demoUsers.js";
-import { upsertUser } from "./bootstrapUsers.js";
+import {
+  projects,
+  todos,
+  roles as rolesTable,
+  users as usersTable,
+} from "../schema.js";
+import {
+  DEMO_ADMIN_EMAIL,
+  DEMO_MANAGER_EMAIL,
+  DEMO_USER_EMAIL,
+} from "../demoUsers.js";
+import { roles as codeRoles } from "../roles.js";
+import { accessRights } from "../accessRights.js";
+import { recordRules } from "../recordRules.js";
 
 const log = logger.child({ component: "app.seed-demo" });
+
+/**
+ * Upsert a demo user and bind them to the named role. The role row must
+ * exist in the `roles` table (it does after `syncRoles` runs above).
+ * Idempotent — re-running refreshes the password hash.
+ */
+async function upsertDemoUser(
+  name: string,
+  email: string,
+  password: string,
+  roleName: string,
+): Promise<number> {
+  const passwordHash = await bcrypt.hash(password, 10);
+  const [role] = await sudoDb
+    .select()
+    .from(rolesTable)
+    .where(eq(rolesTable.name, roleName))
+    .limit(1);
+  if (!role) throw new Error(`seedDemo: role '${roleName}' not found in DB`);
+
+  const [existing] = await sudoDb
+    .select()
+    .from(usersTable)
+    .where(eq(usersTable.email, email))
+    .limit(1);
+  if (existing) {
+    await sudoDb
+      .update(usersTable)
+      .set({ passwordHash, active: true, roleId: role.id })
+      .where(eq(usersTable.id, existing.id));
+    log.info({ email, userId: existing.id, roleName }, "demo user updated");
+    return existing.id;
+  }
+  const [created] = await sudoDb
+    .insert(usersTable)
+    .values({ name, email, passwordHash, active: true, roleId: role.id })
+    .returning();
+  log.info({ email, userId: created.id, roleName }, "demo user created");
+  return created.id;
+}
 
 async function seedDemoTodos(ids: { admin: number; manager: number; user: number }): Promise<void> {
   const [{ count }] = await sudoDb.select({ count: sql<number>`count(*)` }).from(todos);
@@ -75,10 +132,22 @@ async function resetDemoData(): Promise<void> {
 
 export async function seedDemo({ reset = false }: { reset?: boolean } = {}): Promise<void> {
   if (reset) await resetDemoData();
+
+  // Sync the `roles` table with the in-code role config before assigning
+  // `users.role_id` — the server normally does this at startup, but a fresh
+  // checkout might run `seed:demo` before ever starting the server.
+  const merged = mergeFrameworkRbac({ roles: codeRoles, accessRights, recordRules });
+  const resolved = buildRbacConfig(merged);
+  await syncRoles(
+    sudoDb,
+    { users: usersTable, roles: rolesTable },
+    resolved.roles,
+  );
+
   const password = process.env.DEV_PASSWORD ?? "demo123";
-  const adminId = await upsertUser("Demo Admin", DEMO_ADMIN_EMAIL, password);
-  const managerId = await upsertUser("Demo Manager", DEMO_MANAGER_EMAIL, password);
-  const userId = await upsertUser("Demo User", DEMO_USER_EMAIL, password);
+  const adminId   = await upsertDemoUser("Demo Admin",   DEMO_ADMIN_EMAIL,   password, "admin");
+  const managerId = await upsertDemoUser("Demo Manager", DEMO_MANAGER_EMAIL, password, "manager");
+  const userId    = await upsertDemoUser("Demo User",    DEMO_USER_EMAIL,    password, "demo");
   await seedDemoTodos({ admin: adminId, manager: managerId, user: userId });
 }
 

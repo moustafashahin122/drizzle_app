@@ -2,7 +2,7 @@ import { describe, it, before, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import Database from "better-sqlite3";
 import { drizzle } from "drizzle-orm/better-sqlite3";
-import { sqliteTable, integer, text } from "drizzle-orm/sqlite-core";
+import { sqliteTable, integer, text, type AnySQLiteColumn } from "drizzle-orm/sqlite-core";
 import { sql } from "drizzle-orm";
 
 import { buildAuthRoutes } from "./routes.js";
@@ -26,12 +26,20 @@ function cookieFromList(list: string[], name: string): string | null {
 }
 
 // Mirror src/db.ts so tests are hermetic.
+const roles = sqliteTable("roles", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  name: text("name").notNull().unique(),
+  isAdmin: integer("is_admin", { mode: "boolean" }).notNull().default(false),
+});
 const users = sqliteTable("users", {
   id: integer("id").primaryKey({ autoIncrement: true }),
   name: text("name").notNull(),
   email: text("email").notNull().unique(),
   passwordHash: text("password_hash").notNull(),
   active: integer("active", { mode: "boolean" }).notNull().default(true),
+  roleId: integer("role_id").references((): AnySQLiteColumn => roles.id, {
+    onDelete: "set null",
+  }),
   createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
 });
 const sessions = sqliteTable("sessions", {
@@ -48,12 +56,18 @@ let app: ReturnType<typeof buildAuthRoutes>;
 before(() => {
   const sqlite = new Database(":memory:");
   sqlite.exec(`
+    CREATE TABLE roles (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL UNIQUE,
+      is_admin INTEGER NOT NULL DEFAULT 0
+    );
     CREATE TABLE users (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       name TEXT NOT NULL,
       email TEXT NOT NULL UNIQUE,
       password_hash TEXT NOT NULL,
       active INTEGER NOT NULL DEFAULT 1,
+      role_id INTEGER REFERENCES roles(id) ON DELETE SET NULL,
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
     CREATE TABLE sessions (
@@ -65,7 +79,7 @@ before(() => {
     );
   `);
   db = drizzle(sqlite);
-  app = buildAuthRoutes({ db, schema: { users, sessions } });
+  app = buildAuthRoutes({ db, schema: { users, sessions, roles } });
 });
 
 /** Helper: fire a request through a Hono sub-app (defaults to the shared `app`). */
@@ -174,7 +188,7 @@ describe("auth REST — register / login / me / logout", () => {
     });
     const token = cookieFromList(login.setCookieList, "sid")!;
 
-    const before = await resolveSessionFromToken(db, { users, sessions }, token);
+    const before = await resolveSessionFromToken(db, { users, sessions, roles }, token);
     assert.ok(before.user);
 
     const out = await call("POST", "/logout", { headers: authedHeaders(token) });
@@ -182,7 +196,7 @@ describe("auth REST — register / login / me / logout", () => {
     assert.equal(out.body.ok, true);
     assert.match(out.setCookie ?? "", /Max-Age=0/);
 
-    const after = await resolveSessionFromToken(db, { users, sessions }, token);
+    const after = await resolveSessionFromToken(db, { users, sessions, roles }, token);
     assert.equal(after.user, null);
   });
 
@@ -191,12 +205,12 @@ describe("auth REST — register / login / me / logout", () => {
 describe("session helpers", () => {
   it("resolveSessionFromToken returns nulls for missing / unknown tokens", async () => {
     assert.deepEqual(
-      await resolveSessionFromToken(db, { users, sessions }, null),
-      { user: null, session: null },
+      await resolveSessionFromToken(db, { users, sessions, roles }, null),
+      { user: null, session: null, role: null },
     );
     assert.deepEqual(
-      await resolveSessionFromToken(db, { users, sessions }, "not-a-real-token"),
-      { user: null, session: null },
+      await resolveSessionFromToken(db, { users, sessions, roles }, "not-a-real-token"),
+      { user: null, session: null, role: null },
     );
   });
 
@@ -234,7 +248,7 @@ describe("auth REST — login rate limiting", () => {
   beforeEach(() => {
     rlApp = buildAuthRoutes({
       db,
-      schema: { users, sessions },
+      schema: { users, sessions, roles },
       loginRateLimit: { maxPerIpEmail: PER_IP_EMAIL, maxPerIp: PER_IP },
     });
   });

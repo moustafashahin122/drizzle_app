@@ -11,7 +11,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - `npm run db:generate` / `npm run db:migrate` — generate and apply SQL migrations for production-style flows.
 - `npm run db:studio` — Drizzle Studio for browsing `todo.db`.
 - `npm run seed:demo` — runs `src/scripts/seedDemo.ts`, which upserts the three demo users (`demo_admin@example.com` admin, `demo_manager@example.com` manager, `demo_user@example.com` demo) with password `demo123` (override via `DEV_PASSWORD`) and, if `todos` is empty, seeds a demo project + todos. Safe to re-run; todo seeding is one-shot.
-- Server startup runs `src/scripts/bootstrapUsers.ts`, which is now prod-only: in `NODE_ENV === "production"` it requires `ADMIN_EMAIL` / `ADMIN_PASSWORD` and upserts that single admin row. In dev it is a no-op — use `npm run seed:demo` to populate demo data.
+- The initial admin user is no longer auto-created on startup. Create one explicitly via the framework's `--create-admin` flag with `ADMIN_EMAIL` / `ADMIN_PASSWORD` (env or CLI). Demo data is populated via `npm run seed:demo`.
 
 ## Architecture
 

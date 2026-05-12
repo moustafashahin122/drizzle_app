@@ -29,6 +29,7 @@ import {
 
 import {
   allTables,
+  assignRole,
   db,
   todos,
   users,
@@ -257,7 +258,7 @@ describe("rbacDb.query — relational query API", () => {
       recordRules: defineRecordRules({}),
     };
     const localRbac = buildRbac(localConfig);
-    localRbac.assignRole(alice.id, "readerNoUsers");
+    await assignRole(localRbac, alice.id, "readerNoUsers");
     const localRdbFor = buildRbacDb({
       db,
       schema: allTables,

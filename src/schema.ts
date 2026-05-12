@@ -14,8 +14,8 @@ import { sql } from "drizzle-orm";
 import { sqliteTable, integer, text } from "drizzle-orm/sqlite-core";
 import { users } from "drizzle-graphql-rbac/tables";
 
-export { users, sessions, frameworkTables } from "drizzle-graphql-rbac/tables";
-export type { User, NewUser, Session } from "drizzle-graphql-rbac/tables";
+export { roles, users, sessions, frameworkTables } from "drizzle-graphql-rbac/tables";
+export type { Role, NewRole, User, NewUser, Session } from "drizzle-graphql-rbac/tables";
 
 export const projects = sqliteTable("projects", {
   id: integer("id").primaryKey({ autoIncrement: true }),

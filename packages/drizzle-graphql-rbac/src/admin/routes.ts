@@ -1,34 +1,46 @@
 /**
  * @module admin/routes
  *
- * REST endpoints for the admin dashboard's user CRUD and role membership.
- * User CRUD is RBAC-enforced via {@link RbacDb}. Role membership is held in
- * the in-memory RBAC engine — these handlers translate HTTP into engine calls.
+ * REST endpoints for the admin dashboard. User CRUD is RBAC-enforced via
+ * {@link RbacDb}. Role assignment writes directly to `users.role_id` — each
+ * user holds at most one role.
  *
  * | Method | Path                          | Body                                | Auth |
  * |--------|-------------------------------|-------------------------------------|------|
  * | GET    | /admin/users                  | —                                   | yes  |
- * | POST   | /admin/users                  | { name, email, password, active? }  | yes  |
+ * | POST   | /admin/users                  | { name, email, password, active?, roleName? } | yes  |
  * | PATCH  | /admin/users/:id              | partial { name, email, active }     | yes  |
  * | DELETE | /admin/users/:id              | —                                   | yes  |
  * | GET    | /admin/roles                  | —                                   | yes  |
- * | GET    | /admin/users/:id/roles        | —                                   | yes  |
- * | POST   | /admin/users/:id/roles        | { roleKey }                         | yes  |
- * | DELETE | /admin/users/:id/roles/:key   | —                                   | yes  |
+ * | GET    | /admin/users/:id/role         | —                                   | yes  |
+ * | PUT    | /admin/users/:id/role         | { roleName }                        | yes  |
+ * | DELETE | /admin/users/:id/role         | —                                   | yes  |
  *
- * Roles themselves are code-defined; this module only manages membership.
- * Adding a user to a role that isn't defined in the code config returns 400.
+ * Roles themselves are code-defined and persisted into the `roles` table by
+ * `syncRoles` at startup — these endpoints only read the table and update
+ * `users.role_id`. Assigning a role that isn't in the table returns 400.
  */
 import { Hono, type Context } from "hono";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import bcrypt from "bcryptjs";
 import { asc, eq, getTableColumns } from "drizzle-orm";
-import type { User, users as usersTableType } from "../tables.js";
+import type { User, users as usersTableType, roles as rolesTableType } from "../tables.js";
 import type { RbacDb } from "../graphql/rbac/rbacDb.js";
 import type { BuiltRbac } from "../graphql/rbac/rbac.js";
 import type { ColumnMap } from "../graphql/builder/filters.js";
-import { requireAuth, requireAdmin, sessionMiddleware, type AuthEnv } from "../auth/middleware.js";
-import type { SudoDb, SessionSchema } from "../auth/session.js";
+import {
+  requireAuth,
+  requireAdmin,
+  sessionMiddleware,
+  type AuthEnv,
+  type RoleAwareSchema,
+} from "../auth/middleware.js";
+import type { SudoDb } from "../auth/session.js";
+import {
+  listRoles as listPersistedRoles,
+  getUserRole,
+  setUserRole,
+} from "../graphql/rbac/persistence.js";
 import { ADMIN_ROLE } from "../frameworkRbac.js";
 
 class HttpError extends Error {
@@ -55,14 +67,16 @@ function mapError(err: any): { status: ContentfulStatusCode; body: { error: stri
 }
 
 export interface AdminRoutesDeps {
-  /** Raw db, used for session resolution. */
+  /** Raw db, used for session resolution and direct role writes. */
   db: SudoDb;
-  schema: SessionSchema;
+  schema: RoleAwareSchema;
   /** The `users` Drizzle table — passed in so this module has no hard dependency on `../db.js`. */
   usersTable: typeof usersTableType;
+  /** The `roles` Drizzle table — used to list / look up roles for assignment. */
+  rolesTable: typeof rolesTableType;
   /** Per-request RBAC-bound db factory built by `buildRbacDb`. */
-  rdbFor: (ctx: { user: User | null; batch?: Map<string, unknown> }) => RbacDb;
-  /** The RBAC engine — used for role-membership lookups, mutations, and enforcement. */
+  rdbFor: (ctx: import("../graphql/rbac/rbac.js").RbacContext) => RbacDb;
+  /** The RBAC engine — used for resource enforcement. */
   rbac: BuiltRbac;
 }
 
@@ -73,6 +87,7 @@ export interface AdminRoutesDeps {
 export function buildAdminRoutes(deps: AdminRoutesDeps) {
   const { db, schema, rdbFor, usersTable, rbac } = deps;
   const usersColumns = getTableColumns(usersTable) as ColumnMap;
+  const persistenceSchema = { users: schema.users, roles: schema.roles };
   const app = new Hono<AuthEnv>();
   app.use("*", sessionMiddleware(db, schema));
   app.use("*", requireAuth);
@@ -80,7 +95,7 @@ export function buildAdminRoutes(deps: AdminRoutesDeps) {
   // checks below are kept as defense-in-depth, but this top-level gate is the
   // policy: no non-admin role gets access to the admin sub-app, regardless of
   // what RBAC grants they may have on `users`.
-  app.use("*", requireAdmin((userId) => rbac.isAdmin(userId)));
+  app.use("*", requireAdmin);
 
   app.onError((err, c) => {
     const r = mapError(err);
@@ -88,11 +103,11 @@ export function buildAdminRoutes(deps: AdminRoutesDeps) {
   });
 
   const rdbForReq = (c: Context<AuthEnv>): RbacDb =>
-    rdbFor({ user: c.get("user"), batch: new Map() });
+    rdbFor({ user: c.get("user"), role: c.get("role"), batch: new Map() });
 
   const requirePerm = (c: Context<AuthEnv>, action: "read" | "update" | "delete") =>
     rbac.enforce(
-      { user: c.get("user"), batch: new Map() },
+      { user: c.get("user"), role: c.get("role"), batch: new Map() },
       "users",
       action,
       usersColumns,
@@ -113,42 +128,6 @@ export function buildAdminRoutes(deps: AdminRoutesDeps) {
     if (!row) throw new HttpError(404, "Not found");
   };
 
-  const readRoleKey = async (
-    c: Context<AuthEnv>,
-    op: "assign" | "revoke",
-  ): Promise<string> => {
-    if (op === "revoke") return c.req.param("key") ?? "";
-    const body = (await c.req.json().catch(() => ({}))) as { roleKey?: unknown };
-    return typeof body.roleKey === "string" ? body.roleKey.trim() : "";
-  };
-
-  const mutateUserRole = async (
-    c: Context<AuthEnv>,
-    op: "assign" | "revoke",
-  ) => {
-    const id = parseIdParam(c);
-    const roleKey = await readRoleKey(c, op);
-    if (!roleKey) throw new HttpError(400, "roleKey is required");
-
-    await requirePerm(c, "update");
-    if (!rbac.hasRole(roleKey)) throw new HttpError(400, `Unknown role '${roleKey}'`);
-
-    const caller = c.get("user")!;
-    if (roleKey === ADMIN_ROLE && !rbac.listUserRoles(caller.id).includes(ADMIN_ROLE)) {
-      const verb = op === "assign" ? "grant" : "revoke";
-      throw new HttpError(403, `Only admins can ${verb} the admin role`);
-    }
-
-    await requireUserExists(id);
-
-    if (op === "assign") {
-      rbac.assignRole(id, roleKey);
-      return c.json({ userId: id, roles: rbac.listUserRoles(id) }, 201);
-    }
-    rbac.revokeRole(id, roleKey);
-    return c.json({ userId: id, roles: rbac.listUserRoles(id) });
-  };
-
   app.get("/users", async (c) => {
     const rows: User[] = await rdbForReq(c)
       .select()
@@ -163,14 +142,30 @@ export function buildAdminRoutes(deps: AdminRoutesDeps) {
     const email = typeof body.email === "string" ? body.email.trim() : "";
     const password = typeof body.password === "string" ? body.password : "";
     const active = typeof body.active === "boolean" ? body.active : true;
+    const roleName = typeof body.roleName === "string" ? body.roleName.trim() : "";
     if (!name || !email || !password) {
       throw new HttpError(400, "name, email and password are required");
+    }
+
+    // Look up role up front so we surface a 400 before hashing the password.
+    let roleId: number | null = null;
+    if (roleName) {
+      const persisted = await listPersistedRoles(db, persistenceSchema);
+      const role = persisted.find((r) => r.name === roleName);
+      if (!role) throw new HttpError(400, `Unknown role '${roleName}'`);
+      if (role.name === ADMIN_ROLE) {
+        const callerRole = c.get("role");
+        if (callerRole?.name !== ADMIN_ROLE) {
+          throw new HttpError(403, "Only admins can grant the admin role");
+        }
+      }
+      roleId = role.id;
     }
 
     const passwordHash = await bcrypt.hash(password, 12);
     const [row] = await rdbForReq(c)
       .insert(usersTable)
-      .values({ name, email, passwordHash, active })
+      .values({ name, email, passwordHash, active, roleId })
       .returning();
     return c.json({ user: publicUser(row as User) }, 201);
   });
@@ -208,35 +203,88 @@ export function buildAdminRoutes(deps: AdminRoutesDeps) {
     // give unauthorized callers a free way to invalidate any user's sessions).
     await requirePerm(c, "delete");
     // Sessions must go first — `sessions.user_id` has a FK to `users.id`, so
-    // with `foreign_keys=ON` the user delete fails while children exist.
+    // with `foreign_keys=ON` the user delete fails while children exist. The
+    // user's `role_id` column is just a value on the row about to be deleted;
+    // no cleanup needed on the roles table.
     await db.delete(schema.sessions).where(eq(schema.sessions.userId, id));
     const rows: User[] = await rdbForReq(c)
       .delete(usersTable)
       .where(eq(usersTable.id, id))
       .returning();
     if (!rows.length) throw new HttpError(404, "Not found");
-    for (const key of rbac.listUserRoles(id)) rbac.revokeRole(id, key);
     return c.json({ id });
   });
 
   // -------------------------------------------------------------------------
-  // Role membership (in-memory)
+  // Role assignment (DB-backed; one role per user)
   // -------------------------------------------------------------------------
 
   app.get("/roles", async (c) => {
     await requirePerm(c, "read");
-    return c.json({ roles: rbac.listRoleKeys() });
+    const rows = await listPersistedRoles(db, persistenceSchema);
+    return c.json({
+      roles: rows
+        .map((r) => ({ name: r.name, isAdmin: r.isAdmin }))
+        .sort((a, b) => a.name.localeCompare(b.name)),
+    });
   });
 
-  app.get("/users/:id/roles", async (c) => {
+  app.get("/users/:id/role", async (c) => {
     const id = parseIdParam(c);
     await requirePerm(c, "read");
     await requireUserExists(id);
-    return c.json({ userId: id, roles: rbac.listUserRoles(id) });
+    const role = await getUserRole(db, persistenceSchema, id);
+    return c.json({
+      userId: id,
+      role: role ? { name: role.name, isAdmin: role.isAdmin } : null,
+    });
   });
 
-  app.post("/users/:id/roles", (c) => mutateUserRole(c, "assign"));
-  app.delete("/users/:id/roles/:key", (c) => mutateUserRole(c, "revoke"));
+  app.put("/users/:id/role", async (c) => {
+    const id = parseIdParam(c);
+    const body = (await c.req.json().catch(() => ({}))) as { roleName?: unknown };
+    const roleName = typeof body.roleName === "string" ? body.roleName.trim() : "";
+    if (!roleName) throw new HttpError(400, "roleName is required");
+
+    await requirePerm(c, "update");
+
+    const callerRole = c.get("role");
+    if (roleName === ADMIN_ROLE && callerRole?.name !== ADMIN_ROLE) {
+      throw new HttpError(403, "Only admins can grant the admin role");
+    }
+
+    await requireUserExists(id);
+    let assigned;
+    try {
+      assigned = await setUserRole(db, persistenceSchema, id, roleName);
+    } catch (e: any) {
+      if (String(e?.message ?? "").startsWith("rbac: unknown role")) {
+        throw new HttpError(400, `Unknown role '${roleName}'`);
+      }
+      throw e;
+    }
+    return c.json({
+      userId: id,
+      role: assigned ? { name: assigned.name, isAdmin: assigned.isAdmin } : null,
+    });
+  });
+
+  app.delete("/users/:id/role", async (c) => {
+    const id = parseIdParam(c);
+    await requirePerm(c, "update");
+
+    // Revoking the admin role from another admin requires the caller to be
+    // an admin themselves — same policy as PUT, applied to the demotion path.
+    const callerRole = c.get("role");
+    const target = await getUserRole(db, persistenceSchema, id);
+    if (target?.name === ADMIN_ROLE && callerRole?.name !== ADMIN_ROLE) {
+      throw new HttpError(403, "Only admins can revoke the admin role");
+    }
+
+    await requireUserExists(id);
+    await setUserRole(db, persistenceSchema, id, null);
+    return c.json({ userId: id, role: null });
+  });
 
   return app;
 }

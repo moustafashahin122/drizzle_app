@@ -37,7 +37,6 @@
  */
 import { before, beforeEach, afterEach, after } from "node:test";
 import Database from "better-sqlite3";
-import type { BuiltRbac } from "../graphql/rbac/rbac.js";
 
 type Sqlite = Database.Database;
 
@@ -71,18 +70,6 @@ export function applySchemaSql(sql: string): void {
 }
 
 /**
- * Revoke every role membership the rbac engine currently holds. Useful in a
- * suite's `setUpClass` when you build the app once per process but want each
- * suite to start from a clean rbac slate.
- *
- * Delegates to {@link BuiltRbac.clearAllMemberships}; `maxId` is retained
- * for backwards-compatibility but is no longer consulted.
- */
-export function clearAllRbacMemberships(rbac: BuiltRbac, _maxId = 10_000): void {
-  rbac.clearAllMemberships();
-}
-
-/**
  * Suite fixture. Pass a `setUpClass` function that builds and returns the
  * suite's baseline state — typically a freshly-built rbac engine and
  * whatever seed data the suite needs. The function runs once in a `before`
@@ -105,7 +92,7 @@ export function clearAllRbacMemberships(rbac: BuiltRbac, _maxId = 10_000): void 
  * are NOT rolled back by these savepoints — only SQL state is. If a suite
  * mutates non-DB state per-test, it must reset that state explicitly.
  */
-export function transactionCase<Ctx>(
+export function transactionCase<Ctx extends object>(
   setUpClass: () => Promise<Ctx> | Ctx,
 ): Ctx {
   let ctx: Ctx | undefined;

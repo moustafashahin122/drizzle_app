@@ -14,7 +14,6 @@ export {
   getSharedSqlite,
   applySchemaSql,
   transactionCase,
-  clearAllRbacMemberships,
 } from "./transactionCase.js";
 export {
   createAppTestHarness,

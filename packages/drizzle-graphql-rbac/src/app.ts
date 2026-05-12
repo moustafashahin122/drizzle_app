@@ -4,13 +4,13 @@
  * `createApp` is the all-in-one composition root. It wires:
  *
  * 1. {@link buildSchema} — auto-generated GraphQL CRUD over the user's Drizzle
- *    schema (your tables plus the framework's `users` / `sessions`).
- * 2. {@link buildRbac} — in-memory RBAC engine built synchronously from the
- *    code config. User→role membership lives in the engine and is mutated by
- *    the admin sub-app.
+ *    schema (your tables plus the framework's `users` / `sessions` / `roles`).
+ * 2. {@link buildRbac} — RBAC engine built synchronously from the in-code role
+ *    config. The engine is read-only; user→role membership is persisted in
+ *    `users.role_id` and reconciled with the `roles` table by `syncRoles`.
  * 3. {@link buildAuthRoutes} — REST `/auth/{register,login,logout,me}`.
  * 4. {@link buildAdminRoutes} — REST `/admin/users` (RBAC-enforced) plus
- *    `/admin/users/:id/roles` for managing role membership.
+ *    `/admin/users/:id/role` for managing role assignment.
  * 5. A Yoga GraphQL handler at `POST /graphql` that consumes the same
  *    session middleware so resolvers see the authenticated user.
  *
@@ -28,8 +28,9 @@
  *   schema,
  *   rbac: { roles, accessRights, recordRules },
  * });
- * // Optionally seed memberships before serving traffic:
- * // rbac.assignRole(adminUserId, "admin");
+ * // Role assignment is DB-backed — use the admin REST endpoints
+ * // (`PUT /admin/users/:id/role`) or `setUserRole(sudoDb, ...)` from
+ * // `graphql/rbac/persistence` for seed scripts.
  * serve({ fetch: app.fetch, port: 3000 });
  */
 import { Hono } from "hono";
@@ -39,23 +40,29 @@ import { createYoga } from "graphql-yoga";
 import { NoSchemaIntrospectionCustomRule } from "graphql/validation";
 import { buildSchema, type BuildSchemaOptions } from "./graphql/builder/builder.js";
 import { depthLimit } from "./graphql/index.js";
-import { buildRbac, type BuiltRbac, type RbacContext } from "./graphql/rbac/rbac.js";
+import {
+  buildRbac,
+  type BuiltRbac,
+  type RbacContext,
+  type ResolvedUserRole,
+} from "./graphql/rbac/rbac.js";
 import type { RbacConfig } from "./graphql/rbac/config.js";
 import { mergeFrameworkRbac } from "./frameworkRbac.js";
 import { buildRbacDb, type RbacDb } from "./graphql/rbac/rbacDb.js";
+import {
+  syncRoles as syncRolesPersistence,
+  getUserRole,
+  setUserRole,
+  listRoles,
+  type RolePersistenceSchema,
+} from "./graphql/rbac/persistence.js";
 import { buildAuthRoutes } from "./auth/routes.js";
 import { buildAdminRoutes } from "./admin/routes.js";
-import { sessionMiddleware, type AuthEnv } from "./auth/middleware.js";
+import { sessionMiddleware, type AuthEnv, type RoleAwareSchema } from "./auth/middleware.js";
 import { createCsrfProtection, type CsrfConfig } from "./auth/csrf.js";
-import {
-  type SudoDb,
-  type SessionSchema,
-} from "./auth/session.js";
+import { type SudoDb } from "./auth/session.js";
 import { logger } from "./logger.js";
-import type {
-  User,
-  Session,
-} from "./tables.js";
+import type { User, Session, Role, roles as rolesTable } from "./tables.js";
 
 // Hono's logger may pre-color the status code with its own ANSI escapes; strip
 // them before sniffing for a three-digit status.
@@ -82,7 +89,7 @@ export interface CreateAppOptions {
    * builder iterates this map and brand-checks each entry, so over-tightening
    * here would force every host app to upcast at the call site.
    */
-  schema: Record<string, unknown> & SessionSchema;
+  schema: Record<string, unknown> & SessionSchema & { roles: typeof rolesTable };
   /**
    * The code-defined RBAC config — roles, access rights, and record rules.
    * Conventionally three small files in the host app: `src/roles.ts`,
@@ -178,8 +185,16 @@ export interface CreateAppOptions {
 export interface CreatedApp {
   /** The Hono app — call `.fetch` from `@hono/node-server` or any Web Fetch host. */
   app: Hono<AuthEnv>;
-  /** The RBAC engine — call `assignRole` / `revokeRole` to seed memberships at startup. */
+  /** The RBAC engine — read-only registry; runtime state lives in the DB. */
   rbac: BuiltRbac;
+  /**
+   * Reconcile the persisted `roles` table with the in-code role config and
+   * refresh `is_admin` on every surviving row. Idempotent — safe to call at
+   * any time. `createApp` already runs this once before returning, so most
+   * callers do not need to invoke it manually; re-call it after a config
+   * reload or a manual DB edit if you need to re-converge.
+   */
+  syncRoles(): Promise<Role[]>;
   /**
    * Per-request RBAC-bound DB factory; re-exported so callers can write
    * custom routes. Pass the request's resolved auth context (the same shape
@@ -188,20 +203,26 @@ export interface CreatedApp {
   rdbFor: (ctx: RbacContext) => RbacDb;
   /**
    * The raw, unwrapped Drizzle handle, re-exported under a name that flags
-   * its bypass semantics. Use it only in pre-user bootstrap paths (startup
-   * role seeding, seed scripts, anywhere that must run before a user
-   * context exists). Per-request code should go through `rdbFor`.
+   * its bypass semantics. Use it only in pre-user bootstrap paths (seed
+   * scripts, anywhere that must run before a user context exists).
+   * Per-request code should go through `rdbFor`.
    */
   sudoDb: SudoDb;
 }
 
 /**
  * Build the full Hono app with REST auth, REST admin, GraphQL CRUD, and
- * RBAC enforcement wired together. The RBAC engine is built synchronously
- * from the code config; memberships start empty and are added via the
- * returned `rbac` handle or the admin REST endpoints.
+ * RBAC enforcement wired together.
+ *
+ * Returns a Promise: this function runs `syncRoles` against the DB as part
+ * of construction so the `roles` table is reconciled with the in-code
+ * config before the app starts handling traffic. Host code should `await`
+ * `createApp(...)` before calling `serve(...)`.
+ *
+ * The returned `syncRoles()` is still exposed for callers that want to
+ * re-run reconciliation later (e.g. seed scripts or hot config reload).
  */
-export function createApp(opts: CreateAppOptions): CreatedApp {
+export async function createApp(opts: CreateAppOptions): Promise<CreatedApp> {
   const {
     db,
     schema,
@@ -223,9 +244,14 @@ export function createApp(opts: CreateAppOptions): CreatedApp {
   const loggingEnabled = loggerOpt !== false;
   const log = logger.child({ component: "framework.app" });
 
-  const sessionSchema: SessionSchema = {
+  const roleSchema: RolePersistenceSchema = {
+    users: schema.users,
+    roles: schema.roles,
+  };
+  const roleAwareSchema: RoleAwareSchema = {
     users: schema.users,
     sessions: schema.sessions,
+    roles: schema.roles,
   };
 
   // Merge framework-owned roles (currently just `admin`) into the user-supplied
@@ -248,11 +274,13 @@ export function createApp(opts: CreateAppOptions): CreatedApp {
   interface ServerCtx {
     user: User | null;
     session: Session | null;
+    role: ResolvedUserRole | null;
   }
 
   interface YogaContext {
     user: User | null;
     session: Session | null;
+    role: ResolvedUserRole | null;
     batch: Map<string, unknown>;
     db: RbacDb;
   }
@@ -267,27 +295,29 @@ export function createApp(opts: CreateAppOptions): CreatedApp {
     logging: loggingEnabled,
     plugins: [
       {
-        onValidate({ addValidationRule, context }) {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any -- yoga plugin args are inferred via the generic context type which the loose top-level YogaContext shape elides; refining each plugin would require duplicating the generic.
+        onValidate({ addValidationRule, context }: { addValidationRule: (rule: any) => void; context: any }) {
           addValidationRule(depthLimit(graphqlMaxDepth));
           // Introspection is gated to admins even when allowed by config:
           // GraphiQL's autocomplete reveals the full schema shape (including
           // hidden columns by name), so non-admin sessions only ever see the
-          // surface they're allowed to query.
-          const user = (context as { user?: User | null } | undefined)?.user ?? null;
-          const callerIsAdmin = user != null && rbac.isAdmin(user.id);
-          if (!graphqlAllowIntrospection || !callerIsAdmin) {
+          // surface they're allowed to query. The role was pre-resolved by
+          // `sessionMiddleware` so this stays synchronous.
+          const role = (context as { role?: ResolvedUserRole | null } | undefined)?.role ?? null;
+          if (!graphqlAllowIntrospection || role?.isAdmin !== true) {
             addValidationRule(NoSchemaIntrospectionCustomRule);
           }
         },
       },
     ],
-    context: async ({ user, session }) => {
+    context: async ({ user, session, role }) => {
       const batch = new Map<string, unknown>();
       return {
         user: user ?? null,
         session: session ?? null,
+        role: role ?? null,
         batch,
-        db: rdbFor({ user: user ?? null, batch }),
+        db: rdbFor({ user: user ?? null, role: role ?? null, batch }),
       };
     },
   });
@@ -324,21 +354,22 @@ export function createApp(opts: CreateAppOptions): CreatedApp {
     "/auth",
     buildAuthRoutes({
       db,
-      schema: sessionSchema,
+      schema: roleAwareSchema,
     }),
   );
   app.route(
     "/admin",
     buildAdminRoutes({
       db,
-      schema: sessionSchema,
+      schema: roleAwareSchema,
       usersTable: schema.users,
+      rolesTable: schema.roles,
       rdbFor,
       rbac,
     }),
   );
 
-  app.use(graphqlEndpoint, sessionMiddleware(db, sessionSchema));
+  app.use(graphqlEndpoint, sessionMiddleware(db, roleAwareSchema));
   app.all(graphqlEndpoint, async (c) => {
     if (graphqlRequireAuth && !c.get("user")) {
       // Reject anonymous traffic before query parsing — closes the parser as
@@ -349,6 +380,7 @@ export function createApp(opts: CreateAppOptions): CreatedApp {
     return yoga.fetch(c.req.raw, {
       user: c.get("user"),
       session: c.get("session"),
+      role: c.get("role"),
     });
   });
 
@@ -358,5 +390,17 @@ export function createApp(opts: CreateAppOptions): CreatedApp {
     });
   }
 
-  return { app, rbac, rdbFor, sudoDb: db };
+  const syncRoles = () => syncRolesPersistence(db, roleSchema, rbac.roles());
+
+  // Reconcile the `roles` table with the in-code role config before the
+  // returned app is allowed to serve traffic. Failures here are surfaced
+  // synchronously so the host can decide whether to abort startup.
+  await syncRoles();
+
+  return { app, rbac, syncRoles, rdbFor, sudoDb: db };
 }
+
+// Re-exported helpers — host apps building custom routes against role state
+// can reach them through `createApp`'s exports without learning about the
+// persistence-module path.
+export { getUserRole, setUserRole, listRoles };

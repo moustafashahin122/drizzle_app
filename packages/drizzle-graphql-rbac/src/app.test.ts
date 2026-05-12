@@ -15,25 +15,33 @@ import bcrypt from "bcryptjs";
 import { sql } from "drizzle-orm";
 
 import { createApp } from "./app.js";
-import { users, sessions } from "./tables.js";
+import { roles, users, sessions } from "./tables.js";
 import {
   defineRoles,
   defineAccessRights,
   defineRecordRules,
 } from "./graphql/rbac/config.js";
+import { setUserRole } from "./graphql/rbac/persistence.js";
 
-const frameworkSchema = { users, sessions } as Record<string, unknown> & {
+const frameworkSchema = { roles, users, sessions } as Record<string, unknown> & {
+  roles: typeof roles;
   users: typeof users;
   sessions: typeof sessions;
 };
 
 const FRAMEWORK_DDL = `
+  CREATE TABLE roles (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE,
+    is_admin INTEGER NOT NULL DEFAULT 0
+  );
   CREATE TABLE users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL,
     email TEXT NOT NULL UNIQUE,
     password_hash TEXT NOT NULL,
     active INTEGER NOT NULL DEFAULT 1,
+    role_id INTEGER REFERENCES roles(id) ON DELETE SET NULL,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
   );
   CREATE TABLE sessions (
@@ -51,11 +59,11 @@ const emptyRbac = {
   recordRules: defineRecordRules({}),
 };
 
-function buildApp(overrides: Partial<Parameters<typeof createApp>[0]> = {}) {
+async function buildApp(overrides: Partial<Parameters<typeof createApp>[0]> = {}) {
   const sqlite = new Database(":memory:");
   sqlite.exec(FRAMEWORK_DDL);
   const db = drizzle(sqlite);
-  const { app, rbac, sudoDb } = createApp({
+  const { app, rbac, sudoDb } = await createApp({
     db,
     schema: frameworkSchema,
     rbac: emptyRbac,
@@ -80,7 +88,7 @@ async function seedAndLogin(
     .insert(users)
     .values({ name, email, passwordHash, active: true })
     .returning();
-  rbac.assignRole(u.id, role);
+  await setUserRole(sudoDb, { roles, users }, u.id, role);
   const res = await app.fetch(
     new Request("http://t.local/auth/login", {
       method: "POST",
@@ -120,7 +128,7 @@ async function gql(
 
 describe("createApp — graphqlRequireAuth (HTTP-layer auth gate)", () => {
   it("rejects anonymous /graphql with 401 and a plain JSON error envelope (no parse)", async () => {
-    const { app } = buildApp(); // default: auth required
+    const { app } = await buildApp(); // default: auth required
     // Use an obviously invalid query body — proves the parser is NOT reached:
     // a non-auth-gated endpoint would respond with a GraphQL validation error.
     const { status, body } = await gql(app, "this is not graphql syntax");
@@ -129,7 +137,7 @@ describe("createApp — graphqlRequireAuth (HTTP-layer auth gate)", () => {
   });
 
   it("allows authenticated /graphql through to the resolver layer", async () => {
-    const { app, sudoDb, rbac } = buildApp();
+    const { app, sudoDb, rbac } = await buildApp();
     const sid = await seedAndLogin(app, sudoDb, rbac);
     const { status, body } = await gql(app, `{ users { id name } }`, { token: sid });
     assert.equal(status, 200);
@@ -140,7 +148,7 @@ describe("createApp — graphqlRequireAuth (HTTP-layer auth gate)", () => {
   });
 
   it("opt-out (graphqlRequireAuth=false) lets anonymous traffic reach resolvers (RBAC then denies)", async () => {
-    const { app } = buildApp({ graphqlRequireAuth: false });
+    const { app } = await buildApp({ graphqlRequireAuth: false });
     const { status, body } = await gql(app, `{ users { id } }`);
     // Resolver-layer RBAC takes over: the request parses + validates, then
     // enforce throws "Not authenticated" inside the resolver. The shape is a
@@ -156,7 +164,7 @@ describe("createApp — graphqlAllowIntrospection", () => {
   const INTROSPECTION_Q = `{ __schema { types { name } } }`;
 
   it("allowed (default in non-production): admin can introspect", async () => {
-    const { app, sudoDb, rbac } = buildApp();
+    const { app, sudoDb, rbac } = await buildApp();
     const sid = await seedAndLogin(app, sudoDb, rbac, {
       role: "admin",
       email: "admin@x.com",
@@ -175,7 +183,7 @@ describe("createApp — graphqlAllowIntrospection", () => {
   it("allowed (default in non-production): non-admin is rejected by introspection rule", async () => {
     // Introspection reveals the full schema shape (including names of hidden
     // columns), so even when the flag is on we only hand it to admins.
-    const { app, sudoDb, rbac } = buildApp();
+    const { app, sudoDb, rbac } = await buildApp();
     const sid = await seedAndLogin(app, sudoDb, rbac); // default role: "user"
     const { status, body } = await gql(app, INTROSPECTION_Q, { token: sid });
     assert.equal(status, 200);
@@ -187,7 +195,7 @@ describe("createApp — graphqlAllowIntrospection", () => {
   });
 
   it("disabled: __schema is rejected at validation time with GraphQL errors[]", async () => {
-    const { app, sudoDb, rbac } = buildApp({ graphqlAllowIntrospection: false });
+    const { app, sudoDb, rbac } = await buildApp({ graphqlAllowIntrospection: false });
     const sid = await seedAndLogin(app, sudoDb, rbac);
     const { status, body } = await gql(app, INTROSPECTION_Q, { token: sid });
     assert.equal(status, 200, "validation error returns 200 + errors[], not HTTP 4xx");
@@ -207,7 +215,7 @@ describe("createApp — graphqlAllowIntrospection", () => {
   });
 
   it("disabled: non-introspection queries still work (validation rule is targeted)", async () => {
-    const { app, sudoDb, rbac } = buildApp({ graphqlAllowIntrospection: false });
+    const { app, sudoDb, rbac } = await buildApp({ graphqlAllowIntrospection: false });
     const sid = await seedAndLogin(app, sudoDb, rbac);
     const { status, body } = await gql(app, `{ users { id name } }`, { token: sid });
     assert.equal(status, 200);
@@ -217,7 +225,7 @@ describe("createApp — graphqlAllowIntrospection", () => {
   });
 
   it("disabled: GraphiQL HTML/JS page is not served (GET /graphql does not render GraphiQL)", async () => {
-    const { app, sudoDb, rbac } = buildApp({ graphqlAllowIntrospection: false });
+    const { app, sudoDb, rbac } = await buildApp({ graphqlAllowIntrospection: false });
     const sid = await seedAndLogin(app, sudoDb, rbac);
     // GET /graphql with an Accept that would otherwise yield the IDE page.
     const res = await app.fetch(
@@ -247,7 +255,7 @@ describe("createApp — default hiddenOutputColumns", () => {
     ];
     for (const c of cases) {
       await t.test(`${c.bannedField} not selectable`, async () => {
-        const { app, sudoDb, rbac } = buildApp();
+        const { app, sudoDb, rbac } = await buildApp();
         const sid = await seedAndLogin(app, sudoDb, rbac);
         const { status, body } = await gql(app, c.query, { token: sid });
         assert.equal(status, 200, "validation error returns 200 + errors[]");
@@ -287,7 +295,7 @@ describe("createApp — CSRF protection (origin gate via hono/csrf)", () => {
   }
 
   it("default config blocks foreign-origin form POSTs (403) and lets JSON through", async () => {
-    const { app } = buildApp();
+    const { app } = await buildApp();
     // Form-encoded from an attacker origin → blocked.
     assert.equal(
       await post(app, "application/x-www-form-urlencoded", { origin: "http://evil.example" }),
@@ -302,7 +310,7 @@ describe("createApp — CSRF protection (origin gate via hono/csrf)", () => {
   });
 
   it("default config allows same-origin form POSTs (passes through to the route handler)", async () => {
-    const { app } = buildApp();
+    const { app } = await buildApp();
     // Same-origin form POST should reach the auth route — which then returns
     // 400 (missing fields) since the form body isn't a valid login payload.
     // The point is that CSRF did NOT short-circuit with 403.
@@ -313,7 +321,7 @@ describe("createApp — CSRF protection (origin gate via hono/csrf)", () => {
   });
 
   it("csrf: { origin: <allowlist> } gates by exact match", async () => {
-    const { app } = buildApp({ csrf: { origin: "https://trusted.example" } });
+    const { app } = await buildApp({ csrf: { origin: "https://trusted.example" } });
     assert.equal(
       await post(app, "application/x-www-form-urlencoded", { origin: "https://trusted.example" }),
       // Trusted origin: reaches the route → 400 missing fields.
@@ -326,7 +334,7 @@ describe("createApp — CSRF protection (origin gate via hono/csrf)", () => {
   });
 
   it("csrf: false disables protection (foreign-origin form POST reaches the route)", async () => {
-    const { app } = buildApp({ csrf: false });
+    const { app } = await buildApp({ csrf: false });
     // Without CSRF, even an evil-origin form POST is forwarded — auth then
     // 400s on the malformed body, proving the request was not blocked at 403.
     assert.equal(

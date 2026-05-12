@@ -38,6 +38,9 @@
  *
  *     // boot
  *     node --env-file=.env --import tsx server.ts --config ./server.config.ts
+ *     # create the admin user from .env on first boot (idempotent, non-fatal on error):
+ *     node --env-file=.env --import tsx server.ts \
+ *       --config ./server.config.ts --create-admin
  *     # any knob or secret can be overridden via CLI:
  *     node --env-file=.env --import tsx server.ts \
  *       --config ./server.config.ts --port 8080 --admin-password override
@@ -50,6 +53,8 @@ import bcrypt from "bcryptjs";
 import { createApp, type CreateAppOptions, type CreatedApp } from "./app.js";
 import { logger } from "./logger.js";
 import { frameworkDefaultConfig } from "./defaultConfig.js";
+import { setUserRole } from "./graphql/rbac/persistence.js";
+import { users as usersTable, roles as rolesTable } from "./tables.js";
 
 /** Secrets the framework resolves from `.env` or CLI flags. */
 export interface Secrets {
@@ -69,14 +74,16 @@ export interface ServerConfig extends CreateAppOptions {
   /** Network interface to bind. @default `"0.0.0.0"` (all interfaces) */
   host?: string;
   /**
-   * When `true` (the default) and both `ADMIN_EMAIL` and `ADMIN_PASSWORD`
-   * are resolved (from `.env` or CLI), `runServer` upserts that user on
-   * startup and assigns them the `admin` role. Set to `false` to manage
-   * admin accounts entirely through the REST API or seed scripts.
+   * When `true` AND both `ADMIN_EMAIL` and `ADMIN_PASSWORD` are resolved
+   * (from `.env` or CLI), `runServer` upserts that user on startup and
+   * assigns them the framework's `admin` role. Disabled by default — opt in
+   * with `--create-admin` (CLI) or `createAdmin: true` (user config).
    *
-   * @default true
+   * Failures are logged but do not stop the server.
+   *
+   * @default false
    */
-  bootstrapAdmin?: boolean;
+  createAdmin?: boolean;
 }
 
 /**
@@ -100,7 +107,7 @@ interface CliKnobs {
   graphqlAllowIntrospection?: boolean;
   graphqlRequireAuth?: boolean;
   maxListLimit?: number;
-  bootstrapAdmin?: boolean;
+  createAdmin?: boolean;
 }
 
 interface CliSecrets {
@@ -130,7 +137,7 @@ const FLAG_SPECS: Record<string, FlagSpec> = {
   "--graphql-allow-introspection": { type: "bool",   bucket: "knobs",   key: "graphqlAllowIntrospection" },
   "--graphql-require-auth":        { type: "bool",   bucket: "knobs",   key: "graphqlRequireAuth" },
   "--max-list-limit":              { type: "number", bucket: "knobs",   key: "maxListLimit" },
-  "--bootstrap-admin":             { type: "bool",   bucket: "knobs",   key: "bootstrapAdmin" },
+  "--create-admin":                { type: "bool",   bucket: "knobs",   key: "createAdmin" },
   "--admin-email":                 { type: "string", bucket: "secrets", key: "adminEmail" },
   "--admin-password":              { type: "string", bucket: "secrets", key: "adminPassword" },
   "--config":                      { type: "string", bucket: "config" },
@@ -251,63 +258,40 @@ export function loadSecrets(cliOverrides?: CliSecrets): Secrets {
 
 async function bootstrapAdminUser(
   handle: CreatedApp,
-  schema: Record<string, unknown>,
   email: string,
   password: string,
 ): Promise<void> {
   const log = logger.child({ component: "framework.bootstrap" });
-  const usersTable = (schema as { users?: unknown }).users as
-    | {
-        id: unknown;
-        email: unknown;
-      }
-    | undefined;
-  if (!usersTable) {
-    log.warn("schema has no `users` export; skipping admin bootstrap");
-    return;
-  }
-
-  const { sudoDb, rbac } = handle;
+  const { sudoDb } = handle;
   const passwordHash = await bcrypt.hash(password, 12);
 
-  const [existing] = await (sudoDb as unknown as {
-    select: () => {
-      from: (t: unknown) => {
-        where: (cond: unknown) => { limit: (n: number) => Promise<{ id: number }[]> };
-      };
-    };
-  })
-    .select()
+  const [existing] = await sudoDb
+    .select({ id: usersTable.id })
     .from(usersTable)
-    .where(eq(usersTable.email as never, email))
-    .limit(1);
+    .where(eq(usersTable.email, email))
+    .limit(1) as Array<{ id: number }>;
 
   let userId: number;
   if (existing) {
-    await (sudoDb as unknown as {
-      update: (t: unknown) => {
-        set: (v: unknown) => { where: (cond: unknown) => Promise<unknown> };
-      };
-    })
+    await sudoDb
       .update(usersTable)
       .set({ passwordHash, active: true })
-      .where(eq(usersTable.id as never, existing.id));
+      .where(eq(usersTable.id, existing.id));
     userId = existing.id;
     log.info({ email, userId }, "admin user updated");
   } else {
-    const [row] = await (sudoDb as unknown as {
-      insert: (t: unknown) => {
-        values: (v: unknown) => { returning: () => Promise<{ id: number }[]> };
-      };
-    })
+    const [row] = await sudoDb
       .insert(usersTable)
       .values({ name: "Admin", email, passwordHash, active: true })
-      .returning();
+      .returning() as Array<{ id: number }>;
     userId = row.id;
     log.info({ email, userId }, "admin user created");
   }
 
-  rbac.assignRole(userId, "admin");
+  // Bind the bootstrapped admin to the `admin` role via users.role_id. This
+  // assumes the role row has been synced into the DB already — `runServer`
+  // calls `handle.syncRoles()` before this function.
+  await setUserRole(sudoDb, { users: usersTable, roles: rolesTable }, userId, "admin");
 }
 
 // ---------------------------------------------------------------------------
@@ -333,7 +317,7 @@ export interface RunServerHandle extends CreatedApp {
 export interface RunServerOptions {
   /** Override the config-file path (skips CLI flag + `CONFIG_PATH` lookup). */
   configPath?: string;
-  /** Skip admin auto-bootstrap even when both admin secrets resolve. */
+  /** Force-skip admin creation even when `--create-admin` is set. */
   skipAdminBootstrap?: boolean;
 }
 
@@ -378,26 +362,35 @@ export async function runServer(opts: RunServerOptions = {}): Promise<RunServerH
   const secrets = loadSecrets(cli.secrets);
   const hasEmail = !!secrets.adminEmail;
   const hasPwd = !!secrets.adminPassword;
-  if (hasEmail !== hasPwd) {
-    throw new Error(
-      "ADMIN_EMAIL and ADMIN_PASSWORD must be set together " +
-        "(via .env or --admin-email/--admin-password).",
-    );
-  }
 
   // Build the app. Strip server-only fields before passing to createApp.
-  const { port: _p, host: _h, bootstrapAdmin: _b, ...appOpts } = merged;
-  const handle = createApp(appOpts);
+  // `createApp` is async — it runs the role-table reconcile (`syncRoles`)
+  // before returning, so by the time `handle` is built the DB is in sync
+  // with the in-code role config.
+  const { port: _p, host: _h, createAdmin: _c, ...appOpts } = merged;
+  const handle = await createApp(appOpts);
 
-  // Auto-bootstrap the admin user when both secrets resolved.
-  const bootstrap = merged.bootstrapAdmin !== false && !opts.skipAdminBootstrap;
-  if (bootstrap && hasEmail && hasPwd) {
-    await bootstrapAdminUser(
-      handle,
-      userConfig.schema,
-      secrets.adminEmail!,
-      secrets.adminPassword!,
-    );
+  // Admin user is only created when explicitly requested (`--create-admin` /
+  // `createAdmin: true`). Failures here must NOT stop the server.
+  const wantAdmin = merged.createAdmin === true && !opts.skipAdminBootstrap;
+  if (wantAdmin) {
+    const log = logger.child({ component: "framework.bootstrap" });
+    if (!hasEmail || !hasPwd) {
+      log.warn(
+        { hasEmail, hasPwd },
+        "--create-admin set but ADMIN_EMAIL/ADMIN_PASSWORD missing; skipping admin creation",
+      );
+    } else {
+      try {
+        await bootstrapAdminUser(
+          handle,
+          secrets.adminEmail!,
+          secrets.adminPassword!,
+        );
+      } catch (err) {
+        log.error({ err }, "admin creation failed; continuing startup");
+      }
+    }
   }
 
   // Start listener.

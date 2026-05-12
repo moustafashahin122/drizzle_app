@@ -12,7 +12,13 @@
  */
 import { randomBytes } from "node:crypto";
 import { and, eq, gt } from "drizzle-orm";
-import type { sessions as sessionsTable, users as usersTable, User, Session } from "../tables.js";
+import type {
+  User,
+  Session,
+  users as usersTable,
+  sessions as sessionsTable,
+  roles as rolesTable,
+} from "../tables.js";
 
 const SESSION_DAYS = 7;
 const SESSION_MS = SESSION_DAYS * 86_400_000;
@@ -26,9 +32,25 @@ export const SESSION_COOKIE_NAME = "sid";
 // Computed lazily so tests (and any wrapper that sets NODE_ENV after module load) see the right value.
 const secureSuffix = () => (process.env.NODE_ENV === "production" ? "; Secure" : "");
 
+/**
+ * Structural shape of the two tables the auth layer touches. Typed against
+ * the framework's own `users` / `sessions` definitions in `../tables.js` —
+ * host apps should re-export those tables (or spread `frameworkTables`)
+ * rather than declaring their own.
+ */
 export interface SessionSchema {
   users: typeof usersTable;
   sessions: typeof sessionsTable;
+}
+
+/**
+ * `SessionSchema` plus the `roles` table — required by
+ * {@link resolveSessionFromToken}, which folds the role lookup into the same
+ * query that resolves the session, so callers (sessionMiddleware) don't issue
+ * a separate `getUserRole` round-trip per request.
+ */
+export interface RoleAwareSessionSchema extends SessionSchema {
+  roles: typeof rolesTable;
 }
 
 /**
@@ -114,29 +136,50 @@ export async function issueSession(
 }
 
 /**
- * Resolve a raw session token to `{ user, session }`. Returns nulls on miss /
- * expiry / inactive user; refreshes the session's sliding expiry on hit.
- * Never throws — callers expect a "guest" context, not an error.
+ * Resolve a raw session token to `{ user, session, role }`. Returns nulls on
+ * miss / expiry / inactive user; refreshes the session's sliding expiry on
+ * hit. `role` is the joined `roles` row (LEFT JOIN — `null` when the user is
+ * roleless). Never throws — callers expect a "guest" context, not an error.
+ *
+ * Folding the role lookup into this single JOIN means `sessionMiddleware`
+ * runs one query per request instead of two.
  */
 export async function resolveSessionFromToken(
   db: SudoDb,
-  schema: SessionSchema,
+  schema: RoleAwareSessionSchema,
   token: string | null,
-): Promise<{ user: User | null; session: Session | null }> {
-  if (!token) return { user: null, session: null };
+): Promise<{
+  user: User | null;
+  session: Session | null;
+  role: { name: string; isAdmin: boolean } | null;
+}> {
+  if (!token) return { user: null, session: null, role: null };
 
-  const { users, sessions } = schema;
+  const { users, sessions, roles } = schema;
   const now = Date.now();
   const nowIso = new Date(now).toISOString();
   const [row] = await db
-    .select({ session: sessions, user: users })
+    .select({
+      session: sessions,
+      user: users,
+      roleName: roles.name,
+      roleIsAdmin: roles.isAdmin,
+    })
     .from(sessions)
     .innerJoin(users, eq(users.id, sessions.userId))
+    .leftJoin(roles, eq(roles.id, users.roleId))
     .where(and(eq(sessions.token, token), gt(sessions.expiresAt, nowIso)))
     .limit(1);
-  if (!row) return { user: null, session: null };
-  const { session, user } = row as { session: Session; user: User };
-  if (!user.active) return { user: null, session: null };
+  if (!row) return { user: null, session: null, role: null };
+  const { session, user, roleName, roleIsAdmin } = row as {
+    session: Session;
+    user: User;
+    roleName: string | null;
+    roleIsAdmin: boolean | number | null;
+  };
+  if (!user.active) return { user: null, session: null, role: null };
+  const role =
+    roleName != null ? { name: roleName, isAdmin: !!roleIsAdmin } : null;
 
   // Sliding expiry: only refresh once the remaining window has dropped below
   // SESSION_REFRESH_MS, so a busy session does not write on every request.
@@ -150,7 +193,7 @@ export async function resolveSessionFromToken(
     session.expiresAt = nextExpiresAt;
   }
 
-  return { user, session };
+  return { user, session, role };
 }
 
 /** Delete a session row by id. Idempotent — missing id is silently ignored. */

@@ -63,7 +63,18 @@ export interface CsrfProtection {
  * Build a CSRF-protection middleware instance. Each call returns a fresh
  * middleware closed over the supplied {@link CsrfConfig}; mount with
  * `app.use("*", protection.middleware)`.
+ *
+ * `/auth/logout` is exempted: its only effect is destroying the caller's own
+ * session, so a forged hit is at worst a self-DoS (the victim has to log in
+ * again). Exempting it removes a per-call Origin-header requirement that
+ * non-browser clients (curl, mobile, the framework's own test suite) would
+ * otherwise have to satisfy.
  */
 export function createCsrfProtection(config: CsrfConfig = {}): CsrfProtection {
-  return { middleware: csrf({ origin: config.origin }) };
+  const inner = csrf({ origin: config.origin });
+  const middleware: MiddlewareHandler = (c, next) => {
+    if (c.req.path === "/auth/logout") return next();
+    return inner(c, next);
+  };
+  return { middleware };
 }

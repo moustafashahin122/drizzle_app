@@ -27,9 +27,13 @@ import {
   destroySession,
   issueSession,
   type SudoDb,
-  type SessionSchema,
 } from "./session.js";
-import { requireAuth, sessionMiddleware, type AuthEnv } from "./middleware.js";
+import {
+  requireAuth,
+  sessionMiddleware,
+  type AuthEnv,
+  type RoleAwareSchema,
+} from "./middleware.js";
 import { createLoginRateLimit, type LoginRateLimitConfig } from "./loginRateLimit.js";
 
 const BCRYPT_ROUNDS = 12;
@@ -52,7 +56,14 @@ function publicUser(user: User): Omit<User, "passwordHash"> {
 
 export interface AuthRoutesDeps {
   db: SudoDb;
-  schema: SessionSchema;
+  /**
+   * Same schema shape the framework's `sessionMiddleware` consumes — needs
+   * `users`, `sessions`, and `roles` (the middleware loads the caller's role
+   * once per request and stashes it on `c.var`). Auth routes themselves do
+   * not read `c.var.role`; the dependency is transitive through the shared
+   * middleware.
+   */
+  schema: RoleAwareSchema;
   /** Optional override for the login rate-limit knobs; defaults are production-safe. */
   loginRateLimit?: LoginRateLimitConfig;
 }
