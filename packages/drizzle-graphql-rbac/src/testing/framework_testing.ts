@@ -1,10 +1,10 @@
 /**
  * @module drizzle-graphql-rbac/testing/framework_testing
  *
- * Test helpers for the framework's own tests (auth/admin/app/persistence).
- * Each helper does one thing — no shared singleton DB, no auto-merged defaults.
- *
- * NOT re-exported from `./index.ts` — host apps should use `app_testing`.
+ * Test helpers for the framework's own tests (auth/admin/app/builder).
+ * Each helper does one thing and uses a fresh in-memory DB — no shared
+ * singleton, no SAVEPOINT magic. Host apps use `app_testing` instead;
+ * this file is intentionally not re-exported from `./index.ts`.
  */
 import Database from "better-sqlite3";
 import { drizzle, type BetterSQLite3Database } from "drizzle-orm/better-sqlite3";
@@ -25,14 +25,14 @@ import { buildSchema, type BuildSchemaOptions } from "../graphql/builder/builder
 import { pushDrizzleSchema, jsonFetch, cookieValue } from "./base.js";
 
 export const frameworkSchema = { roles, users, sessions } as const;
-export type FrameworkSchema = typeof frameworkSchema;
+type FrameworkSchema = typeof frameworkSchema;
 export type FrameworkDb = BetterSQLite3Database<FrameworkSchema>;
 
 // ---------------------------------------------------------------------------
-// DB + seeders
+// DB
 // ---------------------------------------------------------------------------
 
-/** New `:memory:` sqlite with the framework DDL applied. */
+/** Fresh `:memory:` sqlite with the framework DDL applied. */
 export async function freshFrameworkDb(): Promise<{
   sqlite: Database.Database;
   db: FrameworkDb;
@@ -42,11 +42,25 @@ export async function freshFrameworkDb(): Promise<{
   return { sqlite, db: drizzle(sqlite, { schema: frameworkSchema }) };
 }
 
+/** Delete every `users` / `sessions` row. `roles` is code-defined; left alone. */
+export async function wipeFrameworkTables(db: FrameworkDb): Promise<void> {
+  await db.delete(sessions);
+  await db.delete(users);
+}
+
+// ---------------------------------------------------------------------------
+// User seeders
+// ---------------------------------------------------------------------------
+
+interface SeedUserAttrs {
+  name: string;
+  email: string;
+  password?: string;
+  active?: boolean;
+}
+
 /** Insert a user with a bcrypt'd password (cost 4 — tests run this in hot loops). */
-export async function seedUser(
-  db: FrameworkDb,
-  attrs: { name: string; email: string; password?: string; active?: boolean },
-): Promise<User> {
+export async function seedUser(db: FrameworkDb, attrs: SeedUserAttrs): Promise<User> {
   const passwordHash = await bcrypt.hash(attrs.password ?? "secret123", 4);
   const [row] = await db
     .insert(users)
@@ -60,10 +74,10 @@ export async function seedUser(
   return row;
 }
 
-/** seedUser + setUserRole. */
+/** `seedUser` + assign a role by name. */
 export async function seedUserWithRole(
   db: FrameworkDb,
-  attrs: { name: string; email: string; password?: string; role: string },
+  attrs: SeedUserAttrs & { role: string },
 ): Promise<User> {
   const u = await seedUser(db, attrs);
   await setUserRole(db, { roles, users }, u.id, attrs.role);
@@ -82,22 +96,12 @@ export async function loginViaHttp(
   return sid;
 }
 
-/**
- * Delete every row from `users` + `sessions`. `roles` is code-defined and
- * synced once, so it's left alone. Useful for `beforeEach` cleanup when a
- * suite doesn't want savepoint semantics.
- */
-export async function wipeFrameworkTables(db: FrameworkDb): Promise<void> {
-  await db.delete(sessions);
-  await db.delete(users);
-}
-
 // ---------------------------------------------------------------------------
 // App builder
 // ---------------------------------------------------------------------------
 
 /** Minimal RBAC: `admin` (auto-injected) + `user` with read on users. */
-const minimalRbacConfig: RbacConfig = {
+const minimalRbac: RbacConfig = {
   roles: defineRoles({ user: {} }),
   accessRights: defineAccessRights({ user: { users: { read: true } } }),
   recordRules: defineRecordRules({}),
@@ -107,24 +111,16 @@ const minimalRbacConfig: RbacConfig = {
 export async function buildFrameworkApp(
   db: FrameworkDb,
   overrides: Partial<Omit<CreateAppOptions, "db" | "schema" | "rbac">> = {},
-): Promise<
-  Pick<CreatedApp, "app" | "rbac" | "sudoDb" | "rdbFor"> & { db: FrameworkDb }
-> {
+): Promise<CreatedApp & { db: FrameworkDb }> {
   const built = await createApp({
     db,
     schema: frameworkSchema as unknown as CreateAppOptions["schema"],
-    rbac: minimalRbacConfig,
+    rbac: minimalRbac,
     publicDir: null,
     logger: false,
     ...overrides,
   });
-  return {
-    app: built.app,
-    rbac: built.rbac,
-    sudoDb: built.sudoDb,
-    rdbFor: built.rdbFor,
-    db,
-  };
+  return { ...built, db };
 }
 
 // ---------------------------------------------------------------------------
@@ -136,7 +132,7 @@ type BuilderDb = ReturnType<typeof drizzle>;
 export interface BuilderFixture {
   db: BuilderDb;
   schema: GraphQLSchema;
-  /** `select ...` statement count since last reset (0 unless `countQueries`). */
+  /** `select ...` statement count since last reset (always 0 unless `countQueries`). */
   selects(): number;
   resetCounter(): void;
   /** Run a query; throws if `errors` is non-empty. */
@@ -152,7 +148,7 @@ export interface BuilderFixture {
   ): Promise<ExecutionResult>;
 }
 
-export interface BuilderFixtureOptions {
+interface BuilderFixtureOptions {
   tables: Record<string, unknown>;
   /** Runs after schema push, before GraphQL schema build. */
   seed?: (db: BuilderDb) => void | Promise<void>;
@@ -169,12 +165,10 @@ export async function makeBuilderFixture(
   await pushDrizzleSchema(sqlite, opts.tables);
 
   let selectCount = 0;
-  const db = drizzle(
-    sqlite,
-    opts.countQueries
-      ? { logger: { logQuery: (q) => { if (q.toLowerCase().startsWith("select")) selectCount++; } } }
-      : undefined,
-  );
+  const logger = opts.countQueries
+    ? { logQuery: (q: string) => { if (q.toLowerCase().startsWith("select")) selectCount++; } }
+    : undefined;
+  const db = drizzle(sqlite, logger ? { logger } : undefined);
 
   if (opts.seed) await opts.seed(db);
 

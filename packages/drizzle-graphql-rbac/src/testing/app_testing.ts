@@ -1,9 +1,17 @@
 /**
  * @module drizzle-graphql-rbac/testing/app_testing
  *
- * Framework-owned base for app-level test fixtures. Bind once to an
- * app's `createApp` config; suites get `setupAppTestCase` + `createUser`,
- * backed by the shared in-memory sqlite + SAVEPOINT fixture in `./base`.
+ * Host-app test harness. Bind once to an app's `createApp` config via
+ * `createAppTestHarness({...})`; suites get `setupAppTestCase` + `createUser`,
+ * backed by the shared in-memory sqlite + SAVEPOINT fixture from `./base`.
+ *
+ *   const { setupAppTestCase, createUser } = createAppTestHarness({ schema, rbac });
+ *
+ *   const tc = setupAppTestCase(async ({ sudoDb, assignRole }) => {
+ *     const alice = await createUser(sudoDb, { name: "Alice", email: "a@x" });
+ *     await assignRole(alice.id, "user");
+ *     return { alice };
+ *   });
  */
 import { drizzle as drizzleSqlite } from "drizzle-orm/better-sqlite3";
 import bcrypt from "bcryptjs";
@@ -16,13 +24,13 @@ import { issueSession } from "../auth/session.js";
 import { setUserRole } from "../graphql/rbac/persistence.js";
 import { getSharedSqlite, transactionCase, pushDrizzleSchema } from "./base.js";
 
-export type AppTestConfig = Omit<CreateAppOptions, "db">;
-
+type AppTestConfig = Omit<CreateAppOptions, "db">;
 type Schema = AppTestConfig["schema"];
+type SudoDb = ReturnType<typeof drizzleSqlite>;
 
-export interface AppTestCtx<S extends Schema, Seed> {
-  /** Raw Drizzle handle — bypasses RBAC. Use for fixture seeding / ground-truth reads. */
-  sudoDb: ReturnType<typeof drizzleSqlite>;
+interface AppTestCtx<S extends Schema, Seed> {
+  /** Raw Drizzle handle — bypasses RBAC. Use for seeding and ground-truth reads. */
+  sudoDb: SudoDb;
   /** Hono app — `app.fetch(new Request(...))`. */
   app: CreatedApp["app"];
   schema: S;
@@ -41,18 +49,18 @@ export interface AppTestCtx<S extends Schema, Seed> {
   seed: Seed;
 }
 
-export interface AppTestHarness<S extends Schema> {
+interface AppTestHarness<S extends Schema> {
   setupAppTestCase: <Seed extends Record<string, unknown> = {}>(
     setUp?: (base: Omit<AppTestCtx<S, undefined>, "seed">) => Promise<Seed> | Seed,
   ) => AppTestCtx<S, Seed>;
   createUser: (
-    sudoDb: ReturnType<typeof drizzleSqlite>,
+    sudoDb: SudoDb,
     attrs: { name: string; email: string; password?: string },
   ) => Promise<any>;
 }
 
-interface Built<S extends Schema> {
-  sudoDb: ReturnType<typeof drizzleSqlite>;
+interface BuiltApp<S extends Schema> {
+  sudoDb: SudoDb;
   app: CreatedApp["app"];
   rdbFor: CreatedApp["rdbFor"];
   graphqlSchema: GraphQLSchema;
@@ -62,108 +70,133 @@ interface Built<S extends Schema> {
 export function createAppTestHarness<S extends Schema>(
   appConfig: AppTestConfig & { schema: S },
 ): AppTestHarness<S> {
-  let cached: Promise<Built<S>> | undefined;
+  // The app is built once per process — shared across all suites that use this
+  // harness. Tests get isolation from the SAVEPOINT fixture, not from rebuilding.
+  let buildPromise: Promise<BuiltApp<S>> | undefined;
 
-  const build = (): Promise<Built<S>> => {
-    if (cached) return cached;
-    cached = (async () => {
-      const sqlite = getSharedSqlite();
-      const sudoDb = drizzleSqlite(sqlite, { schema: appConfig.schema });
-      await pushDrizzleSchema(sqlite, appConfig.schema as Record<string, unknown>);
-
-      const { app, rbac, rdbFor } = await createApp({
-        db: sudoDb,
-        ...appConfig,
-        publicDir: null,
-        logger: false,
-      });
-
-      // Rebuild the same GraphQL schema for direct (`graphql()`) invocation —
-      // `createApp` doesn't expose its internal schema. Reusing `rbac.enforce`
-      // keeps role memberships consistent between runHttp and runDirect.
-      const { schema: graphqlSchema } = buildGraphqlSchema(sudoDb, appConfig.schema, {
-        hiddenOutputColumns: appConfig.hiddenOutputColumns,
-        rbac: { enforce: rbac.enforce },
-      });
-
-      return { sudoDb, app, rdbFor, graphqlSchema, schema: appConfig.schema };
-    })();
-    return cached;
+  const buildOnce = (): Promise<BuiltApp<S>> => {
+    if (!buildPromise) buildPromise = buildAppOnce(appConfig);
+    return buildPromise;
   };
 
   const setupAppTestCase: AppTestHarness<S>["setupAppTestCase"] = (setUp) =>
     transactionCase(async () => {
-      const h = await build();
-      const s = h.schema as unknown as { roles: any; users: any };
-
-      const runHttp: AppTestCtx<S, any>["runHttp"] = async (query, opts = {}) => {
-        const headers: Record<string, string> = { "content-type": "application/json" };
-        if (opts.asUserId != null) {
-          const { token } = await issueSession(h.sudoDb, h.schema as any, opts.asUserId);
-          headers.authorization = `Bearer ${token}`;
-        }
-        const res = await h.app.fetch(
-          new Request("http://test.local/graphql", {
-            method: "POST",
-            headers,
-            body: JSON.stringify({ query, variables: opts.variables ?? {} }),
-          }),
-        );
-        return { status: res.status, body: await res.json().catch(() => null) };
-      };
-
-      const runDirect: AppTestCtx<S, any>["runDirect"] = (query, opts = {}) => {
-        const user = opts.user ?? null;
-        // Mirrors what `sessionMiddleware` does over HTTP.
-        let role: { name: string; isAdmin: boolean } | null = null;
-        if (user) {
-          const rows = h.sudoDb
-            .select({ name: s.roles.name, isAdmin: s.roles.isAdmin })
-            .from(s.users)
-            .innerJoin(s.roles, eq(s.roles.id, s.users.roleId))
-            .where(eq(s.users.id, user.id))
-            .limit(1)
-            .all() as Array<{ name: string; isAdmin: boolean | number }>;
-          if (rows[0]) role = { name: rows[0].name, isAdmin: !!rows[0].isAdmin };
-        }
-        const batch = new Map<string, unknown>();
-        return graphql({
-          schema: h.graphqlSchema,
-          source: query,
-          contextValue: {
-            user,
-            role,
-            session: null,
-            batch,
-            db: h.rdbFor({ user: user as any, role, batch }),
-          },
-          variableValues: opts.variables,
-        });
-      };
-
-      const base: Omit<AppTestCtx<S, undefined>, "seed"> = {
-        sudoDb: h.sudoDb,
-        app: h.app,
-        schema: h.schema,
-        assignRole: (userId, roleName) =>
-          setUserRole(h.sudoDb, { roles: s.roles, users: s.users }, userId, roleName),
-        runHttp,
-        runDirect,
-      };
-
+      const built = await buildOnce();
+      const base = makeTestCtx(built);
       const seed = setUp ? await setUp(base) : ({} as any);
       return { ...base, seed } as AppTestCtx<S, any>;
     });
 
   const createUser: AppTestHarness<S>["createUser"] = async (sudoDb, attrs) => {
     const passwordHash = await bcrypt.hash(attrs.password ?? "secret123", 4);
-    const users = (appConfig.schema as any).users;
+    const usersTable = (appConfig.schema as any).users;
     const [row] = (await sudoDb
-      .insert(users)
+      .insert(usersTable)
       .values({ name: attrs.name, email: attrs.email, passwordHash })
       .returning()) as any[];
     return row;
   };
 
   return { setupAppTestCase, createUser };
+}
+
+// ---------------------------------------------------------------------------
+// internals
+// ---------------------------------------------------------------------------
+
+async function buildAppOnce<S extends Schema>(
+  appConfig: AppTestConfig & { schema: S },
+): Promise<BuiltApp<S>> {
+  const sqlite = getSharedSqlite();
+  const sudoDb = drizzleSqlite(sqlite, { schema: appConfig.schema });
+  await pushDrizzleSchema(sqlite, appConfig.schema as Record<string, unknown>);
+
+  const { app, rbac, rdbFor } = await createApp({
+    db: sudoDb,
+    ...appConfig,
+    publicDir: null,
+    logger: false,
+  });
+
+  // `createApp` doesn't expose its internal GraphQL schema; rebuild one for
+  // direct (`graphql()`) invocation, sharing the live `rbac.enforce` hook so
+  // role memberships stay consistent between runHttp and runDirect.
+  const { schema: graphqlSchema } = buildGraphqlSchema(sudoDb, appConfig.schema, {
+    hiddenOutputColumns: appConfig.hiddenOutputColumns,
+    rbac: { enforce: rbac.enforce },
+  });
+
+  return { sudoDb, app, rdbFor, graphqlSchema, schema: appConfig.schema };
+}
+
+function makeTestCtx<S extends Schema>(
+  built: BuiltApp<S>,
+): Omit<AppTestCtx<S, undefined>, "seed"> {
+  const { sudoDb, schema } = built;
+  const tables = schema as unknown as { roles: any; users: any };
+
+  return {
+    sudoDb,
+    app: built.app,
+    schema,
+    assignRole: (userId, roleName) =>
+      setUserRole(sudoDb, { roles: tables.roles, users: tables.users }, userId, roleName),
+    runHttp: makeRunHttp(built),
+    runDirect: makeRunDirect(built),
+  };
+}
+
+function makeRunHttp<S extends Schema>(built: BuiltApp<S>): AppTestCtx<S, any>["runHttp"] {
+  return async (query, opts = {}) => {
+    const headers: Record<string, string> = { "content-type": "application/json" };
+    if (opts.asUserId != null) {
+      const { token } = await issueSession(built.sudoDb, built.schema as any, opts.asUserId);
+      headers.authorization = `Bearer ${token}`;
+    }
+    const res = await built.app.fetch(
+      new Request("http://test.local/graphql", {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ query, variables: opts.variables ?? {} }),
+      }),
+    );
+    return { status: res.status, body: await res.json().catch(() => null) };
+  };
+}
+
+function makeRunDirect<S extends Schema>(built: BuiltApp<S>): AppTestCtx<S, any>["runDirect"] {
+  return (query, opts = {}) => {
+    const user = opts.user ?? null;
+    const role = user ? lookupRole(built, user.id) : null;
+    const batch = new Map<string, unknown>();
+    return graphql({
+      schema: built.graphqlSchema,
+      source: query,
+      contextValue: {
+        user,
+        role,
+        session: null,
+        batch,
+        db: built.rdbFor({ user: user as any, role, batch }),
+      },
+      variableValues: opts.variables,
+    });
+  };
+}
+
+/** Mirrors what `sessionMiddleware` does over HTTP: join user → role. */
+function lookupRole<S extends Schema>(
+  built: BuiltApp<S>,
+  userId: number,
+): { name: string; isAdmin: boolean } | null {
+  const tables = built.schema as unknown as { roles: any; users: any };
+  const rows = built.sudoDb
+    .select({ name: tables.roles.name, isAdmin: tables.roles.isAdmin })
+    .from(tables.users)
+    .innerJoin(tables.roles, eq(tables.roles.id, tables.users.roleId))
+    .where(eq(tables.users.id, userId))
+    .limit(1)
+    .all() as Array<{ name: string; isAdmin: boolean | number }>;
+  if (!rows[0]) return null;
+  return { name: rows[0].name, isAdmin: !!rows[0].isAdmin };
 }

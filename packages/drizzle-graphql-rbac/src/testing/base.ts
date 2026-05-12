@@ -1,12 +1,13 @@
 /**
  * @module drizzle-graphql-rbac/testing/base
  *
- * Low-level test plumbing — no opinions on schema, RBAC, or auth:
+ * Low-level test plumbing — no opinions on schema, RBAC, or auth.
  *
- *   - {@link getSharedSqlite} — one process-wide in-memory sqlite handle.
- *   - {@link transactionCase} — Odoo-style suite + per-test SAVEPOINT fixture.
+ *   - {@link getSharedSqlite}   — one process-wide in-memory sqlite handle.
+ *   - {@link transactionCase}   — node:test suite + per-test SAVEPOINT fixture.
  *   - {@link pushDrizzleSchema} — apply a Drizzle schema via drizzle-kit.
- *   - {@link jsonFetch} / {@link cookieValue} — Hono request + cookie helpers.
+ *   - {@link jsonFetch}         — fire a request at a Hono-like app.
+ *   - {@link cookieValue}       — read a single cookie out of a Set-Cookie list.
  */
 import { createRequire } from "node:module";
 import { before, beforeEach, afterEach, after } from "node:test";
@@ -14,28 +15,35 @@ import Database from "better-sqlite3";
 import { drizzle } from "drizzle-orm/better-sqlite3";
 
 // ---------------------------------------------------------------------------
-// Shared sqlite + SAVEPOINT fixture
+// Shared sqlite
 // ---------------------------------------------------------------------------
 
 let sharedSqlite: Database.Database | undefined;
-let suiteCounter = 0;
-let testCounter = 0;
 
-/** Process-wide singleton in-memory sqlite handle. Lazy on first call. */
+/** Process-wide singleton `:memory:` sqlite handle. Lazy on first call. */
 export function getSharedSqlite(): Database.Database {
   if (!sharedSqlite) sharedSqlite = new Database(":memory:");
   return sharedSqlite;
 }
 
+// ---------------------------------------------------------------------------
+// SAVEPOINT-based suite fixture
+// ---------------------------------------------------------------------------
+
+let savepointCounter = 0;
+const nextSavepointName = (kind: "suite" | "test") => `${kind}_${++savepointCounter}`;
+
 /**
- * Suite fixture with nested SAVEPOINTs:
+ * Suite fixture with nested SAVEPOINTs on the shared sqlite handle:
+ *
  *   before:     SAVEPOINT suite_n;  setUpClass() seeds reference data
  *   beforeEach: SAVEPOINT test_m;
  *   afterEach:  ROLLBACK TO test_m
  *   after:      ROLLBACK TO suite_n
  *
- * Returns a Proxy over the ctx — `tc.foo` reads through to the live ctx.
- * Accessing before setUpClass ran throws. Only SQL state is rolled back.
+ * Returns a Proxy over the ctx — `tc.foo` reads through to the live ctx, but
+ * only after `setUpClass` has run, so access it from inside `it` bodies.
+ * Only SQL state is rolled back; in-process state is the suite's problem.
  */
 export function transactionCase<Ctx extends object>(
   setUpClass: () => Promise<Ctx> | Ctx,
@@ -43,35 +51,32 @@ export function transactionCase<Ctx extends object>(
   let ctx: Ctx | undefined;
   let suiteSp = "";
   let testSp = "";
+  const exec = (sql: string) => getSharedSqlite().exec(sql);
 
   before(async () => {
-    const sqlite = getSharedSqlite();
-    suiteSp = `suite_${++suiteCounter}`;
-    sqlite.exec(`SAVEPOINT ${suiteSp}`);
+    suiteSp = nextSavepointName("suite");
+    exec(`SAVEPOINT ${suiteSp}`);
     try {
       ctx = await setUpClass();
     } catch (err) {
-      try { sqlite.exec(`ROLLBACK TO SAVEPOINT ${suiteSp}; RELEASE SAVEPOINT ${suiteSp}`); }
-      catch { /* best-effort */ }
+      try { exec(`ROLLBACK TO SAVEPOINT ${suiteSp}; RELEASE SAVEPOINT ${suiteSp}`); } catch {}
       throw err;
     }
   });
 
   beforeEach(() => {
     if (!ctx) throw new Error("transactionCase: setUpClass did not produce a ctx");
-    testSp = `test_${++testCounter}`;
-    getSharedSqlite().exec(`SAVEPOINT ${testSp}`);
+    testSp = nextSavepointName("test");
+    exec(`SAVEPOINT ${testSp}`);
   });
 
   afterEach(() => {
-    if (!ctx) return;
-    getSharedSqlite().exec(`ROLLBACK TO SAVEPOINT ${testSp}; RELEASE SAVEPOINT ${testSp}`);
+    if (ctx) exec(`ROLLBACK TO SAVEPOINT ${testSp}; RELEASE SAVEPOINT ${testSp}`);
   });
 
   after(() => {
     if (!ctx) return;
-    try { getSharedSqlite().exec(`ROLLBACK TO SAVEPOINT ${suiteSp}; RELEASE SAVEPOINT ${suiteSp}`); }
-    catch { /* best-effort */ }
+    try { exec(`ROLLBACK TO SAVEPOINT ${suiteSp}; RELEASE SAVEPOINT ${suiteSp}`); } catch {}
   });
 
   return new Proxy({} as Ctx, {
@@ -90,9 +95,8 @@ export function transactionCase<Ctx extends object>(
 // Drizzle schema push (via drizzle-kit)
 // ---------------------------------------------------------------------------
 
-// `drizzle-kit/api`'s ESM bundle uses a broken dynamic-require polyfill that
-// throws on `require("fs")` under native ESM. The CJS entry works under ESM
-// via `createRequire`.
+// drizzle-kit/api's ESM bundle has a broken dynamic-require polyfill; the CJS
+// entry works under native ESM via createRequire.
 const kitApi = createRequire(import.meta.url)("drizzle-kit/api") as {
   pushSQLiteSchema: (
     imports: Record<string, unknown>,
@@ -101,7 +105,7 @@ const kitApi = createRequire(import.meta.url)("drizzle-kit/api") as {
 };
 
 /**
- * Materialize a Drizzle schema onto a sqlite handle. Idempotent. Also enables
+ * Materialize a Drizzle schema onto a sqlite handle. Idempotent. Enables
  * `PRAGMA foreign_keys = ON`. Bypasses `drizzle.all` because better-sqlite3
  * rejects DDL there.
  */
@@ -134,8 +138,8 @@ export function cookieValue(list: string[], name: string): string | null {
   return null;
 }
 
-export interface JsonFetchOpts {
-  /** Object → JSON.stringify + content-type: application/json (unless overridden). */
+interface JsonFetchOpts {
+  /** Object → JSON.stringify + `content-type: application/json` (unless overridden). */
   body?: unknown;
   /** Raw body. Pairs with `contentType` for form-encoded routes. */
   rawBody?: BodyInit;
@@ -147,7 +151,7 @@ export interface JsonFetchOpts {
   cookie?: string;
 }
 
-export interface JsonFetchResult {
+interface JsonFetchResult {
   status: number;
   body: any;
   setCookies: string[];
@@ -161,30 +165,41 @@ export async function jsonFetch(
   opts: JsonFetchOpts = {},
 ): Promise<JsonFetchResult> {
   const headers: Record<string, string> = { ...(opts.headers ?? {}) };
-  let body: BodyInit | undefined;
-  if (opts.rawBody !== undefined) {
-    body = opts.rawBody;
-    if (opts.contentType) headers["content-type"] = opts.contentType;
-  } else if (opts.body !== undefined) {
-    headers["content-type"] = opts.contentType ?? "application/json";
-    body = typeof opts.body === "string" ? opts.body : JSON.stringify(opts.body);
-  } else if (opts.contentType) {
-    headers["content-type"] = opts.contentType;
-  }
+  const body = buildBody(opts, headers);
   if (opts.bearer) headers.authorization = `Bearer ${opts.bearer}`;
   if (opts.cookie) headers.cookie = opts.cookie;
 
   const res = await app.request(path, { method, headers, body });
-  const text = await res.text();
-  let parsed: any = null;
-  if (text) {
-    try { parsed = JSON.parse(text); }
-    catch { parsed = text; }
+  return {
+    status: res.status,
+    body: await readJsonOrText(res),
+    setCookies: readSetCookies(res),
+  };
+}
+
+function buildBody(opts: JsonFetchOpts, headers: Record<string, string>): BodyInit | undefined {
+  if (opts.rawBody !== undefined) {
+    if (opts.contentType) headers["content-type"] = opts.contentType;
+    return opts.rawBody;
   }
+  if (opts.body !== undefined) {
+    headers["content-type"] = opts.contentType ?? "application/json";
+    return typeof opts.body === "string" ? opts.body : JSON.stringify(opts.body);
+  }
+  if (opts.contentType) headers["content-type"] = opts.contentType;
+  return undefined;
+}
+
+async function readJsonOrText(res: Response): Promise<any> {
+  const text = await res.text();
+  if (!text) return null;
+  try { return JSON.parse(text); } catch { return text; }
+}
+
+function readSetCookies(res: Response): string[] {
   // Node 20+ exposes getSetCookie(); older runtimes only concat via .get().
   const h = res.headers as unknown as { getSetCookie?: () => string[] };
-  const setCookies = typeof h.getSetCookie === "function"
-    ? h.getSetCookie()
-    : (res.headers.get("set-cookie") ? [res.headers.get("set-cookie")!] : []);
-  return { status: res.status, body: parsed, setCookies };
+  if (typeof h.getSetCookie === "function") return h.getSetCookie();
+  const single = res.headers.get("set-cookie");
+  return single ? [single] : [];
 }

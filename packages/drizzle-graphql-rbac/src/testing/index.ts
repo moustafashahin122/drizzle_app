@@ -18,9 +18,4 @@ export {
   cookieValue,
   jsonFetch,
 } from "./base.js";
-export {
-  createAppTestHarness,
-  type AppTestConfig,
-  type AppTestCtx,
-  type AppTestHarness,
-} from "./app_testing.js";
+export { createAppTestHarness } from "./app_testing.js";
