@@ -11,12 +11,12 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
 import type { CreateAppOptions } from "./app.js";
-import { cookieValue, jsonFetch } from "./testing/httpTestUtils.js";
+import { cookieValue, jsonFetch } from "./testing/base.js";
 import {
   buildFrameworkApp,
   freshFrameworkDb,
   seedUserWithRole,
-} from "./testing/frameworkTesting.js";
+} from "./testing/framework_testing.js";
 
 type BuiltApp = Awaited<ReturnType<typeof buildFrameworkApp>>;
 
@@ -25,7 +25,7 @@ async function buildApp(
   overrides: Partial<Omit<CreateAppOptions, "db" | "schema" | "rbac">> = {},
 ): Promise<BuiltApp> {
   const db = (await freshFrameworkDb()).db;
-  return buildFrameworkApp({ db, createAppOverrides: overrides });
+  return buildFrameworkApp(db, overrides);
 }
 
 /**

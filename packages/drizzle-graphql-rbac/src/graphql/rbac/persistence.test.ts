@@ -18,7 +18,7 @@ import {
   listRoles,
 } from "./persistence.js";
 import type { ResolvedRole } from "./config.js";
-import { freshFrameworkDb, type FrameworkDb } from "../../testing/frameworkTesting.js";
+import { freshFrameworkDb, type FrameworkDb } from "../../testing/framework_testing.js";
 
 const schema = { roles, users };
 

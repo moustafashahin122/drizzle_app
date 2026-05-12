@@ -1,31 +1,38 @@
 /**
  * @module drizzle-graphql-rbac/testing
  *
- * Public surface for the framework's test fixtures. Importable from
- * framework tests and from apps built on the framework via:
+ * Public testing surface for host apps. Two layers:
+ *
+ *   - `base`         — shared sqlite + SAVEPOINT fixture, schema push,
+ *                       Hono jsonFetch helpers. Used by every test.
+ *   - `app_testing`  — `createAppTestHarness(appConfig)` — wire an app's
+ *                       `createApp` config into a ready-to-use harness.
+ *
+ * Framework tests (auth, admin, persistence, createApp options) use
+ * `framework_testing.ts` directly and that surface is intentionally not
+ * re-exported here.
  *
  *     import {
  *       getSharedSqlite,
- *       applySchemaSql,
  *       transactionCase,
+ *       createAppTestHarness,
  *     } from "drizzle-graphql-rbac/testing";
  */
 export {
   getSharedSqlite,
   applySchemaSql,
   transactionCase,
-} from "./transactionCase.js";
+  pushDrizzleSchema,
+  getSetCookieList,
+  cookieValue,
+  jsonFetch,
+  type JsonFetchOpts,
+  type JsonFetchResult,
+} from "./base.js";
 export {
   createAppTestHarness,
   type AppTestConfig,
   type AppTestCtx,
   type AppTestHarness,
   type AppHandle,
-} from "./appTestCase.js";
-export {
-  getSetCookieList,
-  cookieValue,
-  jsonFetch,
-  type JsonFetchOpts,
-  type JsonFetchResult,
-} from "./httpTestUtils.js";
+} from "./app_testing.js";

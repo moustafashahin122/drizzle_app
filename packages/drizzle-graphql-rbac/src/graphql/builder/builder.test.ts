@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { integer, sqliteTable, text } from "drizzle-orm/sqlite-core";
 import type { GraphQLInputObjectType, GraphQLObjectType } from "graphql";
 
-import { makeBuilderFixture, type BuilderFixture } from "./__helpers__.js";
+import { makeBuilderFixture, type BuilderFixture } from "../../testing/framework_testing.js";
 
 // End-to-end tests against an in-memory SQLite. We define a small two-table
 // schema with a single FK so we can verify root CRUD, recursive relation

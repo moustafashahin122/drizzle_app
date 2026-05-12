@@ -22,8 +22,8 @@ import { graphql, type GraphQLSchema } from "graphql";
 import {
   getSharedSqlite,
   transactionCase,
-} from "../../testing/index.js";
-import { pushDrizzleSchema } from "../../testing/schemaPush.js";
+  pushDrizzleSchema,
+} from "../../testing/base.js";
 import { buildSchema } from "../builder/builder.js";
 import { buildRbac } from "./rbac.js";
 import type { BuiltRbac, RbacContext, ResolvedUserRole } from "./rbac.js";

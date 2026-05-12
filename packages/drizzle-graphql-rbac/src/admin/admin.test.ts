@@ -5,18 +5,24 @@ import { eq } from "drizzle-orm";
 import { roles, users, sessions } from "../tables.js";
 import { buildAdminRoutes } from "./routes.js";
 import { buildAuthRoutes } from "../auth/routes.js";
-import { type BuiltRbac } from "../graphql/rbac/rbac.js";
-import { getUserRole } from "../graphql/rbac/persistence.js";
-import { jsonFetch } from "../testing/httpTestUtils.js";
+import { buildRbac, type BuiltRbac } from "../graphql/rbac/rbac.js";
+import { buildRbacDb } from "../graphql/rbac/rbacDb.js";
 import {
-  buildAdminAndAuth,
+  defineRoles,
+  defineAccessRights,
+  defineRecordRules,
+} from "../graphql/rbac/config.js";
+import { getUserRole, syncRoles } from "../graphql/rbac/persistence.js";
+import { jsonFetch } from "../testing/base.js";
+import {
   freshFrameworkDb,
+  frameworkSchema,
   loginViaHttp,
   seedUser as fwSeedUser,
   seedUserWithRole as fwSeedUserWithRole,
   wipeFrameworkTables,
   type FrameworkDb,
-} from "../testing/frameworkTesting.js";
+} from "../testing/framework_testing.js";
 
 let db: FrameworkDb;
 let authApp: ReturnType<typeof buildAuthRoutes>;
@@ -25,7 +31,24 @@ let rbac: BuiltRbac;
 
 before(async () => {
   db = (await freshFrameworkDb()).db;
-  ({ authApp, adminApp, rbac } = await buildAdminAndAuth({ db }));
+  rbac = buildRbac({
+    roles: defineRoles({ admin: { isAdmin: true }, user: {} }),
+    accessRights: defineAccessRights({
+      user: { users: { read: true, update: true } },
+    }),
+    recordRules: defineRecordRules({}),
+  });
+  await syncRoles(db, { roles, users }, rbac.roles());
+  const rdbFor = buildRbacDb({ db, schema: frameworkSchema, enforce: rbac.enforce });
+  authApp = buildAuthRoutes({ db, schema: frameworkSchema });
+  adminApp = buildAdminRoutes({
+    db,
+    schema: frameworkSchema,
+    usersTable: users,
+    rolesTable: roles,
+    rdbFor,
+    rbac,
+  });
 });
 
 beforeEach(async () => {

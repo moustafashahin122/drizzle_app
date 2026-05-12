@@ -8,12 +8,12 @@ import {
   parseSessionCookie,
   SESSION_COOKIE_NAME,
 } from "./session.js";
-import { cookieValue, jsonFetch } from "../testing/httpTestUtils.js";
+import { cookieValue, jsonFetch } from "../testing/base.js";
 import {
-  buildAuthOnly,
   freshFrameworkDb,
+  frameworkSchema,
   type FrameworkDb,
-} from "../testing/frameworkTesting.js";
+} from "../testing/framework_testing.js";
 
 let db: FrameworkDb;
 let app: ReturnType<typeof buildAuthRoutes>;
@@ -21,7 +21,7 @@ let app: ReturnType<typeof buildAuthRoutes>;
 before(async () => {
   const fresh = await freshFrameworkDb();
   db = fresh.db;
-  app = (await buildAuthOnly({ db })).app;
+  app = buildAuthRoutes({ db, schema: frameworkSchema });
 });
 
 /** Thin adapter over the shared `jsonFetch` — defaults `target` to the suite's `app`. */
@@ -160,10 +160,11 @@ describe("auth REST — login rate limiting", () => {
   });
 
   beforeEach(async () => {
-    rlApp = (await buildAuthOnly({
+    rlApp = buildAuthRoutes({
       db,
+      schema: frameworkSchema,
       loginRateLimit: { maxPerIpEmail: PER_IP_EMAIL, maxPerIp: PER_IP },
-    })).app;
+    });
   });
 
   it("locks out after maxPerIpEmail failures for the same (IP, email)", async () => {
