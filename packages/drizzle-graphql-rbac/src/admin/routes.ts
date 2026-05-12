@@ -263,6 +263,9 @@ export function buildAdminRoutes(deps: AdminRoutesDeps) {
       }
       throw e;
     }
+    // Invalidate the target user's sessions so the new role takes effect on
+    // their next request rather than across a long-lived cookie.
+    await db.delete(schema.sessions).where(eq(schema.sessions.userId, id));
     return c.json({
       userId: id,
       role: assigned ? { name: assigned.name, isAdmin: assigned.isAdmin } : null,
@@ -283,6 +286,7 @@ export function buildAdminRoutes(deps: AdminRoutesDeps) {
 
     await requireUserExists(id);
     await setUserRole(db, persistenceSchema, id, null);
+    await db.delete(schema.sessions).where(eq(schema.sessions.userId, id));
     return c.json({ userId: id, role: null });
   });
 

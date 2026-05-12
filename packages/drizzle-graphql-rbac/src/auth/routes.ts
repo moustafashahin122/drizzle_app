@@ -17,7 +17,7 @@
  * Password reset is intentionally out of scope here — see the project README
  * for the planned `/auth/password/*` endpoints.
  */
-import { Hono } from "hono";
+import { Hono, type Context } from "hono";
 import bcrypt from "bcryptjs";
 import { eq } from "drizzle-orm";
 import type { User } from "../tables.js";
@@ -54,6 +54,28 @@ function publicUser(user: User): Omit<User, "passwordHash"> {
   return rest;
 }
 
+/** Parse the JSON body, returning `{}` on malformed input rather than throwing. */
+async function readJsonBody(c: Context<AuthEnv>): Promise<unknown> {
+  return c.req.json().catch(() => ({}));
+}
+
+/**
+ * Destroy any session attached to the current request and mint a fresh one for
+ * `userId`, setting the cookie. Prevents session fixation: a pre-login cookie
+ * cannot survive across the authentication boundary.
+ */
+async function rotateSession(
+  c: Context<AuthEnv>,
+  db: SudoDb,
+  schema: RoleAwareSchema,
+  userId: number,
+): Promise<void> {
+  const existing = c.get("session");
+  if (existing) await destroySession(db, schema, existing.id);
+  const { token } = await issueSession(db, schema, userId);
+  c.header("Set-Cookie", buildSessionCookie(token), { append: true });
+}
+
 export interface AuthRoutesDeps {
   db: SudoDb;
   /**
@@ -83,7 +105,7 @@ export function buildAuthRoutes(deps: AuthRoutesDeps) {
   app.use("/login", ...loginLimiter.middlewares);
 
   app.post("/register", async (c) => {
-    const body = await c.req.json().catch(() => ({}));
+    const body = await readJsonBody(c);
     const name = getStringField(body, "name");
     const email = getStringField(body, "email");
     const password = getStringField(body, "password", { trim: false });
@@ -107,13 +129,12 @@ export function buildAuthRoutes(deps: AuthRoutesDeps) {
       throw err;
     }
 
-    const { token } = await issueSession(db, schema, user.id);
-    c.header("Set-Cookie", buildSessionCookie(token), { append: true });
+    await rotateSession(c, db, schema, user.id);
     return c.json({ user: publicUser(user) }, 201);
   });
 
   app.post("/login", async (c) => {
-    const body = await c.req.json().catch(() => ({}));
+    const body = await readJsonBody(c);
     const email = getStringField(body, "email");
     const password = getStringField(body, "password", { trim: false });
     if (!email || !password) {
@@ -140,8 +161,7 @@ export function buildAuthRoutes(deps: AuthRoutesDeps) {
     // failures stop counting down the window.
     await loginLimiter.onSuccess(c);
 
-    const { token } = await issueSession(db, schema, user.id);
-    c.header("Set-Cookie", buildSessionCookie(token), { append: true });
+    await rotateSession(c, db, schema, user.id);
     return c.json({ user: publicUser(user as User) });
   });
 
