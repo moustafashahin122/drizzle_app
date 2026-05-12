@@ -2,14 +2,12 @@
  * Tests for the DB-backed RBAC persistence layer (`./persistence.ts`):
  * `syncRoles`, `getUserRole`, `setUserRole`, `listRoles`.
  *
- * Uses isolated in-memory sqlite per test (not the shared handle) so we can
- * exercise the real `roles` + `users` tables from `../../tables.ts` — these
- * tests are about that exact schema, not the simplified one in `__helpers__`.
+ * Uses isolated in-memory sqlite per test (via `freshFrameworkDb`, not the
+ * shared singleton) — these tests are about the exact `roles` + `users`
+ * tables from `../../tables.ts`, not the simplified schema in `__helpers__`.
  */
 import { describe, it, beforeEach } from "node:test";
 import assert from "node:assert/strict";
-import Database from "better-sqlite3";
-import { drizzle, type BetterSQLite3Database } from "drizzle-orm/better-sqlite3";
 import { eq } from "drizzle-orm";
 
 import { roles, users, type Role } from "../../tables.js";
@@ -20,36 +18,13 @@ import {
   listRoles,
 } from "./persistence.js";
 import type { ResolvedRole } from "./config.js";
-
-type Db = BetterSQLite3Database<{ roles: typeof roles; users: typeof users }>;
+import { freshFrameworkDb, type FrameworkDb } from "../../testing/frameworkTesting.js";
 
 const schema = { roles, users };
 
 const role = (key: string, isAdmin = false): ResolvedRole => ({ key, isAdmin });
 
-/** Build a fresh in-memory DB with the framework's user/role schema. */
-function freshDb(): { sqlite: Database.Database; db: Db } {
-  const sqlite = new Database(":memory:");
-  sqlite.exec(`
-    CREATE TABLE roles (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      name TEXT NOT NULL UNIQUE,
-      is_admin INTEGER NOT NULL DEFAULT 0
-    );
-    CREATE TABLE users (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      name TEXT NOT NULL,
-      email TEXT NOT NULL UNIQUE,
-      password_hash TEXT NOT NULL,
-      active INTEGER NOT NULL DEFAULT 1,
-      role_id INTEGER REFERENCES roles(id) ON DELETE SET NULL,
-      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-    );
-  `);
-  return { sqlite, db: drizzle(sqlite, { schema: { roles, users } }) as unknown as Db };
-}
-
-async function insertUser(db: Db, name: string, email: string): Promise<number> {
+async function insertUser(db: FrameworkDb, name: string, email: string): Promise<number> {
   const [row] = await db
     .insert(users)
     .values({ name, email, passwordHash: "x" })
@@ -58,9 +33,9 @@ async function insertUser(db: Db, name: string, email: string): Promise<number> 
 }
 
 describe("syncRoles", () => {
-  let db: Db;
-  beforeEach(() => {
-    db = freshDb().db;
+  let db: FrameworkDb;
+  beforeEach(async () => {
+    db = (await freshFrameworkDb()).db;
   });
 
   it("inserts code-declared roles on a fresh DB", async () => {
@@ -150,9 +125,9 @@ describe("syncRoles", () => {
 });
 
 describe("getUserRole", () => {
-  let db: Db;
+  let db: FrameworkDb;
   beforeEach(async () => {
-    db = freshDb().db;
+    db = (await freshFrameworkDb()).db;
     await syncRoles(db, schema, [role("user"), role("admin", true)]);
   });
 
@@ -178,9 +153,9 @@ describe("getUserRole", () => {
 });
 
 describe("setUserRole", () => {
-  let db: Db;
+  let db: FrameworkDb;
   beforeEach(async () => {
-    db = freshDb().db;
+    db = (await freshFrameworkDb()).db;
     await syncRoles(db, schema, [role("user"), role("admin", true)]);
   });
 
@@ -221,7 +196,7 @@ describe("setUserRole", () => {
 
 describe("listRoles", () => {
   it("returns every persisted role row, post-sync", async () => {
-    const { db } = freshDb();
+    const { db } = await freshFrameworkDb();
     await syncRoles(db, schema, [role("user"), role("admin", true), role("manager")]);
     const rows = await listRoles(db, schema);
     assert.deepEqual(
@@ -231,7 +206,7 @@ describe("listRoles", () => {
   });
 
   it("returns an empty array on a DB with no synced roles", async () => {
-    const { db } = freshDb();
+    const { db } = await freshFrameworkDb();
     const rows = await listRoles(db, schema);
     assert.deepEqual(rows, []);
   });

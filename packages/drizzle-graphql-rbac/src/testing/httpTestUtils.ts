@@ -7,7 +7,9 @@
  */
 
 interface HonoLike {
-  request(input: string, init?: RequestInit): Promise<Response>;
+  // Hono's `.request` is declared as `Response | Promise<Response>`; widen to
+  // match so the test fixture types pass.
+  request(input: string, init?: RequestInit): Response | Promise<Response>;
 }
 
 /**

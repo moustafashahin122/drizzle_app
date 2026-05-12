@@ -9,88 +9,38 @@
  */
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import Database from "better-sqlite3";
-import { drizzle } from "drizzle-orm/better-sqlite3";
-import bcrypt from "bcryptjs";
-import { sql } from "drizzle-orm";
 
-import { createApp } from "./app.js";
-import { roles, users, sessions } from "./tables.js";
-import {
-  defineRoles,
-  defineAccessRights,
-  defineRecordRules,
-} from "./graphql/rbac/config.js";
-import { setUserRole } from "./graphql/rbac/persistence.js";
+import type { CreateAppOptions } from "./app.js";
 import { cookieValue, jsonFetch } from "./testing/httpTestUtils.js";
+import {
+  buildFrameworkApp,
+  freshFrameworkDb,
+  seedUserWithRole,
+} from "./testing/frameworkTesting.js";
 
-const frameworkSchema = { roles, users, sessions } as Record<string, unknown> & {
-  roles: typeof roles;
-  users: typeof users;
-  sessions: typeof sessions;
-};
+type BuiltApp = Awaited<ReturnType<typeof buildFrameworkApp>>;
 
-const FRAMEWORK_DDL = `
-  CREATE TABLE roles (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL UNIQUE,
-    is_admin INTEGER NOT NULL DEFAULT 0
-  );
-  CREATE TABLE users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL,
-    email TEXT NOT NULL UNIQUE,
-    password_hash TEXT NOT NULL,
-    active INTEGER NOT NULL DEFAULT 1,
-    role_id INTEGER REFERENCES roles(id) ON DELETE SET NULL,
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-  );
-  CREATE TABLE sessions (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    token TEXT NOT NULL UNIQUE,
-    user_id INTEGER NOT NULL REFERENCES users(id),
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    expires_at TEXT NOT NULL
-  );
-`;
-
-const emptyRbac = {
-  roles: defineRoles({ user: {} }),
-  accessRights: defineAccessRights({ user: { users: { read: true } } }),
-  recordRules: defineRecordRules({}),
-};
-
-async function buildApp(overrides: Partial<Parameters<typeof createApp>[0]> = {}) {
-  const sqlite = new Database(":memory:");
-  sqlite.exec(FRAMEWORK_DDL);
-  const db = drizzle(sqlite);
-  const { app, rbac, sudoDb } = await createApp({
-    db,
-    schema: frameworkSchema,
-    rbac: emptyRbac,
-    publicDir: null,
-    logger: false,
-    ...overrides,
-  });
-  return { app, rbac, sudoDb, sqlite };
+/** Fresh DB + fresh createApp wired for each test — supports the option matrix. */
+async function buildApp(
+  overrides: Partial<Omit<CreateAppOptions, "db" | "schema" | "rbac">> = {},
+): Promise<BuiltApp> {
+  const db = (await freshFrameworkDb()).db;
+  return buildFrameworkApp({ db, createAppOverrides: overrides });
 }
 
+/**
+ * Seed a user (default role: `user`, "pw" password) and return the `sid`
+ * cookie value. Uses the full app's `/auth/login` so CSRF + middleware run.
+ */
 async function seedAndLogin(
-  app: ReturnType<typeof buildApp>["app"],
-  sudoDb: ReturnType<typeof buildApp>["sudoDb"],
-  rbac: ReturnType<typeof buildApp>["rbac"],
+  built: BuiltApp,
   opts: { role?: string; email?: string; name?: string } = {},
 ): Promise<string> {
   const role = opts.role ?? "user";
   const email = opts.email ?? "alice@x.com";
   const name = opts.name ?? "Alice";
-  const passwordHash = await bcrypt.hash("pw", 4);
-  const [u] = await sudoDb
-    .insert(users)
-    .values({ name, email, passwordHash, active: true })
-    .returning();
-  await setUserRole(sudoDb, { roles, users }, u.id, role);
-  const r = await jsonFetch(app, "POST", "http://t.local/auth/login", {
+  await seedUserWithRole(built.db, { name, email, password: "pw", role });
+  const r = await jsonFetch(built.app, "POST", "http://t.local/auth/login", {
     body: { email, password: "pw" },
   });
   const sid = cookieValue(r.setCookies, "sid");
@@ -99,7 +49,7 @@ async function seedAndLogin(
 }
 
 async function gql(
-  app: ReturnType<typeof buildApp>["app"],
+  app: BuiltApp["app"],
   query: string,
   opts: { token?: string } = {},
 ): Promise<{ status: number; body: any }> {
@@ -120,8 +70,9 @@ describe("createApp — graphqlRequireAuth (HTTP-layer auth gate)", () => {
   });
 
   it("allows authenticated /graphql through to the resolver layer", async () => {
-    const { app, sudoDb, rbac } = await buildApp();
-    const sid = await seedAndLogin(app, sudoDb, rbac);
+    const built = await buildApp();
+    const { app } = built;
+    const sid = await seedAndLogin(built);
     const { status, body } = await gql(app, `{ users { id name } }`, { token: sid });
     assert.equal(status, 200);
     assert.equal(body.errors, undefined);
@@ -147,8 +98,9 @@ describe("createApp — graphqlAllowIntrospection", () => {
   const INTROSPECTION_Q = `{ __schema { types { name } } }`;
 
   it("allowed (default in non-production): admin can introspect", async () => {
-    const { app, sudoDb, rbac } = await buildApp();
-    const sid = await seedAndLogin(app, sudoDb, rbac, {
+    const built = await buildApp();
+    const { app } = built;
+    const sid = await seedAndLogin(built, {
       role: "admin",
       email: "admin@x.com",
       name: "Admin",
@@ -166,8 +118,9 @@ describe("createApp — graphqlAllowIntrospection", () => {
   it("allowed (default in non-production): non-admin is rejected by introspection rule", async () => {
     // Introspection reveals the full schema shape (including names of hidden
     // columns), so even when the flag is on we only hand it to admins.
-    const { app, sudoDb, rbac } = await buildApp();
-    const sid = await seedAndLogin(app, sudoDb, rbac); // default role: "user"
+    const built = await buildApp();
+    const { app } = built;
+    const sid = await seedAndLogin(built); // default role: "user"
     const { status, body } = await gql(app, INTROSPECTION_Q, { token: sid });
     assert.equal(status, 200);
     assert.equal(body.data ?? null, null);
@@ -178,8 +131,9 @@ describe("createApp — graphqlAllowIntrospection", () => {
   });
 
   it("disabled: __schema is rejected at validation time with GraphQL errors[]", async () => {
-    const { app, sudoDb, rbac } = await buildApp({ graphqlAllowIntrospection: false });
-    const sid = await seedAndLogin(app, sudoDb, rbac);
+    const built = await buildApp({ graphqlAllowIntrospection: false });
+    const { app } = built;
+    const sid = await seedAndLogin(built);
     const { status, body } = await gql(app, INTROSPECTION_Q, { token: sid });
     assert.equal(status, 200, "validation error returns 200 + errors[], not HTTP 4xx");
     assert.equal(body.data ?? null, null);
@@ -198,8 +152,9 @@ describe("createApp — graphqlAllowIntrospection", () => {
   });
 
   it("disabled: non-introspection queries still work (validation rule is targeted)", async () => {
-    const { app, sudoDb, rbac } = await buildApp({ graphqlAllowIntrospection: false });
-    const sid = await seedAndLogin(app, sudoDb, rbac);
+    const built = await buildApp({ graphqlAllowIntrospection: false });
+    const { app } = built;
+    const sid = await seedAndLogin(built);
     const { status, body } = await gql(app, `{ users { id name } }`, { token: sid });
     assert.equal(status, 200);
     assert.equal(body.errors, undefined);
@@ -208,8 +163,9 @@ describe("createApp — graphqlAllowIntrospection", () => {
   });
 
   it("disabled: GraphiQL HTML/JS page is not served (GET /graphql does not render GraphiQL)", async () => {
-    const { app, sudoDb, rbac } = await buildApp({ graphqlAllowIntrospection: false });
-    const sid = await seedAndLogin(app, sudoDb, rbac);
+    const built = await buildApp({ graphqlAllowIntrospection: false });
+    const { app } = built;
+    const sid = await seedAndLogin(built);
     // GET /graphql with an Accept that would otherwise yield the IDE page.
     const r = await jsonFetch(app, "GET", "http://t.local/graphql", {
       headers: { accept: "text/html" },
@@ -236,8 +192,9 @@ describe("createApp — default hiddenOutputColumns", () => {
     ];
     for (const c of cases) {
       await t.test(`${c.bannedField} not selectable`, async () => {
-        const { app, sudoDb, rbac } = await buildApp();
-        const sid = await seedAndLogin(app, sudoDb, rbac);
+        const built = await buildApp();
+    const { app } = built;
+        const sid = await seedAndLogin(built);
         const { status, body } = await gql(app, c.query, { token: sid });
         assert.equal(status, 200, "validation error returns 200 + errors[]");
         assert.equal(body.data ?? null, null);
@@ -321,6 +278,3 @@ describe("createApp — CSRF protection (origin gate via hono/csrf)", () => {
   });
 });
 
-// Suppress the unused-import lint for `sql` — it's here as a hedge in case
-// future cases need a raw SQL fragment in the framework schema setup.
-void sql;

@@ -1,129 +1,40 @@
 import { describe, it, before, beforeEach } from "node:test";
 import assert from "node:assert/strict";
-import Database from "better-sqlite3";
-import { drizzle } from "drizzle-orm/better-sqlite3";
-import { sqliteTable, integer, text, type AnySQLiteColumn } from "drizzle-orm/sqlite-core";
-import { eq, sql } from "drizzle-orm";
-import bcrypt from "bcryptjs";
+import { eq } from "drizzle-orm";
 
+import { roles, users, sessions } from "../tables.js";
 import { buildAdminRoutes } from "./routes.js";
 import { buildAuthRoutes } from "../auth/routes.js";
-import { parseSessionCookie } from "../auth/session.js";
-import { buildRbac, type BuiltRbac } from "../graphql/rbac/rbac.js";
-import { buildRbacDb } from "../graphql/rbac/rbacDb.js";
+import { type BuiltRbac } from "../graphql/rbac/rbac.js";
+import { getUserRole } from "../graphql/rbac/persistence.js";
+import { jsonFetch } from "../testing/httpTestUtils.js";
 import {
-  defineRoles,
-  defineAccessRights,
-  defineRecordRules,
-} from "../graphql/rbac/config.js";
-import { syncRoles, setUserRole, getUserRole } from "../graphql/rbac/persistence.js";
-import { cookieValue, jsonFetch } from "../testing/httpTestUtils.js";
+  buildAdminAndAuth,
+  freshFrameworkDb,
+  loginViaHttp,
+  seedUser as fwSeedUser,
+  seedUserWithRole as fwSeedUserWithRole,
+  wipeFrameworkTables,
+  type FrameworkDb,
+} from "../testing/frameworkTesting.js";
 
-const roles = sqliteTable("roles", {
-  id: integer("id").primaryKey({ autoIncrement: true }),
-  name: text("name").notNull().unique(),
-  isAdmin: integer("is_admin", { mode: "boolean" }).notNull().default(false),
-});
-const users = sqliteTable("users", {
-  id: integer("id").primaryKey({ autoIncrement: true }),
-  name: text("name").notNull(),
-  email: text("email").notNull().unique(),
-  passwordHash: text("password_hash").notNull(),
-  active: integer("active", { mode: "boolean" }).notNull().default(true),
-  roleId: integer("role_id").references((): AnySQLiteColumn => roles.id, {
-    onDelete: "set null",
-  }),
-  createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
-});
-const sessions = sqliteTable("sessions", {
-  id: integer("id").primaryKey({ autoIncrement: true }),
-  token: text("token").notNull().unique(),
-  userId: integer("user_id").notNull().references(() => users.id),
-  createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
-  expiresAt: text("expires_at").notNull(),
-});
-const allTables = { roles, users, sessions };
-
-const rbacConfig = {
-  roles: defineRoles({
-    admin: { isAdmin: true },
-    user: {},
-  }),
-  accessRights: defineAccessRights({
-    user: {
-      users: { read: true, update: true },
-    },
-  }),
-  recordRules: defineRecordRules({}),
-};
-
-let db: ReturnType<typeof drizzle>;
-let sqlite: Database.Database;
+let db: FrameworkDb;
 let authApp: ReturnType<typeof buildAuthRoutes>;
 let adminApp: ReturnType<typeof buildAdminRoutes>;
 let rbac: BuiltRbac;
 
-const adminSchema = { users, sessions, roles };
-
 before(async () => {
-  sqlite = new Database(":memory:");
-  sqlite.exec(`
-    CREATE TABLE roles (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      name TEXT NOT NULL UNIQUE,
-      is_admin INTEGER NOT NULL DEFAULT 0
-    );
-    CREATE TABLE users (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      name TEXT NOT NULL,
-      email TEXT NOT NULL UNIQUE,
-      password_hash TEXT NOT NULL,
-      active INTEGER NOT NULL DEFAULT 1,
-      role_id INTEGER REFERENCES roles(id) ON DELETE SET NULL,
-      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-    );
-    CREATE TABLE sessions (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      token TEXT NOT NULL UNIQUE,
-      user_id INTEGER NOT NULL REFERENCES users(id),
-      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      expires_at TEXT NOT NULL
-    );
-  `);
-  db = drizzle(sqlite);
-  rbac = buildRbac(rbacConfig);
-  // Reconcile the `roles` table with the in-code config — same as production startup.
-  await syncRoles(db, { roles, users }, rbac.roles());
-  const rdbFor = buildRbacDb({ db, schema: allTables, enforce: rbac.enforce });
-  authApp = buildAuthRoutes({ db, schema: adminSchema });
-  adminApp = buildAdminRoutes({
-    db,
-    schema: adminSchema,
-    usersTable: users,
-    rolesTable: roles,
-    rdbFor,
-    rbac,
-  });
+  db = (await freshFrameworkDb()).db;
+  ({ authApp, adminApp, rbac } = await buildAdminAndAuth({ db }));
 });
 
 beforeEach(async () => {
-  // DB DELETE wipes per-test state. Roles rows themselves persist across
-  // tests (they're code-defined and synced in `before`).
-  sqlite.exec(`
-    DELETE FROM sessions;
-    DELETE FROM users;
-  `);
+  // Wipe per-test state. `roles` rows persist (code-defined, synced once).
+  await wipeFrameworkTables(db);
 });
 
 async function loginAs(email: string, password: string): Promise<{ token: string }> {
-  const r = await jsonFetch(authApp, "POST", "/login", { body: { email, password } });
-  const token =
-    cookieValue(r.setCookies, "sid") ??
-    parseSessionCookie(r.setCookies[0] ?? null);
-  if (!token) {
-    throw new Error(`login failed: ${r.status} ${r.setCookies.join(", ")}`);
-  }
-  return { token };
+  return { token: await loginViaHttp(authApp, email, password) };
 }
 
 function admin(
@@ -138,20 +49,13 @@ function admin(
   });
 }
 
-async function seedUser(name: string, email: string, password = "secret") {
-  const passwordHash = await bcrypt.hash(password, 10);
-  const [row] = await db
-    .insert(users)
-    .values({ name, email, passwordHash, active: true })
-    .returning();
-  return row;
+function seedUser(name: string, email: string, password = "pw") {
+  return fwSeedUser(db, { name, email, password });
 }
 
 /** Seed user + assign a role via the DB-backed persistence helper. */
-async function seedUserWithRole(name: string, email: string, role: string, password = "pw") {
-  const u = await seedUser(name, email, password);
-  await setUserRole(db, { roles, users }, u.id, role);
-  return u;
+function seedUserWithRole(name: string, email: string, role: string, password = "pw") {
+  return fwSeedUserWithRole(db, { name, email, password, role });
 }
 
 describe("admin REST — /admin/* is admin-only at the middleware layer", () => {

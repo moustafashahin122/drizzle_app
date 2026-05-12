@@ -1,10 +1,7 @@
 import { describe, it, before, beforeEach } from "node:test";
 import assert from "node:assert/strict";
-import Database from "better-sqlite3";
-import { drizzle } from "drizzle-orm/better-sqlite3";
-import { sqliteTable, integer, text, type AnySQLiteColumn } from "drizzle-orm/sqlite-core";
-import { sql } from "drizzle-orm";
 
+import { roles, users, sessions } from "../tables.js";
 import { buildAuthRoutes } from "./routes.js";
 import {
   resolveSessionFromToken,
@@ -12,62 +9,19 @@ import {
   SESSION_COOKIE_NAME,
 } from "./session.js";
 import { cookieValue, jsonFetch } from "../testing/httpTestUtils.js";
+import {
+  buildAuthOnly,
+  freshFrameworkDb,
+  type FrameworkDb,
+} from "../testing/frameworkTesting.js";
 
-// Mirror src/db.ts so tests are hermetic.
-const roles = sqliteTable("roles", {
-  id: integer("id").primaryKey({ autoIncrement: true }),
-  name: text("name").notNull().unique(),
-  isAdmin: integer("is_admin", { mode: "boolean" }).notNull().default(false),
-});
-const users = sqliteTable("users", {
-  id: integer("id").primaryKey({ autoIncrement: true }),
-  name: text("name").notNull(),
-  email: text("email").notNull().unique(),
-  passwordHash: text("password_hash").notNull(),
-  active: integer("active", { mode: "boolean" }).notNull().default(true),
-  roleId: integer("role_id").references((): AnySQLiteColumn => roles.id, {
-    onDelete: "set null",
-  }),
-  createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
-});
-const sessions = sqliteTable("sessions", {
-  id: integer("id").primaryKey({ autoIncrement: true }),
-  token: text("token").notNull().unique(),
-  userId: integer("user_id").notNull().references(() => users.id),
-  createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
-  expiresAt: text("expires_at").notNull(),
-});
-
-let db: ReturnType<typeof drizzle>;
+let db: FrameworkDb;
 let app: ReturnType<typeof buildAuthRoutes>;
 
-before(() => {
-  const sqlite = new Database(":memory:");
-  sqlite.exec(`
-    CREATE TABLE roles (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      name TEXT NOT NULL UNIQUE,
-      is_admin INTEGER NOT NULL DEFAULT 0
-    );
-    CREATE TABLE users (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      name TEXT NOT NULL,
-      email TEXT NOT NULL UNIQUE,
-      password_hash TEXT NOT NULL,
-      active INTEGER NOT NULL DEFAULT 1,
-      role_id INTEGER REFERENCES roles(id) ON DELETE SET NULL,
-      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-    );
-    CREATE TABLE sessions (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      token TEXT NOT NULL UNIQUE,
-      user_id INTEGER NOT NULL REFERENCES users(id),
-      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      expires_at TEXT NOT NULL
-    );
-  `);
-  db = drizzle(sqlite);
-  app = buildAuthRoutes({ db, schema: { users, sessions, roles } });
+before(async () => {
+  const fresh = await freshFrameworkDb();
+  db = fresh.db;
+  app = (await buildAuthOnly({ db })).app;
 });
 
 /** Thin adapter over the shared `jsonFetch` — defaults `target` to the suite's `app`. */
@@ -205,12 +159,11 @@ describe("auth REST — login rate limiting", () => {
     });
   });
 
-  beforeEach(() => {
-    rlApp = buildAuthRoutes({
+  beforeEach(async () => {
+    rlApp = (await buildAuthOnly({
       db,
-      schema: { users, sessions, roles },
       loginRateLimit: { maxPerIpEmail: PER_IP_EMAIL, maxPerIp: PER_IP },
-    });
+    })).app;
   });
 
   it("locks out after maxPerIpEmail failures for the same (IP, email)", async () => {
