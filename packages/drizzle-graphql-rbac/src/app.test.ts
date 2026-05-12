@@ -22,6 +22,7 @@ import {
   defineRecordRules,
 } from "./graphql/rbac/config.js";
 import { setUserRole } from "./graphql/rbac/persistence.js";
+import { cookieValue, jsonFetch } from "./testing/httpTestUtils.js";
 
 const frameworkSchema = { roles, users, sessions } as Record<string, unknown> & {
   roles: typeof roles;
@@ -89,20 +90,10 @@ async function seedAndLogin(
     .values({ name, email, passwordHash, active: true })
     .returning();
   await setUserRole(sudoDb, { roles, users }, u.id, role);
-  const res = await app.fetch(
-    new Request("http://t.local/auth/login", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ email, password: "pw" }),
-    }),
-  );
-  const list: string[] =
-    typeof (res.headers as any).getSetCookie === "function"
-      ? (res.headers as any).getSetCookie()
-      : [res.headers.get("set-cookie") ?? ""];
-  const sid = list.map((c) => c.split(";")[0])
-    .find((c) => c.startsWith("sid="))
-    ?.slice(4);
+  const r = await jsonFetch(app, "POST", "http://t.local/auth/login", {
+    body: { email, password: "pw" },
+  });
+  const sid = cookieValue(r.setCookies, "sid");
   if (!sid) throw new Error("login failed: no sid cookie");
   return sid;
 }
@@ -112,18 +103,10 @@ async function gql(
   query: string,
   opts: { token?: string } = {},
 ): Promise<{ status: number; body: any }> {
-  const headers: Record<string, string> = { "content-type": "application/json" };
-  if (opts.token) headers.authorization = `Bearer ${opts.token}`;
-  const res = await app.fetch(
-    new Request("http://t.local/graphql", {
-      method: "POST",
-      headers,
-      body: JSON.stringify({ query }),
-    }),
-  );
-  const text = await res.text();
-  const body = text ? (() => { try { return JSON.parse(text); } catch { return text; } })() : null;
-  return { status: res.status, body };
+  return jsonFetch(app, "POST", "http://t.local/graphql", {
+    body: { query },
+    bearer: opts.token,
+  });
 }
 
 describe("createApp — graphqlRequireAuth (HTTP-layer auth gate)", () => {
@@ -228,13 +211,11 @@ describe("createApp — graphqlAllowIntrospection", () => {
     const { app, sudoDb, rbac } = await buildApp({ graphqlAllowIntrospection: false });
     const sid = await seedAndLogin(app, sudoDb, rbac);
     // GET /graphql with an Accept that would otherwise yield the IDE page.
-    const res = await app.fetch(
-      new Request("http://t.local/graphql", {
-        method: "GET",
-        headers: { accept: "text/html", cookie: `sid=${sid}` },
-      }),
-    );
-    const text = await res.text();
+    const r = await jsonFetch(app, "GET", "http://t.local/graphql", {
+      headers: { accept: "text/html" },
+      cookie: `sid=${sid}`,
+    });
+    const text = typeof r.body === "string" ? r.body : JSON.stringify(r.body ?? "");
     assert.ok(
       !text.toLowerCase().includes("<title>yoga graphiql</title>") &&
         !text.toLowerCase().includes("graphiql"),
@@ -280,18 +261,14 @@ describe("createApp — CSRF protection (origin gate via hono/csrf)", () => {
     contentType: string,
     headers: Record<string, string> = {},
   ): Promise<number> {
-    const body =
+    const rawBody =
       contentType.startsWith("application/x-www-form-urlencoded") ? "a=1" :
       contentType.startsWith("multipart/form-data") ? "--xxx--" :
       contentType.startsWith("application/json") ? "{}" : "hi";
-    const res = await app.fetch(
-      new Request("http://app.localhost/auth/login", {
-        method: "POST",
-        headers: { "content-type": contentType, ...headers },
-        body,
-      }),
-    );
-    return res.status;
+    const r = await jsonFetch(app, "POST", "http://app.localhost/auth/login", {
+      rawBody, contentType, headers,
+    });
+    return r.status;
   }
 
   it("default config blocks foreign-origin form POSTs (403) and lets JSON through", async () => {

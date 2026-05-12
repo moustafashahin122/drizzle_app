@@ -17,18 +17,7 @@ import {
   defineRecordRules,
 } from "../graphql/rbac/config.js";
 import { syncRoles, setUserRole, getUserRole } from "../graphql/rbac/persistence.js";
-
-function cookieFromList(list: string[], name: string): string | null {
-  for (const raw of list) {
-    const first = raw.split(";")[0]?.trim() ?? "";
-    const eq = first.indexOf("=");
-    if (eq < 0) continue;
-    if (first.slice(0, eq).trim() !== name) continue;
-    const v = first.slice(eq + 1).trim();
-    return v || null;
-  }
-  return null;
-}
+import { cookieValue, jsonFetch } from "../testing/httpTestUtils.js";
 
 const roles = sqliteTable("roles", {
   id: integer("id").primaryKey({ autoIncrement: true }),
@@ -127,41 +116,26 @@ beforeEach(async () => {
 });
 
 async function loginAs(email: string, password: string): Promise<{ token: string }> {
-  const res = await authApp.request("/login", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ email, password }),
-  });
-  const list: string[] =
-    typeof (res.headers as any).getSetCookie === "function"
-      ? (res.headers as any).getSetCookie()
-      : res.headers.get("set-cookie")
-        ? [res.headers.get("set-cookie")!]
-        : [];
-  const token = cookieFromList(list, "sid") ?? parseSessionCookie(res.headers.get("set-cookie"));
+  const r = await jsonFetch(authApp, "POST", "/login", { body: { email, password } });
+  const token =
+    cookieValue(r.setCookies, "sid") ??
+    parseSessionCookie(r.setCookies[0] ?? null);
   if (!token) {
-    throw new Error(`login failed: ${res.status} ${res.headers.get("set-cookie")}`);
+    throw new Error(`login failed: ${r.status} ${r.setCookies.join(", ")}`);
   }
   return { token };
 }
 
-async function admin(
+function admin(
   auth: { token: string },
   method: string,
   path: string,
   body?: unknown,
-): Promise<{ status: number; body: any }> {
-  const headers: Record<string, string> = {
+) {
+  return jsonFetch(adminApp, method, path, {
+    body,
     cookie: `sid=${auth.token}`,
-  };
-  let init: RequestInit = { method, headers };
-  if (body !== undefined) {
-    headers["content-type"] = "application/json";
-    init.body = JSON.stringify(body);
-  }
-  const res = await adminApp.request(path, init);
-  const text = await res.text();
-  return { status: res.status, body: text ? JSON.parse(text) : null };
+  });
 }
 
 async function seedUser(name: string, email: string, password = "secret") {

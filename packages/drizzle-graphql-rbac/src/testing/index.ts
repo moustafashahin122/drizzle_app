@@ -22,3 +22,10 @@ export {
   type AppTestHarness,
   type AppHandle,
 } from "./appTestCase.js";
+export {
+  getSetCookieList,
+  cookieValue,
+  jsonFetch,
+  type JsonFetchOpts,
+  type JsonFetchResult,
+} from "./httpTestUtils.js";
