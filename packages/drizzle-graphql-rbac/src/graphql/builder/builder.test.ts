@@ -1,12 +1,9 @@
 import { describe, it, before } from "node:test";
 import assert from "node:assert/strict";
-import Database from "better-sqlite3";
-import { drizzle } from "drizzle-orm/better-sqlite3";
-import { graphql, type GraphQLSchema, type GraphQLInputObjectType, type GraphQLObjectType } from "graphql";
 import { integer, sqliteTable, text } from "drizzle-orm/sqlite-core";
-import { sql } from "drizzle-orm";
+import type { GraphQLInputObjectType, GraphQLObjectType } from "graphql";
 
-import { buildSchema } from "./builder.js";
+import { makeBuilderFixture, type BuilderFixture } from "./__helpers__.js";
 
 // End-to-end tests against an in-memory SQLite. We define a small two-table
 // schema with a single FK so we can verify root CRUD, recursive relation
@@ -25,70 +22,55 @@ const todos = sqliteTable("todos", {
   assigneeId: integer("assignee_id").references(() => assignees.id),
 });
 
-let schema: GraphQLSchema;
-let db: ReturnType<typeof drizzle>;
+const baseTables = { assignees, todos };
+
+let fx: BuilderFixture;
 
 before(async () => {
-  // Set up a new in-memory SQLite database instance for isolated test execution.
-  const sqlite = new Database(":memory:");
-  sqlite.exec(`
-    CREATE TABLE assignees (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      name TEXT NOT NULL,
-      email TEXT NOT NULL
-    );
-    CREATE TABLE todos (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      title TEXT NOT NULL,
-      completed INTEGER NOT NULL DEFAULT 0,
-      assignee_id INTEGER REFERENCES assignees(id)
-    );
-    INSERT INTO assignees (name, email) VALUES
-      ('Alice', 'alice@example.com'),
-      ('Bob', 'bob@example.com');
-    INSERT INTO todos (title, assignee_id) VALUES
-      ('write tests', 1),
-      ('review PR', 1),
-      ('deploy', 2),
-      ('orphan', NULL);
-  `);
-  db = drizzle(sqlite);
-  schema = buildSchema(db, { assignees, todos }).schema;
+  fx = await makeBuilderFixture({
+    tables: baseTables,
+    seed: async (db) => {
+      await db.insert(assignees).values([
+        { name: "Alice", email: "alice@example.com" },
+        { name: "Bob", email: "bob@example.com" },
+      ]);
+      await db.insert(todos).values([
+        { title: "write tests", assigneeId: 1 },
+        { title: "review PR", assigneeId: 1 },
+        { title: "deploy", assigneeId: 2 },
+        { title: "orphan", assigneeId: null },
+      ]);
+    },
+  });
 });
-
-async function run(query: string, variables?: Record<string, unknown>) {
-  const result = await graphql({ schema, source: query, variableValues: variables });
-  // Surfacing errors makes failures readable in test output.
-  if (result.errors?.length) {
-    throw new Error(result.errors.map((e) => e.message).join("\n"));
-  }
-  return result.data;
-}
 
 describe("buildSchema — root surface", () => {
   it("exposes per-table list and Single queries", async () => {
-    const data: any = await run(`{ __schema { queryType { fields { name } } } }`);
-    const names = data.__schema.queryType.fields.map((f: any) => f.name).sort();
-    assert.deepEqual(names, ["assignees", "assigneesSingle", "todos", "todosSingle"]);
+    const data = await fx.run(`{ __schema { queryType { fields { name } } } }`);
+    const names = new Set(data.__schema.queryType.fields.map((f: any) => f.name));
+    assert.deepEqual(names, new Set(["assignees", "assigneesSingle", "todos", "todosSingle"]));
   });
 
   it("exposes insertInto / update / deleteFrom mutations per table", async () => {
-    const data: any = await run(`{ __schema { mutationType { fields { name } } } }`);
-    const names = data.__schema.mutationType.fields.map((f: any) => f.name).sort();
-    assert.deepEqual(names, [
-      "deleteFromAssignees",
-      "deleteFromTodos",
-      "insertIntoAssignees",
-      "insertIntoTodos",
-      "updateAssignees",
-      "updateTodos",
-    ]);
+    const data = await fx.run(`{ __schema { mutationType { fields { name } } } }`);
+    const names = new Set(data.__schema.mutationType.fields.map((f: any) => f.name));
+    assert.deepEqual(
+      names,
+      new Set([
+        "deleteFromAssignees",
+        "deleteFromTodos",
+        "insertIntoAssignees",
+        "insertIntoTodos",
+        "updateAssignees",
+        "updateTodos",
+      ]),
+    );
   });
 });
 
 describe("buildSchema — list query", () => {
   it("returns all rows when no args given", async () => {
-    const data: any = await run(`{ todos(orderBy: { id: ASC }) { id title } }`);
+    const data = await fx.run(`{ todos(orderBy: { id: ASC }) { id title } }`);
     assert.equal(data.todos.length, 4);
     assert.deepEqual(
       data.todos.map((t: any) => t.title),
@@ -98,7 +80,7 @@ describe("buildSchema — list query", () => {
   });
 
   it("filters by where (JSON domain)", async () => {
-    const data: any = await run(
+    const data = await fx.run(
       `query ($w: JSON) { todos(where: $w) { title } }`,
       { w: [["title", "like", "%PR%"]] },
     );
@@ -106,7 +88,7 @@ describe("buildSchema — list query", () => {
   });
 
   it("orders, limits, and offsets", async () => {
-    const data: any = await run(
+    const data = await fx.run(
       `{ todos(orderBy: { id: DESC }, limit: 2, offset: 1) { id title } }`,
     );
     assert.deepEqual(data.todos.map((t: any) => t.title), ["deploy", "review PR"]);
@@ -115,13 +97,13 @@ describe("buildSchema — list query", () => {
 
 describe("buildSchema — Single query", () => {
   it("returns the first match or null", async () => {
-    const found: any = await run(
+    const found = await fx.run(
       `query ($w: JSON) { todosSingle(where: $w) { id title } }`,
       { w: [["title", "=", "deploy"]] },
     );
     assert.equal(found.todosSingle.title, "deploy");
 
-    const missing: any = await run(
+    const missing = await fx.run(
       `query ($w: JSON) { todosSingle(where: $w) { id } }`,
       { w: [["title", "=", "nope"]] },
     );
@@ -131,7 +113,7 @@ describe("buildSchema — Single query", () => {
 
 describe("buildSchema — recursive relation traversal", () => {
   it("resolves the forward 'one' relation under the FK column's name", async () => {
-    const data: any = await run(`
+    const data = await fx.run(`
       { todos(orderBy: { id: ASC }) { title assigneeId { name } } }
     `);
     assert.deepEqual(
@@ -146,7 +128,7 @@ describe("buildSchema — recursive relation traversal", () => {
   });
 
   it("resolves the inverse 'many' relation on the referenced table", async () => {
-    const data: any = await run(`
+    const data = await fx.run(`
       { assignees(orderBy: { id: ASC }) { name todos(orderBy: { id: ASC }) { title } } }
     `);
     assert.deepEqual(
@@ -159,7 +141,7 @@ describe("buildSchema — recursive relation traversal", () => {
   });
 
   it("recurses through multiple relation hops", async () => {
-    const data: any = await run(
+    const data = await fx.run(
       `query ($w: JSON) { todosSingle(where: $w) {
           assigneeId { todos(orderBy: { id: ASC }) { title } }
       } }`,
@@ -172,7 +154,7 @@ describe("buildSchema — recursive relation traversal", () => {
   });
 
   it("accepts where/limit on a 'many' relation field", async () => {
-    const data: any = await run(
+    const data = await fx.run(
       `query ($a: JSON, $t: JSON) { assignees(where: $a) {
           todos(where: $t, limit: 1) { title }
       } }`,
@@ -187,7 +169,7 @@ describe("buildSchema — recursive relation traversal", () => {
 
 describe("buildSchema — nested relation filters (dotted domain paths)", () => {
   it("filters parent rows via a dotted path through the forward 'one' relation", async () => {
-    const data: any = await run(
+    const data = await fx.run(
       `query ($w: JSON) {
         todos(where: $w, orderBy: { id: ASC }) {
           title
@@ -206,7 +188,7 @@ describe("buildSchema — nested relation filters (dotted domain paths)", () => 
   });
 
   it("still supports column-op filtering on the same FK column", async () => {
-    const data: any = await run(
+    const data = await fx.run(
       `query ($w: JSON) { todos(where: $w) { title } }`,
       { w: [["assigneeId", "=", 2]] },
     );
@@ -214,7 +196,7 @@ describe("buildSchema — nested relation filters (dotted domain paths)", () => 
   });
 
   it("mixes column ops and dotted predicates in a single domain", async () => {
-    const data: any = await run(
+    const data = await fx.run(
       `query ($w: JSON) { todos(where: $w, orderBy: { id: ASC }) { title } }`,
       {
         w: [
@@ -230,7 +212,7 @@ describe("buildSchema — nested relation filters (dotted domain paths)", () => 
   });
 
   it("filters parents by an inverse 'many' relation via dotted path", async () => {
-    const data: any = await run(
+    const data = await fx.run(
       `query ($w: JSON) { assignees(where: $w) { name } }`,
       { w: [["todos.title", "=", "deploy"]] },
     );
@@ -238,7 +220,7 @@ describe("buildSchema — nested relation filters (dotted domain paths)", () => 
   });
 
   it("composes domain combinators (OR) with dotted predicates", async () => {
-    const data: any = await run(
+    const data = await fx.run(
       `query ($w: JSON) { todos(where: $w, orderBy: { id: ASC }) { title } }`,
       {
         w: [
@@ -256,38 +238,37 @@ describe("buildSchema — nested relation filters (dotted domain paths)", () => 
 });
 
 describe("buildSchema — relation batching", () => {
-  // Wrap the better-sqlite3 instance with a query counter that observes the
-  // raw SQL fired by Drizzle. Reusing the suite-wide `db` would require
-  // mutating it; instead we build a fresh schema bound to a counted DB and
-  // reuse the same in-memory data via ATTACH would be overkill — just rebuild
-  // a tiny isolated DB.
-  let countedSchema: GraphQLSchema;
-  let selectCount = 0;
-  before(() => {
-    const sqlite = new Database(":memory:");
-    sqlite.exec(`
-      CREATE TABLE assignees (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, email TEXT NOT NULL);
-      CREATE TABLE todos (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, completed INTEGER NOT NULL DEFAULT 0, assignee_id INTEGER REFERENCES assignees(id));
-      INSERT INTO assignees (name, email) VALUES ('Alice','a@x'), ('Bob','b@x'), ('Cara','c@x');
-      INSERT INTO todos (title, assignee_id) VALUES ('t1',1),('t2',2),('t3',1),('t4',3),('t5',2);
-    `);
-    const counted = drizzle(sqlite, {
-      logger: { logQuery: (q) => { if (q.startsWith("select")) selectCount++; } },
+  let batchFx: BuilderFixture;
+  before(async () => {
+    batchFx = await makeBuilderFixture({
+      tables: baseTables,
+      countQueries: true,
+      seed: async (db) => {
+        await db.insert(assignees).values([
+          { name: "Alice", email: "a@x" },
+          { name: "Bob",   email: "b@x" },
+          { name: "Cara",  email: "c@x" },
+        ]);
+        await db.insert(todos).values([
+          { title: "t1", assigneeId: 1 },
+          { title: "t2", assigneeId: 2 },
+          { title: "t3", assigneeId: 1 },
+          { title: "t4", assigneeId: 3 },
+          { title: "t5", assigneeId: 2 },
+        ]);
+      },
     });
-    countedSchema = buildSchema(counted, { assignees, todos }).schema;
   });
 
   it("coalesces forward 'one' lookups into a single IN-query when context.batch is provided", async () => {
-    selectCount = 0;
-    const result = await graphql({
-      schema: countedSchema,
-      source: `{ todos(orderBy: { id: ASC }) { title assigneeId { name } } }`,
-      contextValue: { batch: new Map() },
-    });
-    assert.equal(result.errors, undefined);
+    batchFx.resetCounter();
+    const data = await batchFx.run(
+      `{ todos(orderBy: { id: ASC }) { title assigneeId { name } } }`,
+      undefined,
+      { batch: new Map() },
+    );
     // 1 query for the parent todos list + 1 batched IN-query for all assignees.
-    assert.equal(selectCount, 2);
-    const data: any = result.data;
+    assert.equal(batchFx.selects(), 2);
     assert.deepEqual(
       data.todos.map((t: any) => [t.title, t.assigneeId.name]),
       [["t1","Alice"],["t2","Bob"],["t3","Alice"],["t4","Cara"],["t5","Bob"]],
@@ -295,42 +276,42 @@ describe("buildSchema — relation batching", () => {
   });
 
   it("falls back to per-parent queries when no batch context is provided", async () => {
-    selectCount = 0;
-    const result = await graphql({
-      schema: countedSchema,
-      source: `{ todos(orderBy: { id: ASC }) { title assigneeId { name } } }`,
-    });
-    assert.equal(result.errors, undefined);
+    batchFx.resetCounter();
+    await batchFx.run(
+      `{ todos(orderBy: { id: ASC }) { title assigneeId { name } } }`,
+    );
     // 1 parent query + 5 child queries (one per todo).
-    assert.equal(selectCount, 6);
+    assert.equal(batchFx.selects(), 6);
   });
 
   it("chunks the IN-list query when relationBatchSize < unique-fk-count", async () => {
-    const sqlite = new Database(":memory:");
-    sqlite.exec(`
-      CREATE TABLE assignees (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, email TEXT NOT NULL);
-      CREATE TABLE todos (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, completed INTEGER NOT NULL DEFAULT 0, assignee_id INTEGER REFERENCES assignees(id));
-      INSERT INTO assignees (name, email) VALUES ('A','a@x'),('B','b@x'),('C','c@x'),('D','d@x');
-      INSERT INTO todos (title, assignee_id) VALUES ('t1',1),('t2',2),('t3',3),('t4',4);
-    `);
-    let chunkSelectCount = 0;
-    const counted = drizzle(sqlite, {
-      logger: { logQuery: (q) => { if (q.startsWith("select")) chunkSelectCount++; } },
+    const chunkFx = await makeBuilderFixture({
+      tables: baseTables,
+      countQueries: true,
+      builder: { relationBatchSize: 2 },
+      seed: async (db) => {
+        await db.insert(assignees).values([
+          { name: "A", email: "a@x" },
+          { name: "B", email: "b@x" },
+          { name: "C", email: "c@x" },
+          { name: "D", email: "d@x" },
+        ]);
+        await db.insert(todos).values([
+          { title: "t1", assigneeId: 1 },
+          { title: "t2", assigneeId: 2 },
+          { title: "t3", assigneeId: 3 },
+          { title: "t4", assigneeId: 4 },
+        ]);
+      },
     });
-    const chunkedSchema = buildSchema(
-      counted,
-      { assignees, todos },
-      { relationBatchSize: 2 },
-    ).schema;
-    const result = await graphql({
-      schema: chunkedSchema,
-      source: `{ todos(orderBy: { id: ASC }) { title assigneeId { name } } }`,
-      contextValue: { batch: new Map() },
-    });
-    assert.equal(result.errors, undefined);
+    chunkFx.resetCounter();
+    const data = await chunkFx.run(
+      `{ todos(orderBy: { id: ASC }) { title assigneeId { name } } }`,
+      undefined,
+      { batch: new Map() },
+    );
     // 1 parent query + 2 chunked IN-queries (4 unique FKs split into batches of 2).
-    assert.equal(chunkSelectCount, 3);
-    const data: any = result.data;
+    assert.equal(chunkFx.selects(), 3);
     assert.deepEqual(
       data.todos.map((t: any) => [t.title, t.assigneeId.name]),
       [["t1","A"],["t2","B"],["t3","C"],["t4","D"]],
@@ -340,26 +321,13 @@ describe("buildSchema — relation batching", () => {
 
 describe("buildSchema — hiddenInputColumns", () => {
   // Use a small users-like table to exercise the option without disturbing
-  // the shared `db`/`schema` setup above.
+  // the shared `fx` setup above.
   const users = sqliteTable("users", {
     id: integer("id").primaryKey({ autoIncrement: true }),
     name: text("name").notNull(),
     email: text("email").notNull(),
     passwordHash: text("password_hash").notNull(),
   });
-
-  function freshDb() {
-    const sqlite = new Database(":memory:");
-    sqlite.exec(`
-      CREATE TABLE users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT NOT NULL,
-        email TEXT NOT NULL,
-        password_hash TEXT NOT NULL
-      );
-    `);
-    return drizzle(sqlite);
-  }
 
   // Table-driven: covers Insert/Update presence/absence of hidden columns + the
   // "default (option omitted): all columns appear" baseline in one place. Each
@@ -381,11 +349,13 @@ describe("buildSchema — hiddenInputColumns", () => {
     ];
     for (const c of cases) {
       const label = `${c.inputType}/${c.field}/hidden=${!c.expectPresent}`;
-      await t.test(label, () => {
-        const opts = c.configHidden ? { hiddenInputColumns: c.configHidden } : undefined;
-        const s = buildSchema(freshDb(), { users }, opts).schema;
-        const t0 = s.getType(c.inputType) as GraphQLInputObjectType;
-        const field = t0.getFields()[c.field];
+      await t.test(label, async () => {
+        const f = await makeBuilderFixture({
+          tables: { users },
+          builder: c.configHidden ? { hiddenInputColumns: c.configHidden } : undefined,
+        });
+        const inputType = f.schema.getType(c.inputType) as GraphQLInputObjectType;
+        const field = inputType.getFields()[c.field];
         if (c.expectPresent) {
           assert.ok(field, `${c.field} must be present on ${c.inputType}`);
         } else {
@@ -395,31 +365,22 @@ describe("buildSchema — hiddenInputColumns", () => {
     }
   });
 
-  it("does not affect the output object type (independent from hiddenOutputColumns)", () => {
+  it("does not affect the output object type (independent from hiddenOutputColumns)", async () => {
     // Hide `name` from inputs only — confirm it stays on the Users output.
-    const s = buildSchema(freshDb(), { users }, {
-      hiddenInputColumns: { users: ["name"] },
-    }).schema;
-    const usersOut = s.getType("Users") as GraphQLObjectType;
+    const f = await makeBuilderFixture({
+      tables: { users },
+      builder: { hiddenInputColumns: { users: ["name"] } },
+    });
+    const usersOut = f.schema.getType("Users") as GraphQLObjectType;
     const outFields = usersOut.getFields();
     assert.ok(outFields.name, "Users output type must still expose `name`");
     assert.ok(outFields.passwordHash, "Users output type must still expose `passwordHash`");
-    const insertType = s.getType("UsersInsert") as GraphQLInputObjectType;
+    const insertType = f.schema.getType("UsersInsert") as GraphQLInputObjectType;
     assert.equal(insertType.getFields().name, undefined);
   });
 });
 
 describe("buildSchema — maxListLimit clamp", () => {
-  function dbWithRows(n: number) {
-    const sqlite = new Database(":memory:");
-    sqlite.exec(`
-      CREATE TABLE assignees (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, email TEXT NOT NULL);
-    `);
-    const stmt = sqlite.prepare("INSERT INTO assignees (name, email) VALUES (?, ?)");
-    for (let i = 0; i < n; i++) stmt.run(`u${i}`, `u${i}@x`);
-    return drizzle(sqlite);
-  }
-
   // Table-driven: the three clamp behaviours share an identical "build schema
   // with cap=5, seed 10 rows, run list query" flow — only the query's `limit`
   // argument varies. `queryLimit: null` means omit `limit` from the query.
@@ -432,14 +393,20 @@ describe("buildSchema — maxListLimit clamp", () => {
     for (const c of cases) {
       const label = `cap=${c.configCap}/limit=${c.queryLimit ?? "omitted"}→${c.expected}`;
       await t.test(label, async () => {
-        const s = buildSchema(dbWithRows(10), { assignees }, { maxListLimit: c.configCap }).schema;
+        const f = await makeBuilderFixture({
+          tables: { assignees },
+          builder: { maxListLimit: c.configCap },
+          seed: async (db) => {
+            await db
+              .insert(assignees)
+              .values(Array.from({ length: 10 }, (_, i) => ({ name: `u${i}`, email: `u${i}@x` })));
+          },
+        });
         const source =
           c.queryLimit === null
             ? `{ assignees { id } }`
             : `{ assignees(limit: ${c.queryLimit}) { id } }`;
-        const result = await graphql({ schema: s, source });
-        assert.equal(result.errors, undefined, "clamping must be silent — no errors");
-        const data: any = result.data;
+        const data = await f.run(source);
         assert.equal(data.assignees.length, c.expected);
       });
     }
@@ -449,13 +416,15 @@ describe("buildSchema — maxListLimit clamp", () => {
     // Strengthened: pin not just cardinality but the first/last identities so a
     // regression that returns 200 *random* rows (e.g. accidental ORDER BY drop)
     // fails here.
-    const s = buildSchema(dbWithRows(250), { assignees }).schema;
-    const result = await graphql({
-      schema: s,
-      source: `{ assignees(orderBy: { id: ASC }, limit: 1000) { id name } }`,
+    const f = await makeBuilderFixture({
+      tables: { assignees },
+      seed: async (db) => {
+        await db
+          .insert(assignees)
+          .values(Array.from({ length: 250 }, (_, i) => ({ name: `u${i}`, email: `u${i}@x` })));
+      },
     });
-    assert.equal(result.errors, undefined);
-    const data: any = result.data;
+    const data = await f.run(`{ assignees(orderBy: { id: ASC }, limit: 1000) { id name } }`);
     assert.equal(data.assignees.length, 200);
     // Use loose equality on `id` — the builder maps the PK to GraphQL's `ID`
     // scalar which is serialized as a string. The point of these asserts is
@@ -473,7 +442,7 @@ describe("buildSchema — maxListLimit clamp", () => {
 
 describe("buildSchema — mutations round-trip", () => {
   it("insert / update / delete each return the affected rows", async () => {
-    const inserted: any = await run(`
+    const inserted = await fx.run(`
       mutation {
         insertIntoTodos(values: [{ title: "new-mutation-roundtrip", assigneeId: 2 }]) { id title }
       }
@@ -481,20 +450,20 @@ describe("buildSchema — mutations round-trip", () => {
     const newId = inserted.insertIntoTodos[0].id;
     assert.equal(inserted.insertIntoTodos[0].title, "new-mutation-roundtrip");
 
-    const updated: any = await run(
+    const updated = await fx.run(
       `mutation ($w: JSON) { updateTodos(set: { completed: true }, where: $w) { id completed } }`,
       { w: [["id", "=", newId]] },
     );
     assert.equal(updated.updateTodos[0].completed, true);
 
-    const deleted: any = await run(
+    const deleted = await fx.run(
       `mutation ($w: JSON) { deleteFromTodos(where: $w) { id title } }`,
       { w: [["id", "=", newId]] },
     );
     assert.equal(deleted.deleteFromTodos[0].title, "new-mutation-roundtrip");
 
     // Confirm row is actually gone.
-    const after: any = await run(
+    const after = await fx.run(
       `query ($w: JSON) { todosSingle(where: $w) { id } }`,
       { w: [["id", "=", newId]] },
     );
