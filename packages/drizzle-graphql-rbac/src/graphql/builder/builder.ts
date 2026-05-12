@@ -63,14 +63,11 @@ import {
   type GraphQLFieldConfigMap,
 } from "graphql";
 import { getTableName } from "drizzle-orm";
-import type { SQL } from "drizzle-orm";
-import type { ColumnMap } from "./filters.js";
 import { introspectSchema } from "./relations.js";
 import { buildTableMeta } from "./builder-types.js";
 import { addRootFields } from "./builder-resolvers.js";
 import type { DomainContext } from "../domain/domain.js";
-import type { DrizzleLike, Guard, TableMeta } from "./types.js";
-import type { RbacContext } from "../rbac/rbac.js";
+import { makeGuard, type DrizzleLike, type RbacConfig, type TableMeta } from "./types.js";
 
 export type { DrizzleLike } from "./types.js";
 
@@ -131,20 +128,7 @@ export interface BuildSchemaOptions {
    * perform a transactional post-check that re-fetches each inserted row
    * through `(PK AND createWhere)` and rolls back if any row fails to match.
    */
-  rbac?: {
-    enforce: (
-      ctx: RbacContext,
-      resource: string,
-      action: "create" | "read" | "update" | "delete",
-      columns: ColumnMap,
-    ) => Promise<{ where?: SQL }>;
-    /**
-     * Per-table opt-out (e.g. for a public `register` flow that needs to
-     * insert into `users` without the caller being authenticated). Resolvers
-     * for tables in this set skip enforcement entirely.
-     */
-     bypassResources?: ReadonlySet<string>;
-  };
+  rbac?: RbacConfig;
   /**
    * Maximum number of distinct foreign-key values to include in a single
    * `WHERE pk IN (...)` query issued by the relation batch loader. When more
@@ -217,16 +201,10 @@ export function buildSchema(
   const maxListLimit = options.maxListLimit ?? 200;
   const rbac = options.rbac;
 
-  // Per-referenced-table read guard used by relation traversal. Mirrors the
-  // guard built inside `addRootFields` for root resolvers so nested fields
-  // enforce the same record rules and read ACL on the referenced resource.
-  // `null` when rbac is disabled or the resource is on the bypass list.
-  const guardFor = (refMeta: TableMeta): Guard => {
-    if (!rbac) return null;
-    if (rbac.bypassResources?.has(refMeta.jsKey)) return null;
-    return async (gqlCtx, action) =>
-      (await rbac.enforce(gqlCtx, refMeta.jsKey, action, refMeta.columns)).where;
-  };
+  // Per-table guard, reused by both root resolvers and nested-relation
+  // traversal so nested fields enforce the same record rules and read ACL on
+  // the referenced resource.
+  const guardFor = (m: TableMeta) => makeGuard(rbac, m.jsKey, m.columns);
 
   // Pass 1: build object types (with relation field thunks) + input types.
   for (const [jsKey, table] of intro.tablesByKey) {
@@ -255,7 +233,7 @@ export function buildSchema(
   const queryFields: GraphQLFieldConfigMap<unknown, unknown> = {};
   const mutationFields: GraphQLFieldConfigMap<unknown, unknown> = {};
   for (const meta of metas.values()) {
-    addRootFields(meta, queryFields, mutationFields, db, domainCtxFor(meta), rbac, maxListLimit);
+    addRootFields(meta, queryFields, mutationFields, db, domainCtxFor(meta), guardFor(meta), maxListLimit);
   }
 
   if (options.extraQueryFields || options.extraMutationFields) {

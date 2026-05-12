@@ -222,7 +222,7 @@ export function createAppTestHarness<Schema extends AppTestConfig["schema"]>(
       };
 
       const runDirect: AppTestCtx<Schema, any>["runDirect"] = (query, opts = {}) => {
-        const user = opts.user === undefined ? null : opts.user;
+        const user = opts.user ?? null;
         return graphql({
           schema: h.graphqlSchema,
           source: query,
@@ -247,7 +247,7 @@ export function createAppTestHarness<Schema extends AppTestConfig["schema"]>(
         runDirect,
       };
 
-      const seed = (setUp ? await setUp(base) : ({} as any));
+      const seed = setUp ? await setUp(base) : ({} as any);
       return { ...base, seed } as AppTestCtx<Schema, any>;
     });
   };

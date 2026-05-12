@@ -18,6 +18,25 @@ export type { Logger } from "./logger.js";
 export { createApp } from "./app.js";
 export type { CreateAppOptions, CreatedApp } from "./app.js";
 
+// Server config-file loader + boot helper.
+export {
+  defineServerConfig,
+  loadServerConfig,
+  loadSecrets,
+  parseCliArgs,
+  resolveConfigPath,
+  runServer,
+} from "./config.js";
+export type {
+  ParsedCli,
+  ResolvedServerConfig,
+  RunServerHandle,
+  RunServerOptions,
+  Secrets,
+  ServerConfig,
+} from "./config.js";
+export { frameworkDefaultConfig } from "./defaultConfig.js";
+
 // Framework-owned tables — callers usually re-export these from their own db module.
 export { users, sessions, frameworkTables } from "./tables.js";
 export type { User, NewUser, Session } from "./tables.js";

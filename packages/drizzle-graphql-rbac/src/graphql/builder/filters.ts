@@ -38,17 +38,11 @@ export interface ColumnMap {
   [gqlField: string]: Column;
 }
 
-/**
- * Build the shared `OrderDirection` GraphQL enum (`ASC` / `DESC`).
- */
-export function buildOrderDirectionEnum(): GraphQLEnumType {
-  return new GraphQLEnumType({
-    name: "OrderDirection",
-    values: { ASC: { value: "asc" }, DESC: { value: "desc" } },
-  });
-}
-
-const orderDirectionEnum = buildOrderDirectionEnum();
+/** Shared `OrderDirection` GraphQL enum (`ASC` / `DESC`). */
+const orderDirectionEnum = new GraphQLEnumType({
+  name: "OrderDirection",
+  values: { ASC: { value: "asc" }, DESC: { value: "desc" } },
+});
 
 /**
  * Build the `<TypeName>OrderBy` input — one optional field per column whose

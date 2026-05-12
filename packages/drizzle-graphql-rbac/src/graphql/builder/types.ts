@@ -79,6 +79,9 @@ export interface TableMeta {
   orderByInput: GraphQLInputObjectType;
 }
 
+/** RBAC actions enforced by the auto-generated CRUD surface. */
+export type RbacAction = "create" | "read" | "update" | "delete";
+
 /**
  * RBAC guard closure resolved once per table — given a GraphQL request context
  * and the action being performed, returns the optional extra `where` clause to
@@ -87,8 +90,39 @@ export interface TableMeta {
  * the bypass list, so resolvers should skip the call entirely.
  */
 export type Guard =
-  | ((ctx: RbacContext, action: "create" | "read" | "update" | "delete") => Promise<SQL | undefined>)
+  | ((ctx: RbacContext, action: RbacAction) => Promise<SQL | undefined>)
   | null;
+
+/**
+ * RBAC config block accepted by `buildSchema` — same shape as
+ * `BuildSchemaOptions["rbac"]` but expressed here to avoid a circular import
+ * with `builder.ts`.
+ */
+export interface RbacConfig {
+  enforce: (
+    ctx: RbacContext,
+    resource: string,
+    action: RbacAction,
+    columns: ColumnMap,
+  ) => Promise<{ where?: SQL }>;
+  bypassResources?: ReadonlySet<string>;
+}
+
+/**
+ * Build the per-table {@link Guard} closure for a resource. Returns `null` when
+ * RBAC is disabled or the resource is on the bypass list, in which case
+ * resolvers skip enforcement entirely.
+ */
+export function makeGuard(
+  rbac: RbacConfig | undefined,
+  jsKey: string,
+  columns: ColumnMap,
+): Guard {
+  if (!rbac) return null;
+  if (rbac.bypassResources?.has(jsKey)) return null;
+  return async (ctx, action) =>
+    (await rbac.enforce(ctx, jsKey, action, columns)).where;
+}
 
 /**
  * Map a Drizzle column to its base (unwrapped) GraphQL type.

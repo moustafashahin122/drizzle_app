@@ -295,18 +295,20 @@ export function createApp(opts: CreateAppOptions): CreatedApp {
   const app = new Hono<AuthEnv>();
 
   if (loggingEnabled) {
-    const httpLog = logger.child({ component: "framework.app.http" });
-    const sink =
-      typeof loggerOpt === "function"
-        ? loggerOpt
-        : (message: string, ...rest: string[]) => {
-            const raw = rest.length ? `${message} ${rest.join(" ")}` : message;
-            const line = raw.replace(ANSI_RE, "");
-            const status = pickHttpStatus(rest);
-            if (status != null && status >= 500) httpLog.error(line);
-            else if (status != null && status >= 400) httpLog.warn(line);
-            else httpLog.info(line);
-          };
+    let sink: (message: string, ...rest: string[]) => void;
+    if (typeof loggerOpt === "function") {
+      sink = loggerOpt;
+    } else {
+      const httpLog = logger.child({ component: "framework.app.http" });
+      sink = (message, ...rest) => {
+        const raw = rest.length ? `${message} ${rest.join(" ")}` : message;
+        const line = raw.replace(ANSI_RE, "");
+        const status = pickHttpStatus(rest);
+        if (status != null && status >= 500) httpLog.error(line);
+        else if (status != null && status >= 400) httpLog.warn(line);
+        else httpLog.info(line);
+      };
+    }
     app.use("*", honoLogger(sink));
   }
 

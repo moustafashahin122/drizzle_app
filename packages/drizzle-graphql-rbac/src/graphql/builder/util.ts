@@ -44,7 +44,7 @@ export function jsKeyOf(
  * `current_user.id` off the GraphQL request context so callers can write
  * domain rules that mirror RBAC conventions.
  */
-export function placeholdersFor(gqlCtx: RbacContext | undefined | null): DomainPlaceholders {
+function placeholdersFor(gqlCtx: RbacContext | undefined | null): DomainPlaceholders {
   return { "current_user.id": gqlCtx?.user?.id ?? null };
 }
 

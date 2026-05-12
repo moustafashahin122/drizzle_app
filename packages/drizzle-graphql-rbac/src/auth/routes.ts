@@ -38,7 +38,7 @@ const BCRYPT_ROUNDS = 12;
 const DUMMY_HASH = bcrypt.hashSync("dummy-password-for-timing", BCRYPT_ROUNDS);
 
 /** Read a string field from a parsed JSON body, defaulting to "" on missing/wrong-type. */
-function getStringField(body: unknown, key: string, { trim }: { trim: boolean } = { trim: true }): string {
+function getStringField(body: unknown, key: string, { trim = true }: { trim?: boolean } = {}): string {
   const v = (body as Record<string, unknown> | null)?.[key];
   if (typeof v !== "string") return "";
   return trim ? v.trim() : v;
@@ -88,8 +88,9 @@ export function buildAuthRoutes(deps: AuthRoutesDeps) {
         .values({ name, email, passwordHash })
         .returning();
       user = row as User;
-    } catch (err: any) {
-      if (String(err?.message ?? "").includes("UNIQUE")) {
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (message.includes("UNIQUE")) {
         return c.json({ error: "Email already registered" }, 409);
       }
       throw err;

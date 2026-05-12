@@ -17,12 +17,12 @@ import {
   GraphQLObjectType,
   type GraphQLFieldConfigMap,
 } from "graphql";
-import { getTableName, getTableColumns } from "drizzle-orm";
+import { getTableColumns, getTableName } from "drizzle-orm";
 import type { ColumnMap } from "./filters.js";
 import { buildOrderByInput } from "./filters.js";
 import { buildInsertInput, buildUpdateInput } from "./builder-fields.js";
 import { buildRelationField } from "./builder-relations.js";
-import { introspectSchema } from "./relations.js";
+import type { introspectSchema } from "./relations.js";
 import { columnToBaseType, wrapNonNull } from "./types.js";
 import { isNotNull } from "./drizzle-internals.js";
 import type { DrizzleLike, Guard, TableMeta } from "./types.js";
@@ -43,7 +43,6 @@ import type { DomainContext } from "../domain/domain.js";
  */
 function buildObjectFields(
   meta: TableMeta,
-  intro: ReturnType<typeof introspectSchema>,
   metas: Map<string, TableMeta>,
   db: DrizzleLike,
   domainCtxFor: (m: TableMeta) => DomainContext,
@@ -61,14 +60,12 @@ function buildObjectFields(
     };
   }
 
-  const sqlName = getTableName(meta.table);
-  const rels = intro.relations.get(sqlName) ?? [];
-  for (const rel of rels) {
+  // Relation field replaces a same-named scalar column on the output type.
+  // The scalar FK column remains usable in `set` / Insert / Update inputs
+  // (and inside a domain leaf) because they iterate the unchanged column map.
+  for (const rel of meta.relations) {
     const refMeta = metas.get(getTableName(rel.referencedTable));
     if (!refMeta) continue;
-    // Relation field replaces a same-named scalar column on the output type.
-    // The scalar FK column remains usable in `set` / Insert / Update inputs
-    // (and inside a domain leaf) because they iterate the unchanged column map.
     fields[rel.fieldName] = buildRelationField(rel, meta, refMeta, db, domainCtxFor(refMeta), relationBatchSize, maxListLimit, guardFor(refMeta));
   }
   return fields;
@@ -100,7 +97,7 @@ export function buildTableMeta(
 
   const objectType = new GraphQLObjectType({
     name: typeName,
-    fields: () => buildObjectFields(meta, intro, metas, db, domainCtxFor, guardFor, hiddenOutput, relationBatchSize, maxListLimit),
+    fields: () => buildObjectFields(meta, metas, db, domainCtxFor, guardFor, hiddenOutput, relationBatchSize, maxListLimit),
   });
   const insertInput = buildInsertInput(typeName, columns, hiddenInput);
   const updateInput = buildUpdateInput(typeName, columns, hiddenInput);

@@ -19,7 +19,7 @@
  * Roles themselves are code-defined; this module only manages membership.
  * Adding a user to a role that isn't defined in the code config returns 400.
  */
-import { Hono } from "hono";
+import { Hono, type Context } from "hono";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import bcrypt from "bcryptjs";
 import { asc, eq, getTableColumns } from "drizzle-orm";
@@ -31,16 +31,26 @@ import { requireAuth, requireAdmin, sessionMiddleware, type AuthEnv } from "../a
 import type { SudoDb, SessionSchema } from "../auth/session.js";
 import { ADMIN_ROLE } from "../frameworkRbac.js";
 
+class HttpError extends Error {
+  constructor(public status: ContentfulStatusCode, message: string) {
+    super(message);
+  }
+}
+
 function publicUser(user: User): Omit<User, "passwordHash"> {
   const { passwordHash: _omit, ...rest } = user;
   return rest;
 }
 
-function errorResponse(err: any): { status: ContentfulStatusCode; body: { error: string } } {
+function mapError(err: any): { status: ContentfulStatusCode; body: { error: string } } {
+  if (err instanceof HttpError) return { status: err.status, body: { error: err.message } };
   const code = err?.extensions?.code;
   if (code === "FORBIDDEN") return { status: 403, body: { error: err.message } };
   if (code === "BAD_USER_INPUT") return { status: 400, body: { error: err.message } };
   if (code === "UNAUTHENTICATED") return { status: 401, body: { error: err.message } };
+  if (String(err?.message ?? "").includes("UNIQUE")) {
+    return { status: 409, body: { error: "Email already registered" } };
+  }
   return { status: 500, body: { error: err?.message ?? "Internal error" } };
 }
 
@@ -72,10 +82,15 @@ export function buildAdminRoutes(deps: AdminRoutesDeps) {
   // what RBAC grants they may have on `users`.
   app.use("*", requireAdmin((userId) => rbac.isAdmin(userId)));
 
-  const rdbForReq = (c: any): RbacDb =>
+  app.onError((err, c) => {
+    const r = mapError(err);
+    return c.json(r.body, r.status);
+  });
+
+  const rdbForReq = (c: Context<AuthEnv>): RbacDb =>
     rdbFor({ user: c.get("user"), batch: new Map() });
 
-  const requirePerm = (c: any, action: "read" | "update" | "delete") =>
+  const requirePerm = (c: Context<AuthEnv>, action: "read" | "update" | "delete") =>
     rbac.enforce(
       { user: c.get("user"), batch: new Map() },
       "users",
@@ -83,18 +98,63 @@ export function buildAdminRoutes(deps: AdminRoutesDeps) {
       usersColumns,
     );
 
-  app.get("/users", async (c) => {
-    try {
-      const rdb = rdbForReq(c);
-      const rows: User[] = await rdb
-        .select()
-        .from(usersTable)
-        .orderBy(asc(usersTable.id));
-      return c.json({ users: rows.map(publicUser) });
-    } catch (err) {
-      const r = errorResponse(err);
-      return c.json(r.body, r.status);
+  const parseIdParam = (c: Context<AuthEnv>): number => {
+    const id = Number(c.req.param("id"));
+    if (!Number.isFinite(id)) throw new HttpError(400, "Invalid id");
+    return id;
+  };
+
+  const requireUserExists = async (id: number): Promise<void> => {
+    const [row] = await db
+      .select({ id: usersTable.id })
+      .from(usersTable)
+      .where(eq(usersTable.id, id))
+      .limit(1);
+    if (!row) throw new HttpError(404, "Not found");
+  };
+
+  const readRoleKey = async (
+    c: Context<AuthEnv>,
+    op: "assign" | "revoke",
+  ): Promise<string> => {
+    if (op === "revoke") return c.req.param("key") ?? "";
+    const body = (await c.req.json().catch(() => ({}))) as { roleKey?: unknown };
+    return typeof body.roleKey === "string" ? body.roleKey.trim() : "";
+  };
+
+  const mutateUserRole = async (
+    c: Context<AuthEnv>,
+    op: "assign" | "revoke",
+  ) => {
+    const id = parseIdParam(c);
+    const roleKey = await readRoleKey(c, op);
+    if (!roleKey) throw new HttpError(400, "roleKey is required");
+
+    await requirePerm(c, "update");
+    if (!rbac.hasRole(roleKey)) throw new HttpError(400, `Unknown role '${roleKey}'`);
+
+    const caller = c.get("user")!;
+    if (roleKey === ADMIN_ROLE && !rbac.listUserRoles(caller.id).includes(ADMIN_ROLE)) {
+      const verb = op === "assign" ? "grant" : "revoke";
+      throw new HttpError(403, `Only admins can ${verb} the admin role`);
     }
+
+    await requireUserExists(id);
+
+    if (op === "assign") {
+      rbac.assignRole(id, roleKey);
+      return c.json({ userId: id, roles: rbac.listUserRoles(id) }, 201);
+    }
+    rbac.revokeRole(id, roleKey);
+    return c.json({ userId: id, roles: rbac.listUserRoles(id) });
+  };
+
+  app.get("/users", async (c) => {
+    const rows: User[] = await rdbForReq(c)
+      .select()
+      .from(usersTable)
+      .orderBy(asc(usersTable.id));
+    return c.json({ users: rows.map(publicUser) });
   });
 
   app.post("/users", async (c) => {
@@ -104,30 +164,19 @@ export function buildAdminRoutes(deps: AdminRoutesDeps) {
     const password = typeof body.password === "string" ? body.password : "";
     const active = typeof body.active === "boolean" ? body.active : true;
     if (!name || !email || !password) {
-      return c.json({ error: "name, email and password are required" }, 400);
+      throw new HttpError(400, "name, email and password are required");
     }
 
-    try {
-      const rdb = rdbForReq(c);
-      const passwordHash = await bcrypt.hash(password, 12);
-      const [row] = await rdb
-        .insert(usersTable)
-        .values({ name, email, passwordHash, active })
-        .returning();
-      return c.json({ user: publicUser(row as User) }, 201);
-    } catch (err: any) {
-      if (String(err?.message ?? "").includes("UNIQUE")) {
-        return c.json({ error: "Email already registered" }, 409);
-      }
-      const r = errorResponse(err);
-      return c.json(r.body, r.status);
-    }
+    const passwordHash = await bcrypt.hash(password, 12);
+    const [row] = await rdbForReq(c)
+      .insert(usersTable)
+      .values({ name, email, passwordHash, active })
+      .returning();
+    return c.json({ user: publicUser(row as User) }, 201);
   });
 
   app.patch("/users/:id", async (c) => {
-    const id = Number(c.req.param("id"));
-    if (!Number.isFinite(id)) return c.json({ error: "Invalid id" }, 400);
-
+    const id = parseIdParam(c);
     const body = await c.req.json().catch(() => ({}));
     const set: Record<string, unknown> = {};
     if (typeof body.name === "string") set.name = body.name.trim();
@@ -137,55 +186,37 @@ export function buildAdminRoutes(deps: AdminRoutesDeps) {
       set.passwordHash = await bcrypt.hash(body.password, 12);
     }
     if (!Object.keys(set).length) {
-      return c.json({ error: "No editable fields supplied" }, 400);
+      throw new HttpError(400, "No editable fields supplied");
     }
 
-    try {
-      const rdb = rdbForReq(c);
-      const rows: User[] = await rdb
-        .update(usersTable)
-        .set(set)
-        .where(eq(usersTable.id, id))
-        .returning();
-      if (!rows.length) return c.json({ error: "Not found" }, 404);
-      if (set.passwordHash) {
-        await db.delete(schema.sessions).where(eq(schema.sessions.userId, id));
-      }
-      return c.json({ user: publicUser(rows[0]) });
-    } catch (err: any) {
-      if (String(err?.message ?? "").includes("UNIQUE")) {
-        return c.json({ error: "Email already registered" }, 409);
-      }
-      const r = errorResponse(err);
-      return c.json(r.body, r.status);
+    const rows: User[] = await rdbForReq(c)
+      .update(usersTable)
+      .set(set)
+      .where(eq(usersTable.id, id))
+      .returning();
+    if (!rows.length) throw new HttpError(404, "Not found");
+    if (set.passwordHash) {
+      await db.delete(schema.sessions).where(eq(schema.sessions.userId, id));
     }
+    return c.json({ user: publicUser(rows[0]) });
   });
 
   app.delete("/users/:id", async (c) => {
-    const id = Number(c.req.param("id"));
-    if (!Number.isFinite(id)) return c.json({ error: "Invalid id" }, 400);
-
-    try {
-      // Pre-flight the RBAC check so the sudo session-delete below cannot run
-      // for a caller who would have been denied the user-delete (otherwise we'd
-      // give unauthorized callers a free way to invalidate any user's sessions).
-      await requirePerm(c, "delete");
-      // Sessions must go first — `sessions.user_id` has a FK to `users.id`, so
-      // with `foreign_keys=ON` the user delete fails while children exist.
-      await db.delete(schema.sessions).where(eq(schema.sessions.userId, id));
-      const rdb = rdbForReq(c);
-      const rows: User[] = await rdb
-        .delete(usersTable)
-        .where(eq(usersTable.id, id))
-        .returning();
-      if (!rows.length) return c.json({ error: "Not found" }, 404);
-      // Drop any in-memory role assignments for the deleted user.
-      for (const key of rbac.listUserRoles(id)) rbac.revokeRole(id, key);
-      return c.json({ id });
-    } catch (err) {
-      const r = errorResponse(err);
-      return c.json(r.body, r.status);
-    }
+    const id = parseIdParam(c);
+    // Pre-flight the RBAC check so the sudo session-delete below cannot run
+    // for a caller who would have been denied the user-delete (otherwise we'd
+    // give unauthorized callers a free way to invalidate any user's sessions).
+    await requirePerm(c, "delete");
+    // Sessions must go first — `sessions.user_id` has a FK to `users.id`, so
+    // with `foreign_keys=ON` the user delete fails while children exist.
+    await db.delete(schema.sessions).where(eq(schema.sessions.userId, id));
+    const rows: User[] = await rdbForReq(c)
+      .delete(usersTable)
+      .where(eq(usersTable.id, id))
+      .returning();
+    if (!rows.length) throw new HttpError(404, "Not found");
+    for (const key of rbac.listUserRoles(id)) rbac.revokeRole(id, key);
+    return c.json({ id });
   });
 
   // -------------------------------------------------------------------------
@@ -193,91 +224,19 @@ export function buildAdminRoutes(deps: AdminRoutesDeps) {
   // -------------------------------------------------------------------------
 
   app.get("/roles", async (c) => {
-    try {
-      await requirePerm(c, "read");
-      return c.json({ roles: rbac.listRoleKeys() });
-    } catch (err) {
-      const r = errorResponse(err);
-      return c.json(r.body, r.status);
-    }
+    await requirePerm(c, "read");
+    return c.json({ roles: rbac.listRoleKeys() });
   });
 
   app.get("/users/:id/roles", async (c) => {
-    const id = Number(c.req.param("id"));
-    if (!Number.isFinite(id)) return c.json({ error: "Invalid id" }, 400);
-    try {
-      await requirePerm(c, "read");
-      const [user] = await db
-        .select()
-        .from(usersTable)
-        .where(eq(usersTable.id, id))
-        .limit(1);
-      if (!user) return c.json({ error: "Not found" }, 404);
-      return c.json({ userId: id, roles: rbac.listUserRoles(id) });
-    } catch (err) {
-      const r = errorResponse(err);
-      return c.json(r.body, r.status);
-    }
+    const id = parseIdParam(c);
+    await requirePerm(c, "read");
+    await requireUserExists(id);
+    return c.json({ userId: id, roles: rbac.listUserRoles(id) });
   });
 
-  app.post("/users/:id/roles", async (c) => {
-    const id = Number(c.req.param("id"));
-    if (!Number.isFinite(id)) return c.json({ error: "Invalid id" }, 400);
-    const body = await c.req.json().catch(() => ({}));
-    const roleKey = typeof body.roleKey === "string" ? body.roleKey.trim() : "";
-    if (!roleKey) return c.json({ error: "roleKey is required" }, 400);
-    try {
-      await requirePerm(c, "update");
-      if (!rbac.hasRole(roleKey)) {
-        return c.json({ error: `Unknown role '${roleKey}'` }, 400);
-      }
-      const callerUser = c.get("user")!;
-      const callerIsAdmin = rbac.listUserRoles(callerUser.id).includes(ADMIN_ROLE);
-      if (roleKey === ADMIN_ROLE && !callerIsAdmin) {
-        return c.json({ error: "Only admins can grant the admin role" }, 403);
-      }
-      const [target] = await db
-        .select()
-        .from(usersTable)
-        .where(eq(usersTable.id, id))
-        .limit(1);
-      if (!target) return c.json({ error: "Not found" }, 404);
-      rbac.assignRole(id, roleKey);
-      return c.json({ userId: id, roles: rbac.listUserRoles(id) }, 201);
-    } catch (err) {
-      const r = errorResponse(err);
-      return c.json(r.body, r.status);
-    }
-  });
-
-  app.delete("/users/:id/roles/:key", async (c) => {
-    const id = Number(c.req.param("id"));
-    const roleKey = c.req.param("key");
-    if (!Number.isFinite(id)) return c.json({ error: "Invalid id" }, 400);
-    if (!roleKey) return c.json({ error: "roleKey is required" }, 400);
-    try {
-      await requirePerm(c, "update");
-      if (!rbac.hasRole(roleKey)) {
-        return c.json({ error: `Unknown role '${roleKey}'` }, 400);
-      }
-      const callerUser = c.get("user")!;
-      const callerIsAdmin = rbac.listUserRoles(callerUser.id).includes(ADMIN_ROLE);
-      if (roleKey === ADMIN_ROLE && !callerIsAdmin) {
-        return c.json({ error: "Only admins can grant the admin role" }, 403);
-      }
-      const [target] = await db
-        .select()
-        .from(usersTable)
-        .where(eq(usersTable.id, id))
-        .limit(1);
-      if (!target) return c.json({ error: "Not found" }, 404);
-      rbac.revokeRole(id, roleKey);
-      return c.json({ userId: id, roles: rbac.listUserRoles(id) });
-    } catch (err) {
-      const r = errorResponse(err);
-      return c.json(r.body, r.status);
-    }
-  });
+  app.post("/users/:id/roles", (c) => mutateUserRole(c, "assign"));
+  app.delete("/users/:id/roles/:key", (c) => mutateUserRole(c, "revoke"));
 
   return app;
 }

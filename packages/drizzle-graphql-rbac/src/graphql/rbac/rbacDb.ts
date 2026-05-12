@@ -159,21 +159,16 @@ export class RbacDb {
    * read enforcement. AND-injects the record-rule where on finalize.
    */
   select(projection?: any): { from: (table: any) => any } {
-    const deps = this.deps;
-    const ctx = this.ctx;
-    const resolveFn = this.resolve.bind(this);
-    const bypassedFn = this.bypassed.bind(this);
-    const enforceFn = this.runEnforce.bind(this);
     return {
-      from(table: any) {
-        const info = resolveFn(table);
+      from: (table: any) => {
+        const info = this.resolve(table);
         const baseChain = projection !== undefined
-          ? deps.db.select(projection).from(table)
-          : deps.db.select().from(table);
-        if (bypassedFn(info.jsKey)) return baseChain;
+          ? this.deps.db.select(projection).from(table)
+          : this.deps.db.select().from(table);
+        if (this.bypassed(info.jsKey)) return baseChain;
         return makeWhereInjectingProxy(
           baseChain,
-          () => enforceFn(info.jsKey, "read", info.columns),
+          () => this.runEnforce(info.jsKey, "read", info.columns),
         );
       },
     };
@@ -225,22 +220,6 @@ export class RbacDb {
   }
 
   /**
-   * Drizzle relational query API, RBAC-enforced.
-   *
-   * `rdb.query.<jsKey>.findMany(opts)` / `.findFirst(opts)` resolves `<jsKey>`
-   * to its target table, runs `enforce(ctx, jsKey, "read")`, and AND-injects
-   * the record-rule SQL into `opts.where`. The walker then descends into
-   * `opts.with` — each relation key is resolved through the introspected
-   * relation graph to its target table, which gets its own enforce + where
-   * injection, recursively.
-   *
-   * Bypassed resources fall through to the raw `db.query.<jsKey>` API.
-   *
-   * Note: relational queries that use a callback-form `where` (e.g.
-   * `where: (t, { eq }) => eq(t.x, 1)`) are still supported — the callback is
-   * wrapped to AND-combine with the record-rule SQL.
-   */
-  /**
    * RBAC-enforced transaction. The callback receives a tx-bound `RbacDb`
    * sharing this instance's `ctx` and enforcement config; every verb invoked
    * on `rtx` runs against the transaction's `tx` handle.
@@ -267,6 +246,22 @@ export class RbacDb {
     });
   }
 
+  /**
+   * Drizzle relational query API, RBAC-enforced.
+   *
+   * `rdb.query.<jsKey>.findMany(opts)` / `.findFirst(opts)` resolves `<jsKey>`
+   * to its target table, runs `enforce(ctx, jsKey, "read")`, and AND-injects
+   * the record-rule SQL into `opts.where`. The walker then descends into
+   * `opts.with` — each relation key is resolved through the introspected
+   * relation graph to its target table, which gets its own enforce + where
+   * injection, recursively.
+   *
+   * Bypassed resources fall through to the raw `db.query.<jsKey>` API.
+   *
+   * Note: relational queries that use a callback-form `where` (e.g.
+   * `where: (t, { eq }) => eq(t.x, 1)`) are still supported — the callback is
+   * wrapped to AND-combine with the record-rule SQL.
+   */
   get query(): any {
     const self = this;
     return new Proxy({}, {

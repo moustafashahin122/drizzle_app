@@ -161,7 +161,6 @@ export interface ResolvedRbacConfig {
  * Validate the bundle and produce flat lists. Throws on:
  *
  * - empty roles config
- * - duplicate role keys
  * - rights/rules referencing an unknown role
  * - unknown action keys in record rules
  * - non-array domains
@@ -174,19 +173,15 @@ export function buildRbacConfig(cfg: RbacConfig): ResolvedRbacConfig {
     throw new Error("rbac: roles config is empty — define at least one role.");
   }
 
-  const seenRoleKeys = new Set<string>();
-  const resolvedRoles: ResolvedRole[] = [];
-  for (const key of roleKeys) {
-    if (seenRoleKeys.has(key)) {
-      throw new Error(`rbac: duplicate role key '${key}'.`);
-    }
-    seenRoleKeys.add(key);
-    resolvedRoles.push({ key, isAdmin: !!roles[key]?.isAdmin });
-  }
+  const knownRoles = new Set(roleKeys);
+  const resolvedRoles: ResolvedRole[] = roleKeys.map((key) => ({
+    key,
+    isAdmin: !!roles[key]?.isAdmin,
+  }));
 
   const resolvedAR: ResolvedAccessRight[] = [];
   for (const [roleKey, byResource] of Object.entries(accessRights)) {
-    if (!seenRoleKeys.has(roleKey)) {
+    if (!knownRoles.has(roleKey)) {
       throw new Error(`rbac: accessRights references unknown role '${roleKey}'.`);
     }
     for (const [resource, def] of Object.entries(byResource)) {
@@ -203,7 +198,7 @@ export function buildRbacConfig(cfg: RbacConfig): ResolvedRbacConfig {
 
   const resolvedRR: ResolvedRecordRule[] = [];
   for (const [roleKey, byResource] of Object.entries(recordRules)) {
-    if (!seenRoleKeys.has(roleKey)) {
+    if (!knownRoles.has(roleKey)) {
       throw new Error(`rbac: recordRules references unknown role '${roleKey}'.`);
     }
     for (const [resource, perAction] of Object.entries(byResource)) {
@@ -218,7 +213,7 @@ export function buildRbacConfig(cfg: RbacConfig): ResolvedRbacConfig {
             `rbac: recordRules['${roleKey}']['${resource}'] has unknown action '${action}'.`,
           );
         }
-        if (!Array.isArray(def?.domain)) {
+        if (!def || !Array.isArray(def.domain)) {
           throw new Error(
             `rbac: recordRules['${roleKey}']['${resource}']['${action}'].domain must be an array.`,
           );
@@ -227,7 +222,7 @@ export function buildRbacConfig(cfg: RbacConfig): ResolvedRbacConfig {
           roleKey,
           resource,
           action: action as RecordRuleAction,
-          domain: def!.domain,
+          domain: def.domain,
         });
       }
     }

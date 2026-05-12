@@ -89,8 +89,11 @@ export function buildRbac(config: RbacConfig): BuiltRbac {
   // ---- Snapshot built once, synchronously ---------------------------------
 
   const rolesByKey = new Map<string, RoleEntry>();
+  const roleById = new Map<number, RoleEntry>();
   resolved.roles.forEach((r, i) => {
-    rolesByKey.set(r.key, { id: i + 1, key: r.key, isAdmin: r.isAdmin });
+    const entry: RoleEntry = { id: i + 1, key: r.key, isAdmin: r.isAdmin };
+    rolesByKey.set(r.key, entry);
+    roleById.set(entry.id, entry);
   });
 
   const accessByRoleId = new Map<number, Map<string, Set<Action>>>();
@@ -125,18 +128,8 @@ export function buildRbac(config: RbacConfig): BuiltRbac {
   const rolesForUser = (userId: number): { roleIds: number[]; isAdmin: boolean } => {
     const ids = userRoles.get(userId);
     if (!ids?.size) return { roleIds: [], isAdmin: false };
-    const roleIds: number[] = [];
-    let isAdmin = false;
-    for (const id of ids) {
-      roleIds.push(id);
-      // Look up by id — small N, linear scan is fine.
-      for (const role of rolesByKey.values()) {
-        if (role.id === id && role.isAdmin) {
-          isAdmin = true;
-          break;
-        }
-      }
-    }
+    const roleIds = Array.from(ids);
+    const isAdmin = roleIds.some((id) => roleById.get(id)?.isAdmin === true);
     return { roleIds, isAdmin };
   };
 
@@ -182,22 +175,17 @@ export function buildRbac(config: RbacConfig): BuiltRbac {
     // against the narrower `RecordRuleAction`.
     if (action === "create") return memo({});
 
-    const placeholders = { "current_user.id": ctx.user?.id ?? null };
+    const placeholders = { "current_user.id": userId };
     const perRole: SQL[] = [];
-    let anyUnrestricted = false;
     for (const id of grantingRoleIds) {
       const domain = rulesByRoleId.get(id)?.get(resource)?.get(action);
-      if (!domain) {
-        anyUnrestricted = true;
-        continue;
-      }
-      const parsed = parseDomain(domain);
-      const sql = domainToSql(parsed, columns, placeholders);
-      if (sql) perRole.push(sql);
-      else anyUnrestricted = true;
+      // No domain for this (role, resource, action) → unrestricted allow.
+      if (!domain) return memo({});
+      const sql = domainToSql(parseDomain(domain), columns, placeholders);
+      // Empty/trivial domain compiles to no SQL — also unrestricted.
+      if (!sql) return memo({});
+      perRole.push(sql);
     }
-    if (anyUnrestricted) return memo({});
-    if (!perRole.length) return memo({});
     const combined = perRole.length === 1 ? perRole[0] : or(...perRole)!;
     return memo({ where: combined });
   };
@@ -212,8 +200,9 @@ export function buildRbac(config: RbacConfig): BuiltRbac {
       const ids = userRoles.get(userId);
       if (!ids?.size) return [];
       const keys: string[] = [];
-      for (const role of rolesByKey.values()) {
-        if (ids.has(role.id)) keys.push(role.key);
+      for (const id of ids) {
+        const role = roleById.get(id);
+        if (role) keys.push(role.key);
       }
       return keys.sort();
     },

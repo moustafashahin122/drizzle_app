@@ -24,10 +24,8 @@ import {
 import { applyListArgs, combineWhere } from "./filters.js";
 import type { DomainContext } from "../domain/domain.js";
 import { GraphQLJSON } from "./scalars.js";
-import type { BuildSchemaOptions } from "./builder.js";
 import type { DrizzleLike, Guard, TableMeta } from "./types.js";
 import { selectProjected, whereDomainToSql } from "./util.js";
-import type { RbacContext } from "../rbac/rbac.js";
 
 /**
  * Attach the standard CRUD root fields for a table to the Query and Mutation
@@ -48,18 +46,9 @@ export function addRootFields(
   mutationFields: GraphQLFieldConfigMap<unknown, unknown>,
   db: DrizzleLike,
   ctx: DomainContext,
-  rbac: BuildSchemaOptions["rbac"],
+  guard: Guard,
   maxListLimit: number,
 ) {
-  // Resolve once: a function that returns the rbac extra-where for a given
-  // request context, or undefined when rbac is disabled / bypassed for this
-  // resource.
-  const bypass = rbac?.bypassResources?.has(meta.jsKey);
-  const guard: Guard = rbac && !bypass
-    ? async (gqlCtx: RbacContext, action: "create" | "read" | "update" | "delete") =>
-        (await rbac.enforce(gqlCtx, meta.jsKey, action, meta.columns)).where
-    : null;
-
   queryFields[meta.jsKey] = buildListQueryField(meta, db, ctx, guard, maxListLimit);
   queryFields[`${meta.jsKey}Single`] = buildSingleQueryField(meta, db, ctx, guard);
   mutationFields[`insertInto${meta.typeName}`] = buildInsertMutationField(meta, db, guard);
