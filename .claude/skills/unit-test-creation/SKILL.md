@@ -45,7 +45,7 @@ Before writing a single `it`, read the source file(s) under test and enumerate:
 - **Outputs**: return value, GraphQL `data` / `errors`, HTTP `status` / `body` / `Set-Cookie`, thrown errors.
 - **Side effects**: DB rows inserted/updated/deleted, session cookies set/cleared, RBAC memberships changed, in-memory caches mutated, logs/PII emitted.
 - **Branches**: every `if`, every early return, every `throw`, every RBAC role path.
-- **Invariants**: contractual claims the module makes — "admin bypasses record rules", "delete cascades to sessions", "rate limiter rejects after N requests", "FK promotion replaces scalar on output only", etc.
+- **Invariants**: contractual claims the module makes — "admin bypasses record rules", "delete cascades to sessions", "FK promotion replaces scalar on output only", etc.
 
 Write this list down as a table — it becomes the test plan.
 
@@ -91,7 +91,7 @@ before(() => {
 beforeEach(() => { /* delete-all or re-seed */ });
 ```
 
-Use this when the suite needs an unusual schema, needs to mutate cross-test state aggressively (e.g. rate limiter, RBAC memberships), or doesn't share fixtures with siblings.
+Use this when the suite needs an unusual schema, needs to mutate cross-test state aggressively (e.g. RBAC memberships), or doesn't share fixtures with siblings.
 
 #### B) Shared `transactionCase` fixture
 
@@ -205,7 +205,6 @@ Drive through `app.request(...)` on the Hono sub-app built by `buildAuthRoutes`.
 - **Logout**: with a valid cookie → cookie cleared (assert Max-Age=0 or empty value), session row removed.
 - **Logout**: without a cookie → 4xx or no-op per the route contract; assert no DB mutation.
 - **Session lookup** (`resolveSessionFromToken`): valid → returns user; expired → returns `null`; tampered → returns `null`. Cover the `parseSessionCookie` edge cases (missing `=`, empty value, multiple cookies with same name).
-- **Rate limiting**: if the route uses `hono-rate-limiter`, make N+1 requests in a tight loop and assert request N+1 returns 429. Call `__resetRateLimitForTests` between cases so counters don't leak.
 - **CSRF**: when CSRF protection is on, a request without/with-wrong CSRF token is rejected; a correctly-formed one passes. Cover both.
 
 #### 4.l Admin dashboard routes (`admin/*.ts`)
@@ -241,7 +240,7 @@ The `serve(...)` boot is a side effect — don't exercise it directly. Instead t
 - **Time**: avoid `Date.now()` comparisons. If a row stores `createdAt`, assert the column **exists** and is non-empty, not its exact value — unless the test deliberately freezes time with an injected clock.
 - **Random**: pass deterministic values into anything that would otherwise read from `crypto.randomUUID` / `Math.random`. If a token is generated internally, assert it matches a stable shape (`assert.match(token, /^[A-Za-z0-9_-]{32,}$/)`) rather than a literal.
 - **Cross-test leakage**:
-  - Per-file `:memory:` style: reset all mutated tables in `beforeEach`, or rebuild the sqlite handle. Rate limiters and other in-memory state need explicit resets.
+  - Per-file `:memory:` style: reset all mutated tables in `beforeEach`, or rebuild the sqlite handle. Any in-memory state needs explicit resets.
   - `transactionCase` style: trust SQL rollback; reset RBAC memberships and any other non-DB caches manually.
 - **Async**: every async route call is `await`ed. `assert.rejects` for expected throws, not try/catch with a flag.
 - **Resource cleanup**: do not leave open sqlite handles per test in the per-file pattern; one handle per file in `before` is enough. `transactionCase` owns its handle for the process.
@@ -284,7 +283,7 @@ Produce a short report:
 - **Component**: which file/module is now covered.
 - **Test plan**: the table from step 1 (invariant → test name).
 - **Files added/modified**: each with a one-line description.
-- **Coverage notes**: any invariant that was intentionally not covered, and why (e.g. "rate-limit window length not asserted — depends on wall clock; would be flaky").
+- **Coverage notes**: any invariant that was intentionally not covered, and why (e.g. "timestamp drift not asserted — depends on wall clock; would be flaky").
 - **Mutation check**: confirm step 8.3 (break-code-rerun) exposed at least one failure.
 - **Verification**: confirm `npm test` is green and note runtime if it changed materially.
 

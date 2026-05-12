@@ -1,4 +1,4 @@
-import { describe, it, before, beforeEach } from "node:test";
+import { describe, it, before } from "node:test";
 import assert from "node:assert/strict";
 
 import { roles, users, sessions } from "../tables.js";
@@ -24,14 +24,13 @@ before(async () => {
   app = buildAuthRoutes({ db, schema: frameworkSchema });
 });
 
-/** Thin adapter over the shared `jsonFetch` — defaults `target` to the suite's `app`. */
+/** Thin adapter over the shared `jsonFetch` — defaults to the suite's `app`. */
 function call(
   method: string,
   path: string,
   init: { body?: unknown; headers?: Record<string, string> } = {},
-  target: ReturnType<typeof buildAuthRoutes> = app,
 ) {
-  return jsonFetch(target, method, path, init);
+  return jsonFetch(app, method, path, init);
 }
 
 describe("auth REST — register / login / me / logout", () => {
@@ -133,146 +132,6 @@ describe("session helpers", () => {
     assert.equal(parseSessionCookie(" foo=1; sid=abc; bar=2 "), "abc");
     assert.equal(parseSessionCookie(""), null);
     assert.equal(parseSessionCookie(null), null);
-  });
-});
-
-describe("auth REST — login rate limiting", () => {
-  // Drive the limiter with small, distinct limits so the tests exercise the
-  // logic (lockout, bucket isolation, success-resets) rather than the prod
-  // defaults. The two limits differ so per-IP / per-(IP,email) can't be
-  // confused for one another.
-  const PER_IP_EMAIL = 3;
-  const PER_IP = 5;
-  const RL_EMAIL = "ratelimit@x.com";
-  const RL_PASSWORD = "rl-secret-123";
-
-  /** Fresh sub-app per test → fresh MemoryStores; no shared rate-limit state to reset. */
-  let rlApp: ReturnType<typeof buildAuthRoutes>;
-  const rlCall: typeof call = (method, path, init) => call(method, path, init, rlApp);
-
-  before(async () => {
-    // Register against the shared `app` once; the user row persists in the DB
-    // and is visible to every per-test rlApp (they share the same DB handle).
-    await call("POST", "/register", {
-      body: { name: "RL", email: RL_EMAIL, password: RL_PASSWORD },
-      headers: { "x-forwarded-for": "10.0.0.99" },
-    });
-  });
-
-  beforeEach(async () => {
-    rlApp = buildAuthRoutes({
-      db,
-      schema: frameworkSchema,
-      loginRateLimit: { maxPerIpEmail: PER_IP_EMAIL, maxPerIp: PER_IP },
-    });
-  });
-
-  it("locks out after maxPerIpEmail failures for the same (IP, email)", async () => {
-    const ip = "10.0.1.1";
-    for (let i = 0; i < PER_IP_EMAIL; i++) {
-      const r = await rlCall("POST", "/login", {
-        body: { email: RL_EMAIL, password: "WRONG" },
-        headers: { "x-forwarded-for": ip },
-      });
-      assert.equal(r.status, 401, `attempt ${i + 1} should be 401`);
-    }
-    const over = await rlCall("POST", "/login", {
-      body: { email: RL_EMAIL, password: "WRONG" },
-      headers: { "x-forwarded-for": ip },
-    });
-    assert.equal(over.status, 429);
-    // Pin the exact documented envelope so a future refactor can't silently
-    // change the body shape while keeping the 429 status.
-    assert.deepEqual(over.body, { error: "Too many attempts, try again in a minute" });
-
-    // Same email from a DIFFERENT IP within the same window must NOT be
-    // locked out — proves the bucket is keyed on (IP, email), not email alone.
-    const otherIp = await rlCall("POST", "/login", {
-      body: { email: RL_EMAIL, password: "WRONG" },
-      headers: { "x-forwarded-for": "10.0.1.99" },
-    });
-    assert.equal(otherIp.status, 401);
-  });
-
-  it("successful login resets the per-(IP, email) bucket", async () => {
-    const ip = "10.0.1.2";
-    // One shy of the limit.
-    for (let i = 0; i < PER_IP_EMAIL - 1; i++) {
-      const r = await rlCall("POST", "/login", {
-        body: { email: RL_EMAIL, password: "WRONG" },
-        headers: { "x-forwarded-for": ip },
-      });
-      assert.equal(r.status, 401);
-    }
-    // Successful login clears the bucket.
-    const ok = await rlCall("POST", "/login", {
-      body: { email: RL_EMAIL, password: RL_PASSWORD },
-      headers: { "x-forwarded-for": ip },
-    });
-    assert.equal(ok.status, 200);
-    // maxPerIpEmail more failures should all be 401 (proves bucket was reset to 0, not 1).
-    for (let i = 0; i < PER_IP_EMAIL; i++) {
-      const r = await rlCall("POST", "/login", {
-        body: { email: RL_EMAIL, password: "WRONG" },
-        headers: { "x-forwarded-for": ip },
-      });
-      assert.equal(r.status, 401, `post-reset attempt ${i + 1} should be 401`);
-    }
-    // The next attempt should now trip the limiter — pins the reset boundary
-    // precisely (reset → 0, not → 1 and not "permanently off").
-    const reLock = await rlCall("POST", "/login", {
-      body: { email: RL_EMAIL, password: "WRONG" },
-      headers: { "x-forwarded-for": ip },
-    });
-    assert.equal(reLock.status, 429);
-  });
-
-  it("per-(IP, email) bucket isolates different emails on the same IP", async () => {
-    const ip = "10.0.1.3";
-    const emailA = RL_EMAIL;
-    const emailB = "ratelimit-b@x.com";
-    // Limit-minus-one failures on email A.
-    for (let i = 0; i < PER_IP_EMAIL - 1; i++) {
-      const r = await rlCall("POST", "/login", {
-        body: { email: emailA, password: "WRONG" },
-        headers: { "x-forwarded-for": ip },
-      });
-      assert.equal(r.status, 401);
-    }
-    // A single failure on email B (unknown email) — bucket is independent, expect 401.
-    const b = await rlCall("POST", "/login", {
-      body: { email: emailB, password: "WRONG" },
-      headers: { "x-forwarded-for": ip },
-    });
-    assert.equal(b.status, 401);
-  });
-
-  it("per-IP bucket trips after maxPerIp failures across many emails from one IP", async () => {
-    const ip = "10.0.1.4";
-    // Use PER_IP distinct emails so the per-(IP, email) bucket never hits its own limit.
-    for (let i = 0; i < PER_IP; i++) {
-      const r = await rlCall("POST", "/login", {
-        body: { email: `noone-${i}@x.com`, password: "WRONG" },
-        headers: { "x-forwarded-for": ip },
-      });
-      assert.equal(r.status, 401, `IP-axis attempt ${i + 1} should be 401`);
-    }
-    // A brand-new email from the same IP should now be rate-limited by the per-IP bucket.
-    const over = await rlCall("POST", "/login", {
-      body: { email: "fresh-email@x.com", password: "WRONG" },
-      headers: { "x-forwarded-for": ip },
-    });
-    assert.equal(over.status, 429);
-    assert.deepEqual(over.body, { error: "Too many attempts, try again in a minute" });
-
-    // A brand-new email + correct password from a DIFFERENT IP must still
-    // succeed in the same window — proves the per-IP lockout is per-IP-scoped,
-    // not a global kill-switch.
-    const otherIp = await rlCall("POST", "/login", {
-      body: { email: RL_EMAIL, password: RL_PASSWORD },
-      headers: { "x-forwarded-for": "10.0.1.49" },
-    });
-    assert.equal(otherIp.status, 200);
   });
 });
 

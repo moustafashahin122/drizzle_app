@@ -8,7 +8,7 @@ A single `createApp(...)` call stands up an HTTP service with a fully-typed Grap
 
 - **Zero-boilerplate GraphQL CRUD.** Every table in your Drizzle namespace gets typed `Query` and `Mutation` fields — `list`, `single`, `insert`, `update`, `delete` — with filter, ordering, and pagination inputs derived from the column types.
 - **Automatic relations.** Single-column foreign keys are promoted into forward (`one`) and inverse (`many`) GraphQL fields automatically; explicit Drizzle `relations(...)` declarations take precedence when you need them.
-- **Built-in authentication.** REST `/auth/*` routes (`register`, `login`, `logout`, `me`) with bcrypt-hashed passwords, dual cookie + bearer-token sessions, sliding expiry, constant-time login (dummy-hash compare for unknown emails), and a per-IP/email login rate limiter ready to mount.
+- **Built-in authentication.** REST `/auth/*` routes (`register`, `login`, `logout`, `me`) with bcrypt-hashed passwords, dual cookie + bearer-token sessions, sliding expiry, and constant-time login (dummy-hash compare for unknown emails).
 - **Admin sub-app.** REST `/admin/*` endpoints for user CRUD and runtime role-membership changes, gated by the same RBAC engine that protects GraphQL.
 - **Hardened GraphQL surface.** Depth-limited operations, optional introspection lockdown, optional HTTP-level auth gate, and a server-side list cap (`maxListLimit`) defend the auto-generated CRUD against runaway queries and unauthenticated probing.
 - **Origin-based CSRF.** Same-origin gate is enabled by default via Hono's `csrf` middleware (with an `origin` allowlist option); disable it explicitly only when fronted by a CSRF-aware gateway.
@@ -510,9 +510,6 @@ The `/graphql` endpoint always requires an authenticated session — anonymous r
 | `hiddenOutputColumns`       | `users.passwordHash`, `sessions.token` | Strips columns from generated output types entirely.                                                                        |
 | `hiddenInputColumns`        | `users.passwordHash`, `sessions.{token,userId}` | Strips columns from `Insert` / `Update` input types (mass-assignment defense). A caller-supplied value **replaces** the default — no merge. |
 
-
-On top of these, the `/auth/login` route mounts a per-IP and per-(IP, email) login rate limiter automatically — successful logins clear the requester's buckets.
-
 ---
 
 ## Database
@@ -881,7 +878,6 @@ All endpoints accept and return JSON. Successful login/register sets a session c
 Notes:
 - Passwords are bcrypt-hashed (cost 12) on register and on admin password changes.
 - `/auth/login` does a constant-time compare against a dummy hash on unknown / inactive emails so timing doesn't leak account existence.
-- `/auth/login` is rate-limited per IP and per (IP, email); successful logins clear the buckets.
 - Duplicate email on register → `409 Email already registered`.
 
 ### `/admin/*` — administration
@@ -1032,7 +1028,7 @@ import {
 | `src/app.ts`                          | `createApp` composition root.                                                                         |
 | `src/tables.ts`                       | Drizzle definitions for `users` and `sessions` (also exported via `./tables`).                        |
 | `src/frameworkRbac.ts`                | Framework-owned `admin` role + `mergeFrameworkRbac` helper.                                           |
-| `src/auth/`                           | `/auth/*` REST sub-app, session primitives, Hono middleware, CSRF, login rate limit.                  |
+| `src/auth/`                           | `/auth/*` REST sub-app, session primitives, Hono middleware, CSRF.                                    |
 | `src/admin/`                          | `/admin/*` REST sub-app (user CRUD + role membership).                                                |
 | `src/graphql/builder/`                | Schema generator: types, root fields, where/orderBy translation, relations introspection, depth limit. |
 | `src/graphql/builder/relations.ts`    | Relation introspection (explicit + auto-promoted single-column FK).                                   |

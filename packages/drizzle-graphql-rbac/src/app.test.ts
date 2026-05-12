@@ -197,7 +197,9 @@ describe("createApp — CSRF protection (origin gate via hono/csrf)", () => {
     const { app } = await buildApp({ csrf: { origin: "https://trusted.example" } });
     assert.equal(
       await post(app, "application/x-www-form-urlencoded", { origin: "https://trusted.example" }),
-      // Trusted origin: reaches the route → 400 missing fields.
+      // Trusted origin: reaches the /login route → 400 because the form body
+      // isn't valid JSON, so the route sees empty fields and rejects with
+      // "email and password are required". The point is CSRF didn't short-circuit.
       400,
     );
     assert.equal(
@@ -208,8 +210,9 @@ describe("createApp — CSRF protection (origin gate via hono/csrf)", () => {
 
   it("csrf: false disables protection (foreign-origin form POST reaches the route)", async () => {
     const { app } = await buildApp({ csrf: false });
-    // Without CSRF, even an evil-origin form POST is forwarded — auth then
-    // 400s on the malformed body, proving the request was not blocked at 403.
+    // Without CSRF, even an evil-origin form POST is forwarded — the auth
+    // route then 400s on the missing JSON fields, proving the request was
+    // not blocked at 403.
     assert.equal(
       await post(app, "application/x-www-form-urlencoded", { origin: "http://evil.example" }),
       400,

@@ -26,14 +26,11 @@ Below are the prioritized findings. Each item lists `file:line`, severity, and t
 
 - **H1 — Session fixation** (`routes.ts:115-146`, `session.ts:121-132`): `issueSession` is called on register/login but pre-login session cookies are never invalidated. Fix: in `/login` and `/register`, if `c.get("session")` exists, call `destroySession` first, then `issueSession`. Rotate on any role change.
 - **H2 — Logout CSRF-exempt** (`csrf.ts:76`): `/auth/logout` is whitelisted, enabling forced logout via cross-site form posts (chains into login-CSRF). Fix: remove the exemption.
-- **H3 — Rate limit bypass via X-Forwarded-For** (`loginRateLimit.ts:41-47`): `clientIp` trusts XFF unconditionally; attacker rotates header per request to defeat both buckets. Fix: gate XFF parsing on a `trustProxy` boolean; default to socket address via Hono `getConnInfo`.
-- **H4 — Rate-limit bucket collision on empty body** (`loginRateLimit.ts:70-73`): `readEmail` returns `""` for unparseable bodies → all empty-email attempts collide into one bucket while real emails proceed unconstrained. Fix: rate-limit on IP alone for unparseable bodies; require `application/json`.
 
 **MEDIUM**
 
 - **M1 — Cookie shadowing** (`session.ts:87-101`): no RFC 6265 unquoting; duplicate `sid` cookies (path/domain scoping) can be exploited from a sibling subdomain. Fix: use `__Host-sid` prefix.
 - **M2 — `bcrypt.compareSync` blocks event loop** (`routes.ts:131`): ~300 ms/req at cost=12. Fix: `await bcrypt.compare(...)`.
-- **M3 — `MemoryStore` is per-process** (`loginRateLimit.ts:61-62`): multi-instance deployments multiply the effective limit by N. Fix: pluggable store interface; document single-process constraint.
 - **M4 — Login enumeration via timing** (`routes.ts:128-133`): success path runs an extra `INSERT`. Fix: defer the INSERT or add a constant-time delay.
 - **M5 — Bearer regex accepts huge tokens** (`session.ts:109-115`): no length/charset cap on `Authorization: Bearer …`. Fix: cap to 128 chars + hex.
 
@@ -41,7 +38,6 @@ Below are the prioritized findings. Each item lists `file:line`, severity, and t
 
 - **L1 — Session tokens stored plaintext** (`session.ts:167`). Hash with sha256 server-side.
 - **L2 — `requireAdmin` truthy check coupling** (`middleware.ts:85`).
-- **L3 — `/register` has no rate limit / strength check** (`routes.ts:85-113`): asymmetric DoS via bcrypt cost.
 - **L4 — Cookie `Secure` flag hardcoded** — make config-driven.
 
 ### 1.2 GraphQL builder (`src/graphql/builder/`)
@@ -189,7 +185,6 @@ No commented-out code blocks, no backwards-compat shims, no always-same paramete
 ### Coverage gaps
 
 - **`auth/middleware.ts`** has no direct test; bearer-vs-cookie precedence, expired sessions, dangling user refs untested.
-- **`auth/loginRateLimit.ts`** window-reset (time expiry) untested — no fake timers.
 - **`admin/routes.ts`**: POST `/users` validation 400, self-delete guard, PATCH email-collision/404 untested.
 - **`depth-limit.ts`** has no test file.
 - **`scalars.ts`**, **`util.ts`** untested directly.
@@ -200,7 +195,6 @@ No commented-out code blocks, no backwards-compat shims, no always-same paramete
 ### Brittle
 
 - `admin.test.ts:192-195` pins alphabetical role order — sort or use set equality.
-- `auth.test.ts:186,266` pin exact rate-limit copy.
 
 ### Slow / setup
 
@@ -235,7 +229,7 @@ No commented-out code blocks, no backwards-compat shims, no always-same paramete
 
 1. **Fix RBAC writes** (R1, R2, R3 / B1, B2): per-column write ACL on insert + update, post-insert tx re-check, registry-verified `isAdmin`.
 2. **Close the filter-column oracle** (B4): apply hidden + RBAC column allow-list to `where`/`orderBy`.
-3. **Cookie/CSRF/rate-limit hardening** (H1–H4): session rotation, remove logout exemption, trust-proxy gate, content-type requirement on the limiter.
+3. **Cookie/CSRF hardening** (H1–H2): session rotation, remove logout exemption.
 4. **Performance: pre-parse domains once + always-on batch Map + session cache** (P7, P1, P8). Three changes that together eliminate most resolver overhead.
 5. **Cut public API + delete `config.ts`/`defaultConfig.ts`**: ~60 unused exports and ~400 lines of unreachable boot helper. Tightens future-compatibility.
 6. **Test gaps**: `auth/middleware.ts`, `depth-limit.ts`, filter-operator matrix, record-rule-on-create branches.

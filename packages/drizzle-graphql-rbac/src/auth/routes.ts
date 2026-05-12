@@ -34,7 +34,6 @@ import {
   type AuthEnv,
   type RoleAwareSchema,
 } from "./middleware.js";
-import { createLoginRateLimit, type LoginRateLimitConfig } from "./loginRateLimit.js";
 
 const BCRYPT_ROUNDS = 12;
 // Pre-computed dummy hash so /auth/login does a bcrypt compare for unknown
@@ -86,8 +85,6 @@ export interface AuthRoutesDeps {
    * middleware.
    */
   schema: RoleAwareSchema;
-  /** Optional override for the login rate-limit knobs; defaults are production-safe. */
-  loginRateLimit?: LoginRateLimitConfig;
 }
 
 /**
@@ -99,10 +96,8 @@ export interface AuthRoutesDeps {
  */
 export function buildAuthRoutes(deps: AuthRoutesDeps) {
   const { db, schema } = deps;
-  const loginLimiter = createLoginRateLimit(deps.loginRateLimit);
   const app = new Hono<AuthEnv>();
   app.use("*", sessionMiddleware(db, schema));
-  app.use("/login", ...loginLimiter.middlewares);
 
   app.post("/register", async (c) => {
     const body = await readJsonBody(c);
@@ -156,10 +151,6 @@ export function buildAuthRoutes(deps: AuthRoutesDeps) {
     if (!ok) {
       return c.json({ error: "Invalid credentials" }, 401);
     }
-
-    // Successful login clears the requester's rate-limit buckets so prior
-    // failures stop counting down the window.
-    await loginLimiter.onSuccess(c);
 
     await rotateSession(c, db, schema, user.id);
     return c.json({ user: publicUser(user as User) });
