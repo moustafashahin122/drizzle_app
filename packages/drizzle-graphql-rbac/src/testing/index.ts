@@ -16,3 +16,10 @@ export {
   transactionCase,
   clearAllRbacMemberships,
 } from "./transactionCase.js";
+export {
+  createAppTestHarness,
+  type AppTestConfig,
+  type AppTestCtx,
+  type AppTestHarness,
+  type AppHandle,
+} from "./appTestCase.js";

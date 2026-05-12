@@ -46,6 +46,7 @@ import { buildRbacDb, type RbacDb } from "./graphql/rbac/rbacDb.js";
 import { buildAuthRoutes } from "./auth/routes.js";
 import { buildAdminRoutes } from "./admin/routes.js";
 import { sessionMiddleware, type AuthEnv } from "./auth/middleware.js";
+import { createCsrfProtection, type CsrfConfig } from "./auth/csrf.js";
 import {
   type SudoDb,
   type SessionSchema,
@@ -162,6 +163,14 @@ export interface CreateAppOptions {
    * @default 200
    */
   maxListLimit?: number;
+  /**
+   * CSRF protection (origin-based, via Hono's built-in `csrf` middleware).
+   *  - omitted / default `{}` → enabled with the same-origin policy
+   *  - `{ origin: ... }`      → enabled with a custom allowlist
+   *  - `false`                → disabled (do this only if you front the app
+   *                              with a separate CSRF-aware gateway)
+   */
+  csrf?: CsrfConfig | false;
 }
 
 export interface CreatedApp {
@@ -207,6 +216,7 @@ export function createApp(opts: CreateAppOptions): CreatedApp {
     graphqlAllowIntrospection = process.env.NODE_ENV !== "production",
     graphqlRequireAuth = true,
     maxListLimit = 200,
+    csrf: csrfOpt = {},
   } = opts;
   const loggingEnabled = loggerOpt !== false;
   const log = logger.child({ component: "framework.app" });
@@ -296,6 +306,13 @@ export function createApp(opts: CreateAppOptions): CreatedApp {
             else httpLog.info(line);
           };
     app.use("*", honoLogger(sink));
+  }
+
+  if (csrfOpt !== false) {
+    // Mount CSRF protection globally so every route (auth, admin, graphql,
+    // static) gets the same origin-based gate. JSON-only callers are
+    // unaffected; see auth/csrf.ts for the threat model.
+    app.use("*", createCsrfProtection(csrfOpt).middleware);
   }
   log.debug({ graphqlEndpoint, publicDir: publicDir ?? null }, "app composed");
 

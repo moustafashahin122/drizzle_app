@@ -20,6 +20,11 @@
     "graphql-yoga": ">=5",
     "hono": ">=4"
   },
+  "peerDependenciesMeta": {
+    "drizzle-kit": {
+      "optional": true
+    }
+  },
   "dependencies": {
     "@hono/node-server": "^1.13.7",
     "@hono/zod-validator": "^0.8.0",

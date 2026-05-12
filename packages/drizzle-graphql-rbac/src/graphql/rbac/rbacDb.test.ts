@@ -17,6 +17,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { eq } from "drizzle-orm";
+import { sqliteTable, integer } from "drizzle-orm/sqlite-core";
 
 import { buildRbac } from "./rbac.js";
 import { buildRbacDb } from "./rbacDb.js";
@@ -280,6 +281,139 @@ describe("rbacDb.query — relational query API", () => {
     await assert.rejects(
       () => rdb.query.todos.findMany({ with: { nonexistent: true } }),
     );
+  });
+});
+
+describe("rbacDb — proxy plumbing", () => {
+  it("select(table) on a table not in the schema namespace throws a clear message", () => {
+    const { rdbFor, cast: { bob } } = tc;
+    const rdb = rdbFor(ctxFor(bob.id));
+    // A table object the factory never saw — must NOT silently bypass enforce
+    // and must NOT crash with an opaque undefined-deref. The error names the
+    // contract so callers can act on it.
+    const stray = sqliteTable("stray", {
+      id: integer("id").primaryKey({ autoIncrement: true }),
+    });
+    assert.throws(
+      () => rdb.select().from(stray),
+      /not registered in the schema namespace/,
+      "unregistered tables must be rejected at .from()",
+    );
+  });
+
+  it("select(projection) forwards the projected shape verbatim through the proxy", async () => {
+    const { rdbFor, cast: { bob } } = tc; // admin → sees all rows
+    const rdb = rdbFor(ctxFor(bob.id));
+    const rows: any[] = await rdb.select({ id: todos.id }).from(todos);
+    assert.equal(rows.length, 4);
+    for (const r of rows) {
+      assert.deepEqual(
+        Object.keys(r),
+        ["id"],
+        "projection must constrain the returned columns — proxy must not widen the shape",
+      );
+      assert.equal(typeof r.id, "number");
+    }
+  });
+
+  it("update with no caller .where() and an admin (no extra where) updates every row", async () => {
+    // Exercises the makeWhereInjectingProxy branch where combineWhere returns
+    // undefined and the proxy must NOT attach a `.where(...)` to the chain.
+    // If a stray where slipped in, the row count would not match.
+    const { db, rdbFor, cast: { bob } } = tc;
+    const rdb = rdbFor(ctxFor(bob.id));
+    const updated: any[] = await rdb.update(todos).set({ title: "all-updated" }).returning();
+    assert.equal(updated.length, 4, "no where attached ⇒ every row updated");
+    const all = await db.select().from(todos);
+    assert.equal(all.length, 4);
+    assert.ok(
+      all.every((r) => r.title === "all-updated"),
+      "every persisted row reflects the unrestricted update",
+    );
+  });
+
+  it("query.<unknownJsKey> falls through to the raw db.query[prop]", () => {
+    const { rdbFor, cast: { bob } } = tc;
+    const rdb = rdbFor(ctxFor(bob.id));
+    // `nonexistent` is not a table in `allTables`; drizzle's relational query
+    // object also has no such key, so the proxy's fallthrough returns
+    // `db.query?.[prop]` which is `undefined`. The contract is "don't throw,
+    // let drizzle decide" — proven by the absence of an exception and the
+    // undefined value.
+    assert.equal(rdb.query.nonexistent, undefined);
+  });
+});
+
+describe("rbacDb.bypassResources — opt-out passthrough for every mutating verb", () => {
+  // The existing tests cover bypass for select() and query.findMany(). Update,
+  // delete, and insert each have their own bypass branch inside RbacDb and
+  // none of them are exercised elsewhere. Carol has no role in the seed —
+  // without bypass every verb would throw FORBIDDEN, so a successful mutation
+  // is itself proof that enforce was skipped.
+
+  function buildBypassRdbFor() {
+    const rbac = buildRbac(rbacConfig);
+    return buildRbacDb({
+      db,
+      schema: allTables,
+      enforce: rbac.enforce,
+      bypassResources: new Set(["todos"]),
+    });
+  }
+
+  it("update on a bypassed resource skips enforce — a role-less user can mutate", async () => {
+    const { db, cast: { carol } } = tc;
+    const rdb = buildBypassRdbFor()(ctxFor(carol.id));
+    const updated: any[] = await rdb
+      .update(todos)
+      .set({ title: "bypass-updated" })
+      .where(eq(todos.title, "alice-1"))
+      .returning();
+    assert.equal(updated.length, 1);
+    assert.equal(updated[0].title, "bypass-updated");
+    // Isolation: only the targeted row was touched.
+    const all = await db.select().from(todos);
+    assert.equal(all.length, 4);
+    assert.equal(all.filter((r) => r.title === "bypass-updated").length, 1);
+    assert.deepEqual(
+      all.map((r) => r.title).sort(),
+      ["alice-2", "bob-1", "bypass-updated", "carol-1"],
+    );
+  });
+
+  it("delete on a bypassed resource skips enforce — a role-less user can delete", async () => {
+    const { db, cast: { carol } } = tc;
+    const rdb = buildBypassRdbFor()(ctxFor(carol.id));
+    const deleted: any[] = await rdb
+      .delete(todos)
+      .where(eq(todos.title, "alice-1"))
+      .returning();
+    assert.equal(deleted.length, 1);
+    assert.equal(deleted[0].title, "alice-1");
+    // Isolation: only that row vanished; the rest are intact.
+    const remaining = await db.select().from(todos);
+    assert.equal(remaining.length, 3);
+    assert.deepEqual(
+      remaining.map((r) => r.title).sort(),
+      ["alice-2", "bob-1", "carol-1"],
+    );
+  });
+
+  it("insert on a bypassed resource skips enforce — a role-less user can create", async () => {
+    const { db, cast: { carol } } = tc;
+    const rdb = buildBypassRdbFor()(ctxFor(carol.id));
+    const inserted: any[] = await rdb
+      .insert(todos)
+      .values({ title: "bypass-inserted", ownerId: carol.id })
+      .returning();
+    assert.equal(inserted.length, 1);
+    assert.equal(inserted[0].title, "bypass-inserted");
+    assert.equal(inserted[0].ownerId, carol.id);
+    // The row actually landed in the DB, not just in the returning payload.
+    const all = await db.select().from(todos);
+    assert.equal(all.length, 5);
+    const [hit] = await db.select().from(todos).where(eq(todos.title, "bypass-inserted"));
+    assert.equal(hit.ownerId, carol.id);
   });
 });
 

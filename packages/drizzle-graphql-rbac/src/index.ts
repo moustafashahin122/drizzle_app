@@ -43,6 +43,8 @@ export {
   SESSION_COOKIE_NAME,
 } from "./auth/session.js";
 export type { SudoDb, SessionSchema } from "./auth/session.js";
+export { createCsrfProtection } from "./auth/csrf.js";
+export type { CsrfConfig, CsrfOriginOption, CsrfProtection } from "./auth/csrf.js";
 
 // REST admin primitives.
 export { buildAdminRoutes } from "./admin/routes.js";

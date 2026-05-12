@@ -265,6 +265,77 @@ describe("createApp — default hiddenOutputColumns", () => {
   });
 });
 
+describe("createApp — CSRF protection (origin gate via hono/csrf)", () => {
+  /** POST helper for the integration cases — picks the content-type per call. */
+  async function post(
+    app: ReturnType<typeof buildApp>["app"],
+    contentType: string,
+    headers: Record<string, string> = {},
+  ): Promise<number> {
+    const body =
+      contentType.startsWith("application/x-www-form-urlencoded") ? "a=1" :
+      contentType.startsWith("multipart/form-data") ? "--xxx--" :
+      contentType.startsWith("application/json") ? "{}" : "hi";
+    const res = await app.fetch(
+      new Request("http://app.localhost/auth/login", {
+        method: "POST",
+        headers: { "content-type": contentType, ...headers },
+        body,
+      }),
+    );
+    return res.status;
+  }
+
+  it("default config blocks foreign-origin form POSTs (403) and lets JSON through", async () => {
+    const { app } = buildApp();
+    // Form-encoded from an attacker origin → blocked.
+    assert.equal(
+      await post(app, "application/x-www-form-urlencoded", { origin: "http://evil.example" }),
+      403,
+    );
+    // JSON is never inspected — proves only the form-submission hole is gated.
+    // (Bad credentials → 401, but crucially NOT 403 from the CSRF layer.)
+    assert.notEqual(
+      await post(app, "application/json", { origin: "http://evil.example" }),
+      403,
+    );
+  });
+
+  it("default config allows same-origin form POSTs (passes through to the route handler)", async () => {
+    const { app } = buildApp();
+    // Same-origin form POST should reach the auth route — which then returns
+    // 400 (missing fields) since the form body isn't a valid login payload.
+    // The point is that CSRF did NOT short-circuit with 403.
+    const status = await post(app, "application/x-www-form-urlencoded", {
+      origin: "http://app.localhost",
+    });
+    assert.notEqual(status, 403);
+  });
+
+  it("csrf: { origin: <allowlist> } gates by exact match", async () => {
+    const { app } = buildApp({ csrf: { origin: "https://trusted.example" } });
+    assert.equal(
+      await post(app, "application/x-www-form-urlencoded", { origin: "https://trusted.example" }),
+      // Trusted origin: reaches the route → 400 missing fields.
+      400,
+    );
+    assert.equal(
+      await post(app, "application/x-www-form-urlencoded", { origin: "https://other.example" }),
+      403,
+    );
+  });
+
+  it("csrf: false disables protection (foreign-origin form POST reaches the route)", async () => {
+    const { app } = buildApp({ csrf: false });
+    // Without CSRF, even an evil-origin form POST is forwarded — auth then
+    // 400s on the malformed body, proving the request was not blocked at 403.
+    assert.equal(
+      await post(app, "application/x-www-form-urlencoded", { origin: "http://evil.example" }),
+      400,
+    );
+  });
+});
+
 // Suppress the unused-import lint for `sql` — it's here as a hedge in case
 // future cases need a raw SQL fragment in the framework schema setup.
 void sql;
