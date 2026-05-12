@@ -13,10 +13,7 @@ import { appConfig } from "../appConfig.js";
 
 const harness = createAppTestHarness(appConfig);
 
-export const { buildAppOnce, setupAppTestCase, createUser } = harness;
+export const { setupAppTestCase, createUser } = harness;
 
 // Re-export the shared low-level helpers so tests have a single import.
-export {
-  applySchemaSql,
-  getSharedSqlite,
-} from "drizzle-graphql-rbac/testing";
+export { getSharedSqlite } from "drizzle-graphql-rbac/testing";

@@ -12,9 +12,6 @@
  *
  * Note: `db`, `schema`, and `rbac` have NO defaults — they are app-specific
  * and must be provided by the user's config file.
- *
- * `graphqlAllowIntrospection` is intentionally absent: its default is
- * dynamic (`NODE_ENV !== "production"`) and is resolved inside `createApp`.
  */
 import type { ServerConfig } from "./config.js";
 
@@ -29,7 +26,6 @@ export const frameworkDefaultConfig: Partial<ServerConfig> = {
 
   // Security gates
   graphqlMaxDepth: 10,
-  graphqlRequireAuth: true,
   maxListLimit: 200,
   csrf: {},
   hiddenOutputColumns: { users: ["passwordHash"], sessions: ["token"] },

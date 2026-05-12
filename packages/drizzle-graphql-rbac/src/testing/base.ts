@@ -1,17 +1,12 @@
 /**
  * @module drizzle-graphql-rbac/testing/base
  *
- * Shared low-level test helpers used by both `framework_testing` and
- * `app_testing`. Everything in this file is plumbing — there are no opinions
- * about schema, RBAC, or auth here:
+ * Low-level test plumbing — no opinions on schema, RBAC, or auth:
  *
- *   - {@link getSharedSqlite} / {@link applySchemaSql} — one process-wide
- *     in-memory sqlite handle.
+ *   - {@link getSharedSqlite} — one process-wide in-memory sqlite handle.
  *   - {@link transactionCase} — Odoo-style suite + per-test SAVEPOINT fixture.
- *   - {@link pushDrizzleSchema} — apply a Drizzle schema namespace to a sqlite
- *     handle via drizzle-kit (works around drizzle.all-rejects-DDL).
- *   - {@link jsonFetch} + cookie helpers — fire a request at any Hono app and
- *     parse the response into `{ status, body, setCookies }`.
+ *   - {@link pushDrizzleSchema} — apply a Drizzle schema via drizzle-kit.
+ *   - {@link jsonFetch} / {@link cookieValue} — Hono request + cookie helpers.
  */
 import { createRequire } from "node:module";
 import { before, beforeEach, afterEach, after } from "node:test";
@@ -22,36 +17,25 @@ import { drizzle } from "drizzle-orm/better-sqlite3";
 // Shared sqlite + SAVEPOINT fixture
 // ---------------------------------------------------------------------------
 
-type Sqlite = Database.Database;
-
-let sharedSqlite: Sqlite | undefined;
+let sharedSqlite: Database.Database | undefined;
 let suiteCounter = 0;
 let testCounter = 0;
 
 /** Process-wide singleton in-memory sqlite handle. Lazy on first call. */
-export function getSharedSqlite(): Sqlite {
+export function getSharedSqlite(): Database.Database {
   if (!sharedSqlite) sharedSqlite = new Database(":memory:");
   return sharedSqlite;
 }
 
-/** Apply raw DDL to the shared sqlite handle. Use `CREATE TABLE IF NOT EXISTS`. */
-export function applySchemaSql(sql: string): void {
-  getSharedSqlite().exec(sql);
-}
-
 /**
  * Suite fixture with nested SAVEPOINTs:
+ *   before:     SAVEPOINT suite_n;  setUpClass() seeds reference data
+ *   beforeEach: SAVEPOINT test_m;
+ *   afterEach:  ROLLBACK TO test_m
+ *   after:      ROLLBACK TO suite_n
  *
- *   before:      SAVEPOINT suite_n;  setUpClass() seeds reference data
- *   beforeEach:  SAVEPOINT test_m;
- *   afterEach:   ROLLBACK TO test_m; RELEASE
- *   after:       ROLLBACK TO suite_n; RELEASE
- *
- * Returns a Proxy over the ctx your setUpClass built — `tc.foo` reads through
- * to the live ctx. Accessing before setUpClass ran throws.
- *
- * Only SQL state is rolled back. In-memory state (RBAC role memberships, etc.)
- * is the suite's responsibility to reset.
+ * Returns a Proxy over the ctx — `tc.foo` reads through to the live ctx.
+ * Accessing before setUpClass ran throws. Only SQL state is rolled back.
  */
 export function transactionCase<Ctx extends object>(
   setUpClass: () => Promise<Ctx> | Ctx,
@@ -67,10 +51,8 @@ export function transactionCase<Ctx extends object>(
     try {
       ctx = await setUpClass();
     } catch (err) {
-      try {
-        sqlite.exec(`ROLLBACK TO SAVEPOINT ${suiteSp}`);
-        sqlite.exec(`RELEASE SAVEPOINT ${suiteSp}`);
-      } catch { /* best-effort */ }
+      try { sqlite.exec(`ROLLBACK TO SAVEPOINT ${suiteSp}; RELEASE SAVEPOINT ${suiteSp}`); }
+      catch { /* best-effort */ }
       throw err;
     }
   });
@@ -83,26 +65,20 @@ export function transactionCase<Ctx extends object>(
 
   afterEach(() => {
     if (!ctx) return;
-    const sqlite = getSharedSqlite();
-    sqlite.exec(`ROLLBACK TO SAVEPOINT ${testSp}`);
-    sqlite.exec(`RELEASE SAVEPOINT ${testSp}`);
+    getSharedSqlite().exec(`ROLLBACK TO SAVEPOINT ${testSp}; RELEASE SAVEPOINT ${testSp}`);
   });
 
   after(() => {
     if (!ctx) return;
-    const sqlite = getSharedSqlite();
-    try {
-      sqlite.exec(`ROLLBACK TO SAVEPOINT ${suiteSp}`);
-      sqlite.exec(`RELEASE SAVEPOINT ${suiteSp}`);
-    } catch { /* best-effort */ }
+    try { getSharedSqlite().exec(`ROLLBACK TO SAVEPOINT ${suiteSp}; RELEASE SAVEPOINT ${suiteSp}`); }
+    catch { /* best-effort */ }
   });
 
   return new Proxy({} as Ctx, {
     get(_, prop) {
       if (!ctx) {
         throw new Error(
-          `transactionCase: property '${String(prop)}' accessed before setUpClass ran. ` +
-          `Access tc fields inside 'it' bodies, not at module scope.`,
+          `transactionCase: '${String(prop)}' accessed before setUpClass ran — use inside 'it' bodies.`,
         );
       }
       return (ctx as any)[prop];
@@ -115,8 +91,8 @@ export function transactionCase<Ctx extends object>(
 // ---------------------------------------------------------------------------
 
 // `drizzle-kit/api`'s ESM bundle uses a broken dynamic-require polyfill that
-// throws on `require("fs")` under native ESM. The CJS entry works under ESM via
-// `createRequire`. Same workaround used elsewhere in this package.
+// throws on `require("fs")` under native ESM. The CJS entry works under ESM
+// via `createRequire`.
 const kitApi = createRequire(import.meta.url)("drizzle-kit/api") as {
   pushSQLiteSchema: (
     imports: Record<string, unknown>,
@@ -125,12 +101,9 @@ const kitApi = createRequire(import.meta.url)("drizzle-kit/api") as {
 };
 
 /**
- * Materialize a Drizzle schema onto a sqlite handle. Idempotent — on an
- * already-applied schema, drizzle-kit emits an empty statement list. Also
- * enables `PRAGMA foreign_keys = ON` so declared FKs actually fire.
- *
- * We bypass `drizzle.all(...)` because better-sqlite3 rejects DDL there
- * ("statement does not return data"); raw `sqlite.exec` sidesteps it.
+ * Materialize a Drizzle schema onto a sqlite handle. Idempotent. Also enables
+ * `PRAGMA foreign_keys = ON`. Bypasses `drizzle.all` because better-sqlite3
+ * rejects DDL there.
  */
 export async function pushDrizzleSchema(
   sqlite: Database.Database,
@@ -150,29 +123,13 @@ interface HonoLike {
   request(input: string, init?: RequestInit): Response | Promise<Response>;
 }
 
-/**
- * Read every `Set-Cookie` header off a response. Node's WHATWG `Headers` only
- * exposes a concatenated value via `get("set-cookie")`; `getSetCookie()` (when
- * available) returns the list. This picks whichever the runtime offers.
- */
-export function getSetCookieList(res: Response): string[] {
-  const anyHdr = res.headers as unknown as {
-    getSetCookie?: () => string[];
-  };
-  if (typeof anyHdr.getSetCookie === "function") return anyHdr.getSetCookie();
-  const single = res.headers.get("set-cookie");
-  return single ? [single] : [];
-}
-
 /** Pull a single cookie value out of a Set-Cookie list, or `null`. */
 export function cookieValue(list: string[], name: string): string | null {
   for (const raw of list) {
     const first = raw.split(";")[0]?.trim() ?? "";
     const eq = first.indexOf("=");
-    if (eq < 0) continue;
-    if (first.slice(0, eq).trim() !== name) continue;
-    const v = first.slice(eq + 1).trim();
-    return v || null;
+    if (eq < 0 || first.slice(0, eq).trim() !== name) continue;
+    return first.slice(eq + 1).trim() || null;
   }
   return null;
 }
@@ -180,14 +137,13 @@ export function cookieValue(list: string[], name: string): string | null {
 export interface JsonFetchOpts {
   /** Object → JSON.stringify + content-type: application/json (unless overridden). */
   body?: unknown;
-  /** Raw body string. Pairs with `contentType` for form-encoded routes. */
+  /** Raw body. Pairs with `contentType` for form-encoded routes. */
   rawBody?: BodyInit;
-  /** Overrides the auto-JSON default. */
   contentType?: string;
   headers?: Record<string, string>;
   /** Sets `Authorization: Bearer <token>`. */
   bearer?: string;
-  /** Sets the `Cookie` header verbatim — pass e.g. `sid=<token>`. */
+  /** Sets the `Cookie` header verbatim. */
   cookie?: string;
 }
 
@@ -225,5 +181,10 @@ export async function jsonFetch(
     try { parsed = JSON.parse(text); }
     catch { parsed = text; }
   }
-  return { status: res.status, body: parsed, setCookies: getSetCookieList(res) };
+  // Node 20+ exposes getSetCookie(); older runtimes only concat via .get().
+  const h = res.headers as unknown as { getSetCookie?: () => string[] };
+  const setCookies = typeof h.getSetCookie === "function"
+    ? h.getSetCookie()
+    : (res.headers.get("set-cookie") ? [res.headers.get("set-cookie")!] : []);
+  return { status: res.status, body: parsed, setCookies };
 }

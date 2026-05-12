@@ -276,75 +276,54 @@ describe("auth REST — login rate limiting", () => {
   });
 });
 
-describe("auth cookies — Secure flag is env-gated", () => {
+describe("auth cookies — Secure flag is always set", () => {
   const SECURE_EMAIL = "secure-test@x.com";
   const SECURE_PASSWORD = "sec-secret-123";
-  let prevEnv: string | undefined;
 
   before(async () => {
-    prevEnv = process.env.NODE_ENV;
-    // Register the user in dev mode so its cookies don't interfere; we re-login per test.
-    process.env.NODE_ENV = "test";
     await call("POST", "/register", {
       body: { name: "Sec", email: SECURE_EMAIL, password: SECURE_PASSWORD },
       headers: { "x-forwarded-for": "10.0.2.99" },
     });
-    process.env.NODE_ENV = prevEnv;
   });
 
   // Match `; Secure` as a complete cookie attribute (preceded by `; `, ended by
   // `;` or end-of-string) so a stray substring like `Secured` can't false-pass.
   const SECURE_ATTR = /; Secure(?:;|$)/;
 
-  it("Set-Cookie `; Secure` flag tracks NODE_ENV across login + logout", async (t) => {
-    const cases = [
-      { nodeEnv: "production", flow: "login", ip: "10.0.2.1", expectSecure: true },
-      { nodeEnv: "production", flow: "logout", ip: "10.0.2.3", expectSecure: true },
-      { nodeEnv: "development", flow: "login", ip: "10.0.2.2", expectSecure: false },
-    ] as const;
+  it("Set-Cookie carries `; Secure` on login and logout", async (t) => {
+    for (const flow of ["login", "logout"] as const) {
+      await t.test(`flow=${flow}`, async () => {
+        const ip = flow === "login" ? "10.0.2.1" : "10.0.2.3";
+        const login = await call("POST", "/login", {
+          body: { email: SECURE_EMAIL, password: SECURE_PASSWORD },
+          headers: { "x-forwarded-for": ip },
+        });
+        assert.equal(login.status, 200);
 
-    for (const c of cases) {
-      await t.test(`NODE_ENV=${c.nodeEnv} flow=${c.flow}`, async () => {
-        const orig = process.env.NODE_ENV;
-        process.env.NODE_ENV = c.nodeEnv;
-        try {
-          const login = await call("POST", "/login", {
-            body: { email: SECURE_EMAIL, password: SECURE_PASSWORD },
-            headers: { "x-forwarded-for": c.ip },
+        // Pick the cookie under inspection based on the flow. For "login"
+        // it's the freshly-issued sid cookie; for "logout" it's the
+        // clearing (Max-Age=0) cookie that the /logout response writes.
+        let sidCookie: string | undefined;
+        if (flow === "login") {
+          sidCookie = login.setCookies.find((s) =>
+            s.startsWith(`${SESSION_COOKIE_NAME}=`),
+          );
+        } else {
+          const token = cookieValue(login.setCookies, SESSION_COOKIE_NAME)!;
+          const out = await call("POST", "/logout", {
+            headers: {
+              cookie: `${SESSION_COOKIE_NAME}=${token}`,
+              "x-forwarded-for": ip,
+            },
           });
-          assert.equal(login.status, 200);
-
-          // Pick the cookie under inspection based on the flow. For "login"
-          // it's the freshly-issued sid cookie; for "logout" it's the
-          // clearing (Max-Age=0) cookie that the /logout response writes.
-          let sidCookie: string | undefined;
-          if (c.flow === "login") {
-            sidCookie = login.setCookies.find((s) =>
-              s.startsWith(`${SESSION_COOKIE_NAME}=`),
-            );
-          } else {
-            const token = cookieValue(login.setCookies, SESSION_COOKIE_NAME)!;
-            const out = await call("POST", "/logout", {
-              headers: {
-                cookie: `${SESSION_COOKIE_NAME}=${token}`,
-                "x-forwarded-for": c.ip,
-              },
-            });
-            assert.equal(out.status, 200);
-            sidCookie = out.setCookies.find(
-              (s) => s.startsWith(`${SESSION_COOKIE_NAME}=`) && /Max-Age=0/.test(s),
-            );
-          }
-          assert.ok(sidCookie, `expected ${c.flow} sid Set-Cookie`);
-
-          if (c.expectSecure) {
-            assert.match(sidCookie!, SECURE_ATTR);
-          } else {
-            assert.equal(SECURE_ATTR.test(sidCookie!), false, `sid: ${sidCookie}`);
-          }
-        } finally {
-          process.env.NODE_ENV = orig;
+          assert.equal(out.status, 200);
+          sidCookie = out.setCookies.find(
+            (s) => s.startsWith(`${SESSION_COOKIE_NAME}=`) && /Max-Age=0/.test(s),
+          );
         }
+        assert.ok(sidCookie, `expected ${flow} sid Set-Cookie`);
+        assert.match(sidCookie!, SECURE_ATTR);
       });
     }
   });

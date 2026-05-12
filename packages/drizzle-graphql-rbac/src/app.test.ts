@@ -1,11 +1,11 @@
 /**
  * `createApp` security-surface tests for the GraphQL endpoint:
- *  - introspection gating (`graphqlAllowIntrospection`)
- *  - HTTP-layer auth gate    (`graphqlRequireAuth`)
+ *  - HTTP-layer auth gate: anonymous /graphql is 401'd before parse.
+ *  - Introspection: admin-only at validation time.
  *
- * Both options ride on the same `app.fetch` path, so each case builds a real
- * `createApp` over an in-memory sqlite (framework schema only — no app tables
- * needed for these contracts) and hits `/graphql` through Hono.
+ * Each case builds a real `createApp` over an in-memory sqlite (framework
+ * schema only — no app tables needed for these contracts) and hits `/graphql`
+ * through Hono.
  */
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
@@ -59,9 +59,9 @@ async function gql(
   });
 }
 
-describe("createApp — graphqlRequireAuth (HTTP-layer auth gate)", () => {
+describe("createApp — /graphql always requires auth", () => {
   it("rejects anonymous /graphql with 401 and a plain JSON error envelope (no parse)", async () => {
-    const { app } = await buildApp(); // default: auth required
+    const { app } = await buildApp();
     // Use an obviously invalid query body — proves the parser is NOT reached:
     // a non-auth-gated endpoint would respond with a GraphQL validation error.
     const { status, body } = await gql(app, "this is not graphql syntax");
@@ -80,24 +80,12 @@ describe("createApp — graphqlRequireAuth (HTTP-layer auth gate)", () => {
     assert.equal(body.data.users.length, 1);
     assert.equal(body.data.users[0].name, "Alice");
   });
-
-  it("opt-out (graphqlRequireAuth=false) lets anonymous traffic reach resolvers (RBAC then denies)", async () => {
-    const { app } = await buildApp({ graphqlRequireAuth: false });
-    const { status, body } = await gql(app, `{ users { id } }`);
-    // Resolver-layer RBAC takes over: the request parses + validates, then
-    // enforce throws "Not authenticated" inside the resolver. The shape is a
-    // GraphQL errors[] envelope, not the HTTP-layer JSON error.
-    assert.equal(status, 200);
-    assert.equal(body.data?.users ?? null, null);
-    assert.equal(body.errors?.length, 1);
-    assert.match(body.errors[0].message, /Not authenticated/i);
-  });
 });
 
-describe("createApp — graphqlAllowIntrospection", () => {
+describe("createApp — introspection is admin-only", () => {
   const INTROSPECTION_Q = `{ __schema { types { name } } }`;
 
-  it("allowed (default in non-production): admin can introspect", async () => {
+  it("admin can introspect", async () => {
     const built = await buildApp();
     const { app } = built;
     const sid = await seedAndLogin(built, {
@@ -115,9 +103,9 @@ describe("createApp — graphqlAllowIntrospection", () => {
     assert.ok(names.includes("Query"), "expected Query in introspected types");
   });
 
-  it("allowed (default in non-production): non-admin is rejected by introspection rule", async () => {
+  it("non-admin is rejected by the introspection validation rule", async () => {
     // Introspection reveals the full schema shape (including names of hidden
-    // columns), so even when the flag is on we only hand it to admins.
+    // columns), so it is hard-gated to admins.
     const built = await buildApp();
     const { app } = built;
     const sid = await seedAndLogin(built); // default role: "user"
@@ -128,55 +116,6 @@ describe("createApp — graphqlAllowIntrospection", () => {
     for (const e of body.errors) {
       assert.match(e.message, /introspection/i);
     }
-  });
-
-  it("disabled: __schema is rejected at validation time with GraphQL errors[]", async () => {
-    const built = await buildApp({ graphqlAllowIntrospection: false });
-    const { app } = built;
-    const sid = await seedAndLogin(built);
-    const { status, body } = await gql(app, INTROSPECTION_Q, { token: sid });
-    assert.equal(status, 200, "validation error returns 200 + errors[], not HTTP 4xx");
-    assert.equal(body.data ?? null, null);
-    // graphql-js may emit more than one introspection-rejection error per
-    // selection path (one per `__schema` / `__type` reference). Assert at
-    // least one and that every emitted error is the introspection-disabled
-    // variety — leaks of unrelated error categories would be a regression.
-    assert.ok((body.errors?.length ?? 0) >= 1, "expected at least one validation error");
-    for (const e of body.errors) {
-      assert.match(
-        e.message,
-        /introspection/i,
-        `every error should be the introspection-rejected variety; got: "${e.message}"`,
-      );
-    }
-  });
-
-  it("disabled: non-introspection queries still work (validation rule is targeted)", async () => {
-    const built = await buildApp({ graphqlAllowIntrospection: false });
-    const { app } = built;
-    const sid = await seedAndLogin(built);
-    const { status, body } = await gql(app, `{ users { id name } }`, { token: sid });
-    assert.equal(status, 200);
-    assert.equal(body.errors, undefined);
-    assert.equal(body.data.users.length, 1);
-    assert.equal(body.data.users[0].name, "Alice");
-  });
-
-  it("disabled: GraphiQL HTML/JS page is not served (GET /graphql does not render GraphiQL)", async () => {
-    const built = await buildApp({ graphqlAllowIntrospection: false });
-    const { app } = built;
-    const sid = await seedAndLogin(built);
-    // GET /graphql with an Accept that would otherwise yield the IDE page.
-    const r = await jsonFetch(app, "GET", "http://t.local/graphql", {
-      headers: { accept: "text/html" },
-      cookie: `sid=${sid}`,
-    });
-    const text = typeof r.body === "string" ? r.body : JSON.stringify(r.body ?? "");
-    assert.ok(
-      !text.toLowerCase().includes("<title>yoga graphiql</title>") &&
-        !text.toLowerCase().includes("graphiql"),
-      `GraphiQL must not be served when introspection is off — got: ${text.slice(0, 120)}`,
-    );
   });
 });
 

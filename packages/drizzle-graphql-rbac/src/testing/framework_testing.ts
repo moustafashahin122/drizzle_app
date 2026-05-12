@@ -2,18 +2,9 @@
  * @module drizzle-graphql-rbac/testing/framework_testing
  *
  * Test helpers for the framework's own tests (auth/admin/app/persistence).
- * Each helper does one obvious thing — no shared-singleton DB, no nested
- * options objects, no auto-merged defaults: tests pass the DB and any
- * overrides they need explicitly.
+ * Each helper does one thing — no shared singleton DB, no auto-merged defaults.
  *
- * Intentionally NOT re-exported from `./index.ts` — host apps should use
- * `app_testing`, not these. Framework tests import from this file directly.
- *
- * Typical use:
- *
- *   const { db } = await freshFrameworkDb();
- *   const { app } = await buildFrameworkApp(db);
- *   await seedUserWithRole(db, { name: "Alice", email: "a@x", role: "user" });
+ * NOT re-exported from `./index.ts` — host apps should use `app_testing`.
  */
 import Database from "better-sqlite3";
 import { drizzle, type BetterSQLite3Database } from "drizzle-orm/better-sqlite3";
@@ -23,7 +14,6 @@ import { graphql, type ExecutionResult, type GraphQLSchema } from "graphql";
 import { roles, users, sessions, type User } from "../tables.js";
 import { createApp, type CreateAppOptions, type CreatedApp } from "../app.js";
 import type { buildAuthRoutes } from "../auth/routes.js";
-import { issueSession } from "../auth/session.js";
 import {
   defineRoles,
   defineAccessRights,
@@ -34,13 +24,12 @@ import { setUserRole } from "../graphql/rbac/persistence.js";
 import { buildSchema, type BuildSchemaOptions } from "../graphql/builder/builder.js";
 import { pushDrizzleSchema, jsonFetch, cookieValue } from "./base.js";
 
-/** Framework table namespace. */
 export const frameworkSchema = { roles, users, sessions } as const;
 export type FrameworkSchema = typeof frameworkSchema;
 export type FrameworkDb = BetterSQLite3Database<FrameworkSchema>;
 
 // ---------------------------------------------------------------------------
-// DB
+// DB + seeders
 // ---------------------------------------------------------------------------
 
 /** New `:memory:` sqlite with the framework DDL applied. */
@@ -52,10 +41,6 @@ export async function freshFrameworkDb(): Promise<{
   await pushDrizzleSchema(sqlite, frameworkSchema as Record<string, unknown>);
   return { sqlite, db: drizzle(sqlite, { schema: frameworkSchema }) };
 }
-
-// ---------------------------------------------------------------------------
-// Seeders
-// ---------------------------------------------------------------------------
 
 /** Insert a user with a bcrypt'd password (cost 4 — tests run this in hot loops). */
 export async function seedUser(
@@ -85,12 +70,6 @@ export async function seedUserWithRole(
   return u;
 }
 
-/** Insert a session row directly and return its token. */
-export async function mintToken(db: FrameworkDb, userId: number): Promise<string> {
-  const { token } = await issueSession(db, frameworkSchema, userId);
-  return token;
-}
-
 /** POST /login through `authApp` and return the `sid` cookie value. */
 export async function loginViaHttp(
   authApp: ReturnType<typeof buildAuthRoutes>,
@@ -104,9 +83,9 @@ export async function loginViaHttp(
 }
 
 /**
- * Delete every row from the framework tables. `roles` is intentionally NOT
- * wiped — it's code-defined and synced once. Useful for `beforeEach` cleanup
- * when a suite doesn't want savepoint semantics.
+ * Delete every row from `users` + `sessions`. `roles` is code-defined and
+ * synced once, so it's left alone. Useful for `beforeEach` cleanup when a
+ * suite doesn't want savepoint semantics.
  */
 export async function wipeFrameworkTables(db: FrameworkDb): Promise<void> {
   await db.delete(sessions);
@@ -114,32 +93,23 @@ export async function wipeFrameworkTables(db: FrameworkDb): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
-// App builders
+// App builder
 // ---------------------------------------------------------------------------
 
-/** Minimal RBAC: `admin` (auto-injected by createApp) + `user` with read on users. */
+/** Minimal RBAC: `admin` (auto-injected) + `user` with read on users. */
 const minimalRbacConfig: RbacConfig = {
   roles: defineRoles({ user: {} }),
   accessRights: defineAccessRights({ user: { users: { read: true } } }),
   recordRules: defineRecordRules({}),
 };
 
-type CreateAppOverrides = Partial<Omit<CreateAppOptions, "db" | "schema" | "rbac">>;
-
-/**
- * Full `createApp` over the framework schema. No caching — each call builds
- * a fresh app so suites can sweep option matrices.
- */
+/** Full `createApp` over the framework schema. No caching — each call is fresh. */
 export async function buildFrameworkApp(
   db: FrameworkDb,
-  overrides: CreateAppOverrides = {},
-): Promise<{
-  app: CreatedApp["app"];
-  rbac: CreatedApp["rbac"];
-  sudoDb: CreatedApp["sudoDb"];
-  rdbFor: CreatedApp["rdbFor"];
-  db: FrameworkDb;
-}> {
+  overrides: Partial<Omit<CreateAppOptions, "db" | "schema" | "rbac">> = {},
+): Promise<
+  Pick<CreatedApp, "app" | "rbac" | "sudoDb" | "rdbFor"> & { db: FrameworkDb }
+> {
   const built = await createApp({
     db,
     schema: frameworkSchema as unknown as CreateAppOptions["schema"],
@@ -157,7 +127,6 @@ export async function buildFrameworkApp(
   };
 }
 
-
 // ---------------------------------------------------------------------------
 // GraphQL builder fixture
 // ---------------------------------------------------------------------------
@@ -167,10 +136,10 @@ type BuilderDb = ReturnType<typeof drizzle>;
 export interface BuilderFixture {
   db: BuilderDb;
   schema: GraphQLSchema;
-  /** Count of `select ...` statements observed so far (0 unless `countQueries`). */
+  /** `select ...` statement count since last reset (0 unless `countQueries`). */
   selects(): number;
   resetCounter(): void;
-  /** Run a query and return `data`; throws if `errors` is non-empty. */
+  /** Run a query; throws if `errors` is non-empty. */
   run<T = Record<string, any>>(
     query: string,
     variables?: Record<string, unknown>,
@@ -185,19 +154,14 @@ export interface BuilderFixture {
 
 export interface BuilderFixtureOptions {
   tables: Record<string, unknown>;
-  /** Runs after schema is pushed, before the GraphQL schema is built. */
+  /** Runs after schema push, before GraphQL schema build. */
   seed?: (db: BuilderDb) => void | Promise<void>;
   builder?: BuildSchemaOptions;
-  /** Install a logger that counts `select` queries. */
+  /** Install a Drizzle logger that counts `select` queries. */
   countQueries?: boolean;
 }
 
-/**
- * Builder-test fixture: one isolated in-memory sqlite handle, schema pushed via
- * drizzle-kit, and a typed `run` that throws on GraphQL errors. `countQueries`
- * installs a Drizzle logger that increments a counter on every `select ...`
- * statement — used by the relation-batching tests.
- */
+/** One isolated in-memory sqlite + schema push + a typed `run` that throws on errors. */
 export async function makeBuilderFixture(
   opts: BuilderFixtureOptions,
 ): Promise<BuilderFixture> {
@@ -208,13 +172,7 @@ export async function makeBuilderFixture(
   const db = drizzle(
     sqlite,
     opts.countQueries
-      ? {
-          logger: {
-            logQuery: (q) => {
-              if (q.toLowerCase().startsWith("select")) selectCount++;
-            },
-          },
-        }
+      ? { logger: { logQuery: (q) => { if (q.toLowerCase().startsWith("select")) selectCount++; } } }
       : undefined,
   );
 
@@ -223,12 +181,7 @@ export async function makeBuilderFixture(
   const { schema } = buildSchema(db, opts.tables, opts.builder ?? {});
 
   const runRaw: BuilderFixture["runRaw"] = (source, o) =>
-    graphql({
-      schema,
-      source,
-      variableValues: o?.variables,
-      contextValue: o?.contextValue,
-    });
+    graphql({ schema, source, variableValues: o?.variables, contextValue: o?.contextValue });
 
   const run: BuilderFixture["run"] = async (source, variables, contextValue) => {
     const result = await runRaw(source, { variables, contextValue });

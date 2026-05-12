@@ -28,10 +28,6 @@ const SESSION_MS = SESSION_DAYS * 86_400_000;
 const SESSION_REFRESH_MS = SESSION_MS / 2;
 export const SESSION_COOKIE_NAME = "sid";
 
-// Env-gated: add `Secure` to auth cookies in production (HTTPS); dev (HTTP) stays unchanged.
-// Computed lazily so tests (and any wrapper that sets NODE_ENV after module load) see the right value.
-const secureSuffix = () => (process.env.NODE_ENV === "production" ? "; Secure" : "");
-
 /**
  * Structural shape of the two tables the auth layer touches. Typed against
  * the framework's own `users` / `sessions` definitions in `../tables.js` —
@@ -79,12 +75,12 @@ export const newExpiresAt = () => new Date(Date.now() + SESSION_MS).toISOString(
 
 /** Build the `Set-Cookie` header value for the session cookie. */
 export function buildSessionCookie(token: string): string {
-  return `${SESSION_COOKIE_NAME}=${token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${SESSION_DAYS * 86400}${secureSuffix()}`;
+  return `${SESSION_COOKIE_NAME}=${token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${SESSION_DAYS * 86400}; Secure`;
 }
 
 /** Header value that clears the session cookie (Max-Age=0). */
 export function buildClearSessionCookie(): string {
-  return `${SESSION_COOKIE_NAME}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0${secureSuffix()}`;
+  return `${SESSION_COOKIE_NAME}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0; Secure`;
 }
 
 /** Extract a named cookie value from a Cookie header. */

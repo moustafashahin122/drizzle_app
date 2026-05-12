@@ -104,8 +104,6 @@ interface CliKnobs {
   publicDir?: string;
   graphqlEndpoint?: string;
   graphqlMaxDepth?: number;
-  graphqlAllowIntrospection?: boolean;
-  graphqlRequireAuth?: boolean;
   maxListLimit?: number;
   createAdmin?: boolean;
 }
@@ -134,8 +132,6 @@ const FLAG_SPECS: Record<string, FlagSpec> = {
   "--public-dir":                  { type: "string", bucket: "knobs",   key: "publicDir" },
   "--graphql-endpoint":            { type: "string", bucket: "knobs",   key: "graphqlEndpoint" },
   "--graphql-max-depth":           { type: "number", bucket: "knobs",   key: "graphqlMaxDepth" },
-  "--graphql-allow-introspection": { type: "bool",   bucket: "knobs",   key: "graphqlAllowIntrospection" },
-  "--graphql-require-auth":        { type: "bool",   bucket: "knobs",   key: "graphqlRequireAuth" },
   "--max-list-limit":              { type: "number", bucket: "knobs",   key: "maxListLimit" },
   "--create-admin":                { type: "bool",   bucket: "knobs",   key: "createAdmin" },
   "--admin-email":                 { type: "string", bucket: "secrets", key: "adminEmail" },

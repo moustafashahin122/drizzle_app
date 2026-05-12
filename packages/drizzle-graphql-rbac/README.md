@@ -260,8 +260,6 @@ A baked-in, fully-typed object exported as `frameworkDefaultConfig` (also dynami
 | `publicDir`                   | `"./public"` (set to `null` to disable static serving) |
 | `graphqlEndpoint`             | `"/graphql"`                                           |
 | `graphqlMaxDepth`             | `10`                                                   |
-| `graphqlAllowIntrospection`   | dynamic — `NODE_ENV !== "production"`                  |
-| `graphqlRequireAuth`          | `true`                                                 |
 | `maxListLimit`                | `200`                                                  |
 | `csrf`                        | `{}` (same-origin)                                     |
 | `hiddenOutputColumns`         | `{ users: ["passwordHash"], sessions: ["token"] }`     |
@@ -304,7 +302,6 @@ export default defineServerConfig({
   // Overrides only — everything else inherits frameworkDefaultConfig.
   port: 8080,
   csrf: { origin: ["https://app.example.com"] },
-  graphqlAllowIntrospection: false,
   createAdmin: true, // upsert the admin user on every boot (idempotent)
 });
 ```
@@ -353,12 +350,11 @@ Your app's own secrets (DB credentials, third-party API keys, …) are read by y
 
 #### Operational env vars
 
-Three env vars also influence runtime behavior and are NOT considered secrets:
+Two env vars also influence runtime behavior and are NOT considered secrets:
 
 
 | Variable    | Effect                                                                                                                                       |
 | ----------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
-| `NODE_ENV`  | When `production`: session cookies get the `Secure` attribute, and `graphqlAllowIntrospection` defaults to `false` (GraphiQL hidden).        |
 | `LOG_LEVEL` | Pino level — `trace`, `debug`, `info`, `warn`, `error`, `fatal`, `silent`. Default `info`. Unknown values fall back silently to `info`.      |
 | `NO_COLOR`  | Any non-empty value (or non-TTY stdout) disables `pino-pretty` colorization and emits newline-delimited JSON instead.                        |
 
@@ -378,8 +374,6 @@ Any knob or secret can be supplied on the command line — and the command line 
 | `--public-dir <s>`                                      | `publicDir`                      | string    |
 | `--graphql-endpoint <s>`                                | `graphqlEndpoint`                | string    |
 | `--graphql-max-depth <n>`                               | `graphqlMaxDepth`                | number    |
-| `--graphql-allow-introspection` / `--no-graphql-allow-introspection` | `graphqlAllowIntrospection` | boolean   |
-| `--graphql-require-auth` / `--no-graphql-require-auth`  | `graphqlRequireAuth`             | boolean   |
 | `--max-list-limit <n>`                                  | `maxListLimit`                   | number    |
 | `--create-admin` / `--no-create-admin`                  | `createAdmin`                    | boolean   |
 | `--admin-email <s>`                                     | secret `adminEmail`              | string    |
@@ -390,9 +384,9 @@ Any knob or secret can be supplied on the command line — and the command line 
 Boolean flags accept three forms: `--flag` (true), `--flag=false` (or `=0`), and `--no-flag` (false). Number flags reject non-numeric values with a clear error. Unknown flags are silently ignored so your own CLI can layer on top.
 
 ```bash
-# Override port + disable HTTP-level auth gate just for this run
+# Override port just for this run
 node --env-file=.env --import tsx server.ts --config ./server.config.ts \
-  --port 8080 --no-graphql-require-auth
+  --port 8080
 
 # Create the admin user from .env on this boot (non-fatal on error)
 node --env-file=.env --import tsx server.ts --config ./server.config.ts --create-admin
@@ -505,14 +499,12 @@ Construct your own pino root (custom transport, redact rules, OTLP exporter, etc
 
 ### HTTP & GraphQL security gates
 
-Five layers harden the auto-generated surface. All are on by default; tune them via `createApp` options.
+The `/graphql` endpoint always requires an authenticated session — anonymous requests get `401 { "error": "Authentication required" }` before parse. Schema introspection (`__schema` / `__type` selections and GraphiQL's autocomplete) is always restricted to admin sessions at validation time. Beyond those two non-negotiable gates, the following layers harden the auto-generated surface and are tunable via `createApp` options:
 
 
 | Option                      | Default                                | What it does                                                                                                                |
 | --------------------------- | -------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
 | `graphqlMaxDepth`           | `10`                                   | Rejects operations whose selection depth exceeds the cap at validation time.                                                |
-| `graphqlAllowIntrospection` | `NODE_ENV !== "production"`            | Off in prod: disables GraphiQL and `__schema` / `__type` selections. When on, introspection is further gated to admins.     |
-| `graphqlRequireAuth`        | `true`                                 | Returns `401 { "error": "Authentication required" }` at the HTTP layer before parsing. Defense-in-depth over resolver RBAC. |
 | `maxListLimit`              | `200`                                  | Silently clamps any list/relation `limit` to this cap. Bounds resolver fan-out and data dumps.                              |
 | `csrf`                      | `{}` (same-origin)                     | Origin-based CSRF gate on every route. Pass `{ origin }` to allowlist, `false` to disable.                                  |
 | `hiddenOutputColumns`       | `users.passwordHash`, `sessions.token` | Strips columns from generated output types entirely.                                                                        |
@@ -935,8 +927,6 @@ const { app, rbac, rdbFor, sudoDb } = createApp({
   graphqlEndpoint:            "/graphql",
   logger:                     true,         // boolean | (msg, ...rest) => void
   graphqlMaxDepth:            10,           // reject deeper operations at validate time
-  graphqlAllowIntrospection:  process.env.NODE_ENV !== "production",
-  graphqlRequireAuth:         true,         // HTTP-level 401 before parse
   maxListLimit:               200,          // server-side cap on list/relation rows
   csrf:                       {},           // {} = same-origin; { origin } to allowlist; false to disable
 });

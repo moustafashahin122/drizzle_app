@@ -144,26 +144,6 @@ export interface CreateAppOptions {
    */
   graphqlMaxDepth?: number;
   /**
-   * Allow GraphQL schema introspection (`__schema` / `__type` selections and
-   * the GraphiQL IDE). When `false`, both the `NoSchemaIntrospectionCustomRule`
-   * is enforced at validation time and the GraphiQL HTML/JS endpoint is
-   * disabled (since GraphiQL relies on introspection).
-   *
-   * @default `process.env.NODE_ENV !== "production"` — introspection is on in
-   * dev/test, off in production.
-   */
-  graphqlAllowIntrospection?: boolean;
-  /**
-   * Reject unauthenticated requests to the GraphQL endpoint at the HTTP layer
-   * (returns `401 { "error": "Authentication required" }`) before the query
-   * is even parsed. RBAC `enforce` still rejects anonymous callers inside
-   * resolvers, but the HTTP gate is defense-in-depth and removes the query
-   * parser as an unauthenticated attack surface.
-   *
-   * @default true
-   */
-  graphqlRequireAuth?: boolean;
-  /**
    * Maximum number of rows a single list/relation query is allowed to return.
    * Caps `args.limit` server-side — a client request with a larger value
    * (or no limit at all) is clamped silently to this cap. Defends against
@@ -236,8 +216,6 @@ export async function createApp(opts: CreateAppOptions): Promise<CreatedApp> {
     graphqlEndpoint = "/graphql",
     logger: loggerOpt = true,
     graphqlMaxDepth = 10,
-    graphqlAllowIntrospection = process.env.NODE_ENV !== "production",
-    graphqlRequireAuth = true,
     maxListLimit = 200,
     csrf: csrfOpt = {},
   } = opts;
@@ -288,23 +266,19 @@ export async function createApp(opts: CreateAppOptions): Promise<CreatedApp> {
   const yoga = createYoga<ServerCtx, YogaContext>({
     schema: gqlSchema,
     graphqlEndpoint,
-    // GraphiQL serves an interactive query console and depends on
-    // introspection to power its autocomplete; keep them in lock-step so
-    // production never exposes either.
-    graphiql: graphqlAllowIntrospection,
+    graphiql: true,
     logging: loggingEnabled,
     plugins: [
       {
         // eslint-disable-next-line @typescript-eslint/no-explicit-any -- yoga plugin args are inferred via the generic context type which the loose top-level YogaContext shape elides; refining each plugin would require duplicating the generic.
         onValidate({ addValidationRule, context }: { addValidationRule: (rule: any) => void; context: any }) {
           addValidationRule(depthLimit(graphqlMaxDepth));
-          // Introspection is gated to admins even when allowed by config:
-          // GraphiQL's autocomplete reveals the full schema shape (including
-          // hidden columns by name), so non-admin sessions only ever see the
-          // surface they're allowed to query. The role was pre-resolved by
-          // `sessionMiddleware` so this stays synchronous.
+          // Introspection is admin-only: GraphiQL's autocomplete reveals the
+          // full schema shape (including hidden columns by name), so non-admin
+          // sessions only ever see the surface they're allowed to query. The
+          // role was pre-resolved by `sessionMiddleware` so this stays sync.
           const role = (context as { role?: ResolvedUserRole | null } | undefined)?.role ?? null;
-          if (!graphqlAllowIntrospection || role?.isAdmin !== true) {
+          if (role?.isAdmin !== true) {
             addValidationRule(NoSchemaIntrospectionCustomRule);
           }
         },
@@ -371,7 +345,7 @@ export async function createApp(opts: CreateAppOptions): Promise<CreatedApp> {
 
   app.use(graphqlEndpoint, sessionMiddleware(db, roleAwareSchema));
   app.all(graphqlEndpoint, async (c) => {
-    if (graphqlRequireAuth && !c.get("user")) {
+    if (!c.get("user")) {
       // Reject anonymous traffic before query parsing — closes the parser as
       // an unauthenticated attack surface. Resolver-level RBAC `enforce` would
       // also reject this caller, but only after parse + validate + execute.
