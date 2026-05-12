@@ -12,8 +12,7 @@
  * - `update(t).set(...).where(...)` → enforces `update`, AND-injects.
  * - `delete(t).where(...)` → enforces `delete`, AND-injects.
  * - `insert(t).values(...)` → enforces `create` ACL only. Record rules on
- *   create are not modeled (would require post-insert validation in a
- *   transaction); ACL alone matches what the auto-CRUD does today.
+ *   create are not modeled; ACL alone matches what the auto-CRUD does today.
  *
  * The wrapper mirrors the Drizzle chain API for the methods resolvers use
  * (`from`, `where`, `orderBy`, `limit`, `offset`, joins, `set`, `values`,

@@ -9,8 +9,7 @@ import { buildSchema } from "./builder.js";
 
 // Mutation-side guard: UPDATE/DELETE must refuse to run with a fully empty
 // combined WHERE. Insert-time row filtering (create record-rule) is not
-// currently modeled — those tests will return once post-insert verification
-// lands.
+// modeled — insert is gated by the ACL check alone.
 
 const users = sqliteTable("users", {
   id: integer("id").primaryKey({ autoIncrement: true }),

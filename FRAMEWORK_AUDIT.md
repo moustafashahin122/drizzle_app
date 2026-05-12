@@ -10,7 +10,7 @@ Method: 10 parallel specialist agents (security ×3, performance ×2, readabilit
 
 The framework is functional and reasonably well-organised, but it has three categories of issue worth fixing before a 1.0:
 
-1. **Three High-severity RBAC/security gaps** allow privilege escalation or credential exfiltration via the GraphQL surface — no per-column write ACL on insert/update, the documented post-insert record-rule check is missing, and `ctx.role.isAdmin` is trusted blindly.
+1. **Two High-severity RBAC/security gaps** allow privilege escalation or credential exfiltration via the GraphQL surface — no per-column write ACL on insert/update, and `ctx.role.isAdmin` is trusted blindly.
 2. **Performance** depends entirely on a request-scoped `ctx.batch` Map being present; if any wrapper forgets it, the schema silently degrades to massive N+1. Domain trees are also re-parsed on every resolver call.
 3. **Public API surface is ~3× too large** — roughly 60 of ~80 re-exports in `index.ts` are unused by the consumer app, and the entire `config.ts`/`defaultConfig.ts` "runServer" stack is dead end-to-end.
 
@@ -45,7 +45,6 @@ Below are the prioritized findings. Each item lists `file:line`, severity, and t
 **HIGH**
 
 - **B1 — Mass-assignment on insert/update** (`builder-resolvers.ts:139-146,162-176`): only a coarse `create`/`update` guard runs; arbitrary columns in `args.values`/`args.set` are passed straight to Drizzle. Forgetting to add `passwordHash`, `email`, `id`, or a future `isAdmin` to `hiddenInputColumns` = privilege escalation. Fix: per-column write ACL inside the resolver; default-hide `passwordHash`, `token`, `id`.
-- **B2 — Documented post-insert record-rule check is missing** (`builder-resolvers.ts:143-144` vs `builder.ts:127-130` JSDoc): the doc promises a transactional re-fetch through `(PK AND createWhere)` — the code does none of it. A user with `create` and rule `ownerId = current_user.id` can insert rows owned by anyone. Fix: implement the documented tx+re-SELECT or remove the lie from the docs.
 
 **MEDIUM**
 
@@ -68,7 +67,6 @@ Below are the prioritized findings. Each item lists `file:line`, severity, and t
 
 - **R1 — Spoofable admin via `ctx.role.isAdmin`** (`rbac.ts:144-170`): engine trusts the caller-supplied flag without cross-checking the in-memory registry. Anyone who can construct a `RbacContext` (custom resolver, leaked test helper) bypasses everything. Fix: `const reg = rolesByKey.get(role.name); if (!reg) deny()` then use `reg.isAdmin`.
 - **R2 — Update record-rule applies to selection, not to `set`** (`builder-resolvers.ts:150-176`, `rbac.ts:181-189`): a user can update *their* row while setting `ownerId = victim`, exfiltrating it. Fix: validate `args.set` against the predicate columns of the same domain, or post-check in a tx.
-- **R3 — Insert has no record-rule check** (mirror of B2 — same root cause; tracked here because it's also a privilege-escalation path on owner-scoped tables).
 
 **MEDIUM**
 
@@ -227,12 +225,12 @@ No commented-out code blocks, no backwards-compat shims, no always-same paramete
 
 ## Top priorities (recommended order)
 
-1. **Fix RBAC writes** (R1, R2, R3 / B1, B2): per-column write ACL on insert + update, post-insert tx re-check, registry-verified `isAdmin`.
+1. **Fix RBAC writes** (R1, R2 / B1): per-column write ACL on insert + update, registry-verified `isAdmin`.
 2. **Close the filter-column oracle** (B4): apply hidden + RBAC column allow-list to `where`/`orderBy`.
 3. **Cookie/CSRF hardening** (H1–H2): session rotation, remove logout exemption.
 4. **Performance: pre-parse domains once + always-on batch Map + session cache** (P7, P1, P8). Three changes that together eliminate most resolver overhead.
 5. **Cut public API + delete `config.ts`/`defaultConfig.ts`**: ~60 unused exports and ~400 lines of unreachable boot helper. Tightens future-compatibility.
-6. **Test gaps**: `auth/middleware.ts`, `depth-limit.ts`, filter-operator matrix, record-rule-on-create branches.
+6. **Test gaps**: `auth/middleware.ts`, `depth-limit.ts`, filter-operator matrix.
 
 ---
 

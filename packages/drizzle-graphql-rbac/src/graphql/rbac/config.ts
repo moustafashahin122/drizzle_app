@@ -20,9 +20,9 @@
 export type Action = "create" | "read" | "update" | "delete";
 
 /**
- * Subset of {@link Action} valid for record rules. `create` is intentionally
- * excluded — row-level filtering at insert time is not currently modeled
- * (will be re-added when post-insert verification lands).
+ * Subset of {@link Action} valid for record rules. `create` is excluded —
+ * row-level filtering at insert time is not modeled; insert is gated by the
+ * ACL check alone.
  */
 export type RecordRuleAction = "read" | "update" | "delete";
 

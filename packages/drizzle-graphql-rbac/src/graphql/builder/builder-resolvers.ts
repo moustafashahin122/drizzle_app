@@ -9,9 +9,9 @@
  * projected SELECTs, `.returning()` on mutations, and empty-WHERE guards on
  * update/delete).
  *
- * Note: row-level record rules currently apply to read/update/delete only.
- * Insert-time row filtering (record rule on `create`) is not modeled — the
- * ACL check still fires on insert, but no post-insert row verification runs.
+ * Note: row-level record rules apply to read/update/delete only. Insert-time
+ * row filtering (record rule on `create`) is not modeled — insert is gated
+ * by the ACL check alone.
  */
 import {
   GraphQLError,

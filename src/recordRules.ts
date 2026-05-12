@@ -21,9 +21,9 @@ const ownTodos = [["assigneeId", "=", "current_user.id"]];
 export const recordRules = defineRecordRules({
   demo: {
     todos: {
-      // Insert-time row filtering (record rule on `create`) is intentionally
-      // not modeled for now — demo can insert a todo with any assigneeId.
-      // Re-add once post-insert verification lands.
+      // Record rules on `create` are not modeled — the framework runs an
+      // ACL check on insert but no row-level predicate. Demo can insert a
+      // todo with any assigneeId.
       read:   { domain: ownTodos },
       update: { domain: ownTodos },
       delete: { domain: ownTodos },

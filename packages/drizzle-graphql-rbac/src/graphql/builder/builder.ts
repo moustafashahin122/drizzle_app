@@ -124,9 +124,8 @@ export interface BuildSchemaOptions {
    * `resource` is the table's JS schema key (the same key used for the
    * `Query.<jsKey>` root field).
    *
-   * Insert resolvers run the ACL check and, when a create-domain is returned,
-   * perform a transactional post-check that re-fetches each inserted row
-   * through `(PK AND createWhere)` and rolls back if any row fails to match.
+   * Insert resolvers run the ACL check only; record rules on `create` are
+   * not modeled — any `where` fragment returned for `create` is ignored.
    */
   rbac?: RbacConfig;
   /**
