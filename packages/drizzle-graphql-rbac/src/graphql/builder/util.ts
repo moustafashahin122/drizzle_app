@@ -18,6 +18,7 @@ import {
   type DomainPlaceholders,
 } from "../domain/domain.js";
 import type { DrizzleLike, TableMeta } from "./types.js";
+import type { RbacContext } from "../rbac/rbac.js";
 import { isPrimary } from "./drizzle-internals.js";
 
 /**
@@ -43,7 +44,7 @@ export function jsKeyOf(
  * `current_user.id` off the GraphQL request context so callers can write
  * domain rules that mirror RBAC conventions.
  */
-export function placeholdersFor(gqlCtx: any): DomainPlaceholders {
+export function placeholdersFor(gqlCtx: RbacContext | undefined | null): DomainPlaceholders {
   return { "current_user.id": gqlCtx?.user?.id ?? null };
 }
 
@@ -144,11 +145,18 @@ export function whereDomainToSql(
   rawWhere: unknown,
   meta: TableMeta,
   ctx: DomainContext,
-  gqlCtx: any,
+  gqlCtx: unknown,
 ): SQL | undefined {
   if (rawWhere == null) return undefined;
   if (!Array.isArray(rawWhere)) {
     throw new Error("where must be a JSON Odoo-style domain array");
   }
-  return domainToSql(parseDomain(rawWhere), meta.columns, placeholdersFor(gqlCtx), ctx);
+  // GraphQL resolver context is typed `unknown` at the field config level; we
+  // narrow here to the RBAC-shaped subset placeholdersFor reads.
+  return domainToSql(
+    parseDomain(rawWhere),
+    meta.columns,
+    placeholdersFor(gqlCtx as RbacContext | null | undefined),
+    ctx,
+  );
 }

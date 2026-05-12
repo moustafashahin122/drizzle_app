@@ -19,6 +19,13 @@
 
 export type Action = "create" | "read" | "update" | "delete";
 
+/**
+ * Subset of {@link Action} valid for record rules. `create` is intentionally
+ * excluded — row-level filtering at insert time is not currently modeled
+ * (will be re-added when post-insert verification lands).
+ */
+export type RecordRuleAction = "read" | "update" | "delete";
+
 /** A single role's declarative metadata. The map key is the role key. */
 export interface RoleDef {
   /** When `true`, members of this role bypass every RBAC check. */
@@ -50,7 +57,7 @@ export interface RecordRuleDef {
 /** `{ roleKey: { resource: { read?: RecordRuleDef, ... } } }`. */
 export type RecordRulesConfig = Record<
   string,
-  Record<string, Partial<Record<Action, RecordRuleDef>>>
+  Record<string, Partial<Record<RecordRuleAction, RecordRuleDef>>>
 >;
 
 /** Bundle passed to the engine. */
@@ -116,7 +123,7 @@ export function defineRecordRules<TRules extends RecordRulesConfig>(rules: TRule
   return rules;
 }
 
-const VALID_ACTIONS: ReadonlySet<string> = new Set(["create", "read", "update", "delete"]);
+const VALID_RECORD_RULE_ACTIONS: ReadonlySet<string> = new Set(["read", "update", "delete"]);
 
 // ---------------------------------------------------------------------------
 // Resolved (validated, flattened) shape.
@@ -139,7 +146,7 @@ export interface ResolvedAccessRight {
 export interface ResolvedRecordRule {
   roleKey: string;
   resource: string;
-  action: Action;
+  action: RecordRuleAction;
   domain: Domain;
 }
 
@@ -201,7 +208,12 @@ export function buildRbacConfig(cfg: RbacConfig): ResolvedRbacConfig {
     }
     for (const [resource, perAction] of Object.entries(byResource)) {
       for (const [action, def] of Object.entries(perAction)) {
-        if (!VALID_ACTIONS.has(action)) {
+        if (action === "create") {
+          throw new Error(
+            `rbac: recordRules['${roleKey}']['${resource}'] uses action 'create', which is not currently supported — insert-time row filtering will be re-added later. Move the constraint to update/delete or remove it.`,
+          );
+        }
+        if (!VALID_RECORD_RULE_ACTIONS.has(action)) {
           throw new Error(
             `rbac: recordRules['${roleKey}']['${resource}'] has unknown action '${action}'.`,
           );
@@ -214,7 +226,7 @@ export function buildRbacConfig(cfg: RbacConfig): ResolvedRbacConfig {
         resolvedRR.push({
           roleKey,
           resource,
-          action: action as Action,
+          action: action as RecordRuleAction,
           domain: def!.domain,
         });
       }

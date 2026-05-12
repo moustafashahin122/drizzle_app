@@ -21,10 +21,9 @@ const ownTodos = [["assigneeId", "=", "current_user.id"]];
 export const recordRules = defineRecordRules({
   demo: {
     todos: {
-      // `create` narrows the inserted row — demo can only assign todos to
-      // themselves; an insert with another assigneeId is rejected as
-      // "rbac: insert blocked by record rule".
-      create: { domain: ownTodos },
+      // Insert-time row filtering (record rule on `create`) is intentionally
+      // not modeled for now — demo can insert a todo with any assigneeId.
+      // Re-add once post-insert verification lands.
       read:   { domain: ownTodos },
       update: { domain: ownTodos },
       delete: { domain: ownTodos },

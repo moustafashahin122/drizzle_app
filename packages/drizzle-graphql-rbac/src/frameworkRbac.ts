@@ -47,7 +47,7 @@ export function mergeFrameworkRbac(user: RbacConfig): RbacConfig {
   for (const key of Object.keys(FRAMEWORK_ROLES)) {
     if (key in user.roles) {
       throw new Error(
-        `rbac: role key '${key}' is reserved by the framework — drop it from your defineRoles({...}).`,
+        `rbac: role key '${key}' is reserved by the framework — it is assigned automatically and provides full-access bypass. Remove it from defineRoles({...}) in your app config.`,
       );
     }
   }

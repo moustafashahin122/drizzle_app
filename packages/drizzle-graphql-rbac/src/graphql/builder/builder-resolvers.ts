@@ -4,10 +4,14 @@
  * Summary
  * -------
  * Pass 2 of {@link buildSchema}: wires per-table root fields onto the Query
- * and Mutation maps and implements the CRUD resolvers (RBAC ACL + record-rule
- * enforcement, JSON domain → SQL translation, projected SELECTs,
- * `.returning()` on mutations, empty-WHERE guards on update/delete, and the
- * transactional post-check for INSERTs gated by a create-domain record rule).
+ * and Mutation maps and implements the CRUD resolvers (RBAC ACL enforcement,
+ * read/update/delete record-rule narrowing, JSON domain → SQL translation,
+ * projected SELECTs, `.returning()` on mutations, and empty-WHERE guards on
+ * update/delete).
+ *
+ * Note: row-level record rules currently apply to read/update/delete only.
+ * Insert-time row filtering (record rule on `create`) is not modeled — the
+ * ACL check still fires on insert, but no post-insert row verification runs.
  */
 import {
   GraphQLError,
@@ -17,14 +21,13 @@ import {
   type GraphQLFieldConfig,
   type GraphQLFieldConfigMap,
 } from "graphql";
-import { and, eq, type Column, type SQL } from "drizzle-orm";
 import { applyListArgs, combineWhere } from "./filters.js";
 import type { DomainContext } from "../domain/domain.js";
 import { GraphQLJSON } from "./scalars.js";
 import type { BuildSchemaOptions } from "./builder.js";
 import type { DrizzleLike, Guard, TableMeta } from "./types.js";
 import { selectProjected, whereDomainToSql } from "./util.js";
-import { isPrimary } from "./drizzle-internals.js";
+import type { RbacContext } from "../rbac/rbac.js";
 
 /**
  * Attach the standard CRUD root fields for a table to the Query and Mutation
@@ -53,7 +56,7 @@ export function addRootFields(
   // resource.
   const bypass = rbac?.bypassResources?.has(meta.jsKey);
   const guard: Guard = rbac && !bypass
-    ? async (gqlCtx: any, action: "create" | "read" | "update" | "delete") =>
+    ? async (gqlCtx: RbacContext, action: "create" | "read" | "update" | "delete") =>
         (await rbac.enforce(gqlCtx, meta.jsKey, action, meta.columns)).where
     : null;
 
@@ -134,11 +137,6 @@ function buildInsertMutationField(
   db: DrizzleLike,
   guard: Guard,
 ): GraphQLFieldConfig<unknown, unknown> {
-  // Primary-key columns of the table. Used to re-fetch inserted rows for
-  // create-domain post-check. Computed once per schema build.
-  const pkEntries: Array<[string, Column]> = Object.entries(meta.columns).filter(
-    ([, c]) => isPrimary(c),
-  );
   return {
     type: listType(meta),
     args: {
@@ -149,83 +147,11 @@ function buildInsertMutationField(
       },
     },
     resolve: async (_, args, gqlCtx) => {
-      // ACL check (and capture optional create-domain SQL for post-check).
-      const createWhere = guard ? await guard(gqlCtx, "create") : undefined;
-
-      // Fast path: no create-domain (admin bypass, no rules, or rbac disabled).
-      // Behavior unchanged.
-      if (!createWhere) {
-        return db.insert(meta.table).values(args.values).returning();
-      }
-
-      // Need transactional post-check: insert, then verify each row matches the
-      // create-domain by re-selecting through PK + create-domain AND. If any
-      // row fails, the throw rolls the tx back.
-      if (!pkEntries.length) {
-        // No primary key to re-fetch by — refuse rather than silently accept.
-        throw new GraphQLError("rbac: insert blocked by record rule", {
-          extensions: { code: "FORBIDDEN" },
-        });
-      }
-      // Drizzle's `db.transaction(...)` callback dispatch differs by driver:
-      // better-sqlite3 invokes it synchronously and refuses a promise return
-      // value; node-postgres / mysql2 / libsql expect an async callback. We
-      // sniff the dialect to pick the right shape — both code paths do the
-      // same per-row PK + create-domain re-select.
-      const anyDb = db as any;
-      const isSync = anyDb?.dialect?.constructor?.name === "SQLiteSyncDialect";
-      const checkRow = (tx: any, row: any): SQL => {
-        const pkConds: SQL[] = [];
-        for (const [name, col] of pkEntries) {
-          pkConds.push(eq(col, row[name] as any));
-        }
-        const pkSql = pkConds.length === 1 ? pkConds[0] : and(...pkConds)!;
-        return combineWhere(pkSql, createWhere)!;
-      };
-      if (isSync) {
-        return anyDb.transaction((tx: any) => {
-          const inserted: any[] = tx
-            .insert(meta.table)
-            .values(args.values)
-            .returning()
-            .all();
-          for (const row of inserted) {
-            const matchWhere = checkRow(tx, row);
-            const matched: any[] = tx
-              .select()
-              .from(meta.table)
-              .where(matchWhere)
-              .limit(1)
-              .all();
-            if (!matched.length) {
-              throw new GraphQLError("rbac: insert blocked by record rule", {
-                extensions: { code: "FORBIDDEN" },
-              });
-            }
-          }
-          return inserted;
-        });
-      }
-      return await anyDb.transaction(async (tx: any) => {
-        const inserted: any[] = await tx
-          .insert(meta.table)
-          .values(args.values)
-          .returning();
-        for (const row of inserted) {
-          const matchWhere = checkRow(tx, row);
-          const matched: any[] = await tx
-            .select()
-            .from(meta.table)
-            .where(matchWhere)
-            .limit(1);
-          if (!matched.length) {
-            throw new GraphQLError("rbac: insert blocked by record rule", {
-              extensions: { code: "FORBIDDEN" },
-            });
-          }
-        }
-        return inserted;
-      });
+      // ACL check only — throws FORBIDDEN if the actor lacks `create` on this
+      // resource. Record rules on `create` are not currently modeled, so the
+      // returned `where` (if any) is ignored.
+      if (guard) await guard(gqlCtx, "create");
+      return db.insert(meta.table).values(args.values).returning();
     },
   };
 }

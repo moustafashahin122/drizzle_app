@@ -31,10 +31,24 @@ export interface SessionSchema {
   sessions: typeof sessionsTable;
 }
 
+/**
+ * Minimal structural shape of a Drizzle DB handle used by framework auth and
+ * admin code paths.
+ *
+ * Intentionally widened — apps should pass a Drizzle
+ * `BetterSQLite3Database`-compatible handle (or any dialect handle exposing the
+ * standard `select` / `insert` / `update` / `delete` query builders). Tightly
+ * typing this surface would require importing dialect-specific Drizzle
+ * internals, which would couple the framework to a particular driver.
+ */
 export interface SudoDb {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- Drizzle dialect-agnostic, see JSDoc above
   select: (...args: any[]) => any;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- Drizzle dialect-agnostic, see JSDoc above
   insert: (...args: any[]) => any;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- Drizzle dialect-agnostic, see JSDoc above
   update: (...args: any[]) => any;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- Drizzle dialect-agnostic, see JSDoc above
   delete: (...args: any[]) => any;
 }
 

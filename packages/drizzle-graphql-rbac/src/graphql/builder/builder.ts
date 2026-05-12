@@ -73,7 +73,6 @@ import type { DrizzleLike, Guard, TableMeta } from "./types.js";
 import type { RbacContext } from "../rbac/rbac.js";
 
 export type { DrizzleLike } from "./types.js";
-export type { BatchCache } from "./builder-relations.js";
 
 /**
  * Optional knobs for {@link buildSchema}.

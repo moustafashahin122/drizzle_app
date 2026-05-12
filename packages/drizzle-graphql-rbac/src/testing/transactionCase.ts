@@ -75,14 +75,11 @@ export function applySchemaSql(sql: string): void {
  * suite's `setUpClass` when you build the app once per process but want each
  * suite to start from a clean rbac slate.
  *
- * `BuiltRbac` doesn't expose an enumerable membership map, so this iterates a
- * candidate id range and calls `revokeRole` for whatever each `listUserRoles`
- * returns. The default `maxId` is high enough for any realistic test fixture.
+ * Delegates to {@link BuiltRbac.clearAllMemberships}; `maxId` is retained
+ * for backwards-compatibility but is no longer consulted.
  */
-export function clearAllRbacMemberships(rbac: BuiltRbac, maxId = 10_000): void {
-  for (let id = 1; id < maxId; id++) {
-    for (const key of rbac.listUserRoles(id)) rbac.revokeRole(id, key);
-  }
+export function clearAllRbacMemberships(rbac: BuiltRbac, _maxId = 10_000): void {
+  rbac.clearAllMemberships();
 }
 
 /**

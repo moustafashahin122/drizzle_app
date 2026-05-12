@@ -29,6 +29,7 @@ import type { BuiltRbac } from "../graphql/rbac/rbac.js";
 import type { ColumnMap } from "../graphql/builder/filters.js";
 import { requireAuth, requireAdmin, sessionMiddleware, type AuthEnv } from "../auth/middleware.js";
 import type { SudoDb, SessionSchema } from "../auth/session.js";
+import { ADMIN_ROLE } from "../frameworkRbac.js";
 
 function publicUser(user: User): Omit<User, "passwordHash"> {
   const { passwordHash: _omit, ...rest } = user;
@@ -231,8 +232,8 @@ export function buildAdminRoutes(deps: AdminRoutesDeps) {
         return c.json({ error: `Unknown role '${roleKey}'` }, 400);
       }
       const callerUser = c.get("user")!;
-      const callerIsAdmin = rbac.listUserRoles(callerUser.id).includes("admin");
-      if (roleKey === "admin" && !callerIsAdmin) {
+      const callerIsAdmin = rbac.listUserRoles(callerUser.id).includes(ADMIN_ROLE);
+      if (roleKey === ADMIN_ROLE && !callerIsAdmin) {
         return c.json({ error: "Only admins can grant the admin role" }, 403);
       }
       const [target] = await db
@@ -260,8 +261,8 @@ export function buildAdminRoutes(deps: AdminRoutesDeps) {
         return c.json({ error: `Unknown role '${roleKey}'` }, 400);
       }
       const callerUser = c.get("user")!;
-      const callerIsAdmin = rbac.listUserRoles(callerUser.id).includes("admin");
-      if (roleKey === "admin" && !callerIsAdmin) {
+      const callerIsAdmin = rbac.listUserRoles(callerUser.id).includes(ADMIN_ROLE);
+      if (roleKey === ADMIN_ROLE && !callerIsAdmin) {
         return c.json({ error: "Only admins can grant the admin role" }, 403);
       }
       const [target] = await db

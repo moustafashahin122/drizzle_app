@@ -55,7 +55,6 @@ import { logger } from "./logger.js";
 import type {
   User,
   Session,
-  users as usersTableType,
 } from "./tables.js";
 
 // Hono's logger may pre-color the status code with its own ANSI escapes; strip
@@ -77,10 +76,13 @@ export interface CreateAppOptions {
   /**
    * The full schema namespace: framework tables (users, sessions) plus any
    * app-specific tables. Pass via `import * as schema from "./db.js"`.
+   *
+   * `Record<string, unknown>` keeps the namespace open to arbitrary additional
+   * exports (other tables, `relations(...)` declarations, type aliases) — the
+   * builder iterates this map and brand-checks each entry, so over-tightening
+   * here would force every host app to upcast at the call site.
    */
-  schema: Record<string, unknown> & SessionSchema & {
-    users: typeof usersTableType;
-  };
+  schema: Record<string, unknown> & SessionSchema;
   /**
    * The code-defined RBAC config — roles, access rights, and record rules.
    * Conventionally three small files in the host app: `src/roles.ts`,

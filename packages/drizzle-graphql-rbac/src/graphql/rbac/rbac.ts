@@ -1,36 +1,28 @@
 /**
  * @module graphql/rbac
  *
- * In-memory RBAC engine. Roles, access rights, record rules, **and**
- * user→role assignments all live in process memory — built synchronously
- * from the code config on startup, mutated at runtime via the engine's
- * membership API.
+ * In-memory RBAC engine. Roles, access rights, record rules, and user→role
+ * assignments all live in the engine closure (not persisted). `assignRole`
+ * and `revokeRole` are synchronous and only thread-safe under Node's
+ * single-threaded event loop — do not share an engine across worker threads.
+ * On process restart, memberships are lost; the app is responsible for
+ * reseeding well-known accounts. The framework's `admin` role is merged in
+ * automatically via `mergeFrameworkRbac`; apps must not redefine it.
  *
- * - **Roles** declared via {@link defineRoles}. Each role may carry an
- *   optional `isAdmin` flag. There is no inheritance: each role's grants
- *   stand alone.
- * - **Access rights** declared via {@link defineAccessRights}: per-role CRUD
- *   booleans on a resource (the table's JS schema key, e.g. `"todos"`).
- *   The user's effective grant set is the union across every role they hold.
- *   Deny-by-default if no role grants the action.
- * - **Record rules** declared via {@link defineRecordRules}: per-role
- *   row-level filters keyed by `(resource, action)`, expressed as
- *   Odoo-style polish-prefix domains. Domains from roles granting the
- *   action are OR-combined and AND-ed into the resolver's `where`.
- *
- * Placeholders: the engine injects `{ "current_user.id": ctx.user?.id ?? null }`
- * when evaluating each rule. Unauthenticated callers get `null`, which makes
- * `=`/`!=` against the placeholder produce no row matches — the safe default.
+ * Roles are declared via {@link defineRoles} (no inheritance). Access rights
+ * (per-role CRUD on a resource) and record rules (per-role row-level Odoo
+ * domains for `(resource, action)`) compose by union; deny-by-default. The
+ * engine injects `{ "current_user.id": ctx.user?.id ?? null }` into domains.
  */
 import { or, type SQL } from "drizzle-orm";
 import { GraphQLError } from "graphql";
 import type { User } from "../../tables.js";
 import type { ColumnMap } from "../builder/filters.js";
 import { parseDomain, domainToSql } from "../domain/domain.js";
-import type { Action, RbacConfig } from "./config.js";
+import type { Action, RecordRuleAction, RbacConfig } from "./config.js";
 import { buildRbacConfig } from "./config.js";
 
-export type { Action } from "./config.js";
+export type { Action, RecordRuleAction } from "./config.js";
 
 export interface RbacContext {
   user: User | null;
@@ -77,6 +69,8 @@ export interface BuiltRbac {
   hasRole(roleKey: string): boolean;
   /** True iff the user currently holds any role whose `isAdmin` flag is set. */
   isAdmin(userId: number): boolean;
+  /** Drop every in-memory user→role assignment. Intended for test resets. */
+  clearAllMemberships(): void;
 }
 
 interface RoleEntry {
@@ -113,7 +107,7 @@ export function buildRbac(config: RbacConfig): BuiltRbac {
     if (a.canDelete) actions.add("delete");
   }
 
-  const rulesByRoleId = new Map<number, Map<string, Map<Action, unknown[]>>>();
+  const rulesByRoleId = new Map<number, Map<string, Map<RecordRuleAction, unknown[]>>>();
   for (const r of resolved.recordRules) {
     const role = rolesByKey.get(r.roleKey);
     if (!role) continue;
@@ -183,6 +177,11 @@ export function buildRbac(config: RbacConfig): BuiltRbac {
       denyAndThrow(`Access denied on '${resource}' for '${action}'`);
     }
 
+    // Record rules currently cover read/update/delete only — `create` has no
+    // row-level filter. Short-circuit here so the lookup map can be typed
+    // against the narrower `RecordRuleAction`.
+    if (action === "create") return memo({});
+
     const placeholders = { "current_user.id": ctx.user?.id ?? null };
     const perRole: SQL[] = [];
     let anyUnrestricted = false;
@@ -238,5 +237,6 @@ export function buildRbac(config: RbacConfig): BuiltRbac {
     },
     hasRole: (roleKey: string) => rolesByKey.has(roleKey),
     isAdmin: (userId: number) => rolesForUser(userId).isAdmin,
+    clearAllMemberships: () => userRoles.clear(),
   };
 }
