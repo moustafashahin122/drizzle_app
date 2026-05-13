@@ -21,13 +21,15 @@ This is a single-process Hono app that serves a static frontend (`public/`) and 
 
 Re-exports the framework-owned tables (`users`, `sessions`) from `drizzle-graphql-rbac/tables` and defines the app-owned `todos` table. The `todos.assignee_id` column has a `.references(() => users.id)` FK — this single-column FK is what the GraphQL layer auto-promotes into a relation field (forward `assigneeId` and inverse `todos`). The DB schema is managed entirely through `drizzle-kit` against these declarations; there is no raw-SQL bootstrap script.
 
-### In-memory RBAC (`src/roles.ts`, `src/accessRights.ts`, `src/recordRules.ts`)
+### RBAC (`src/roles.ts`, `src/accessRights.ts`, `src/recordRules.ts`)
 
 Roles, per-role CRUD grants, and per-role row-level rules are declared in three small TypeScript files. There is **no inheritance** — flatten any shared grants. The framework provides the `admin` role (full bypass) automatically — `createApp` merges it in, and declaring `admin` in app code throws at startup.
 
-RBAC is fully in-memory: `createApp` builds the engine snapshot synchronously from the code config, and user → role memberships live in process memory. There are no RBAC tables and no startup sync. Memberships reset on restart; `server.ts` re-seeds well-known accounts (admin, demo1) by email after `createApp` returns.
+**Role definitions** (the grants + record rules) are in-memory: `createApp` builds the engine snapshot synchronously from the code config. Changing a grant requires a restart.
 
-The admin dashboard's `/admin/users/:id/roles` endpoints add/remove memberships at runtime through the engine's `assignRole` / `revokeRole` API.
+**User → role memberships are DB-backed.** The framework owns a `roles` table and a `users.role_id` FK column (see `packages/drizzle-graphql-rbac/src/tables.ts`). Each user holds **at most one role**. On startup, `createApp` upserts the code-declared role names into the `roles` table so the FK targets exist; memberships themselves survive restarts. The framework boot path can create an initial admin via the `--create-admin` flag (`ADMIN_EMAIL` / `ADMIN_PASSWORD`); `npm run seed:demo` upserts the demo users and assigns their roles.
+
+Membership changes go through `setUserRole(db, ...)` (or the admin dashboard's `/admin/users/:id/roles` endpoints), which writes `users.role_id` and invalidates any active sessions for that user. Resolvers read the joined role live per request via `users INNER JOIN roles` — there is no per-process membership cache, so a SAVEPOINT rollback in tests correctly reverts role assignments along with every other row.
 
 ### Custom GraphQL builder (`packages/drizzle-graphql-rbac/src/graphql/builder/`)
 
@@ -47,7 +49,7 @@ A relation field replaces a same-named scalar column on the **output** type only
 
 ### Server wiring (`src/server.ts`)
 
-`createApp(...)` builds the GraphQL schema, the RBAC engine, and the Hono app in one call; the result is handed to `@hono/node-server`'s `serve`. Static assets are served from `./public`. After `createApp` returns, the server seeds a small set of in-memory role memberships (admin/demo) from a hard-coded email map.
+`createApp(...)` builds the GraphQL schema, the RBAC engine, and the Hono app in one call; the result is handed to `@hono/node-server`'s `serve`. Static assets are served from `./public`. Role rows are upserted into the `roles` table during `createApp` so FKs resolve; user → role memberships are loaded from the DB on demand per request, not seeded into memory at boot. Demo accounts (admin/demo) are populated by `npm run seed:demo`, not by server startup.
 
 ## Tests
 

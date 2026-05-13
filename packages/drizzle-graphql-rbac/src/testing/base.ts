@@ -3,28 +3,21 @@
  *
  * Low-level test plumbing — no opinions on schema, RBAC, or auth.
  *
- *   - {@link getSharedSqlite}   — one process-wide in-memory sqlite handle.
  *   - {@link transactionCase}   — node:test suite + per-test SAVEPOINT fixture.
  *   - {@link pushDrizzleSchema} — apply a Drizzle schema via drizzle-kit.
  *   - {@link jsonFetch}         — fire a request at a Hono-like app.
  *   - {@link cookieValue}       — read a single cookie out of a Set-Cookie list.
+ *
+ * No process-wide sqlite handle. Each `transactionCase` call owns its own
+ * `:memory:` database (created in `before`, closed in `after`) so test files
+ * cannot leak rows into each other regardless of how `node --test` parallelises.
+ * Callers that need to share a handle across suites (e.g. the framework's
+ * `__helpers__.ts` fixture) pass one explicitly via `options.sqlite`.
  */
 import { createRequire } from "node:module";
 import { before, beforeEach, afterEach, after } from "node:test";
 import Database from "better-sqlite3";
 import { drizzle } from "drizzle-orm/better-sqlite3";
-
-// ---------------------------------------------------------------------------
-// Shared sqlite
-// ---------------------------------------------------------------------------
-
-let sharedSqlite: Database.Database | undefined;
-
-/** Process-wide singleton `:memory:` sqlite handle. Lazy on first call. */
-export function getSharedSqlite(): Database.Database {
-  if (!sharedSqlite) sharedSqlite = new Database(":memory:");
-  return sharedSqlite;
-}
 
 // ---------------------------------------------------------------------------
 // SAVEPOINT-based suite fixture
@@ -33,50 +26,82 @@ export function getSharedSqlite(): Database.Database {
 let savepointCounter = 0;
 const nextSavepointName = (kind: "suite" | "test") => `${kind}_${++savepointCounter}`;
 
+export interface TransactionCaseOptions {
+  /**
+   * Pre-existing sqlite handle to run the SAVEPOINTs against. If omitted,
+   * `transactionCase` opens a fresh `:memory:` database in `before` and
+   * closes it in `after`, giving the suite a fully isolated DB.
+   *
+   * Pass one explicitly when you need multiple `transactionCase` blocks to
+   * share state (e.g. a schema fixture pushed once at module load).
+   */
+  sqlite?: Database.Database;
+}
+
 /**
- * Suite fixture with nested SAVEPOINTs on the shared sqlite handle:
+ * Suite fixture with nested SAVEPOINTs:
  *
- *   before:     SAVEPOINT suite_n;  setUpClass() seeds reference data
- *   beforeEach: SAVEPOINT test_m;
+ *   before:     open :memory: sqlite (unless provided); SAVEPOINT suite_n;
+ *               setUpClass(sqlite) seeds reference data
+ *   beforeEach: SAVEPOINT test_m
  *   afterEach:  ROLLBACK TO test_m
- *   after:      ROLLBACK TO suite_n
+ *   after:      ROLLBACK TO suite_n; close sqlite if we opened it
  *
  * Returns a Proxy over the ctx — `tc.foo` reads through to the live ctx, but
  * only after `setUpClass` has run, so access it from inside `it` bodies.
- * Only SQL state is rolled back; in-process state is the suite's problem.
+ *
+ * Only SQL state is rolled back; in-process state (caches, singletons,
+ * captured row snapshots) is the suite's problem.
  */
 export function transactionCase<Ctx extends object>(
-  setUpClass: () => Promise<Ctx> | Ctx,
+  setUpClass: (sqlite: Database.Database) => Promise<Ctx> | Ctx,
+  options: TransactionCaseOptions = {},
 ): Ctx {
   let ctx: Ctx | undefined;
+  let sqlite: Database.Database | undefined;
+  let ownsSqlite = false;
   let suiteSp = "";
   let testSp = "";
-  const exec = (sql: string) => getSharedSqlite().exec(sql);
 
   before(async () => {
+    if (options.sqlite) {
+      sqlite = options.sqlite;
+      ownsSqlite = false;
+    } else {
+      sqlite = new Database(":memory:");
+      ownsSqlite = true;
+    }
     suiteSp = nextSavepointName("suite");
-    exec(`SAVEPOINT ${suiteSp}`);
+    sqlite.exec(`SAVEPOINT ${suiteSp}`);
     try {
-      ctx = await setUpClass();
+      ctx = await setUpClass(sqlite);
     } catch (err) {
-      try { exec(`ROLLBACK TO SAVEPOINT ${suiteSp}; RELEASE SAVEPOINT ${suiteSp}`); } catch {}
+      try { sqlite.exec(`ROLLBACK TO SAVEPOINT ${suiteSp}; RELEASE SAVEPOINT ${suiteSp}`); } catch {}
+      if (ownsSqlite) {
+        try { sqlite.close(); } catch {}
+        sqlite = undefined;
+      }
       throw err;
     }
   });
 
   beforeEach(() => {
-    if (!ctx) throw new Error("transactionCase: setUpClass did not produce a ctx");
+    if (!ctx || !sqlite) throw new Error("transactionCase: setUpClass did not produce a ctx");
     testSp = nextSavepointName("test");
-    exec(`SAVEPOINT ${testSp}`);
+    sqlite.exec(`SAVEPOINT ${testSp}`);
   });
 
   afterEach(() => {
-    if (ctx) exec(`ROLLBACK TO SAVEPOINT ${testSp}; RELEASE SAVEPOINT ${testSp}`);
+    if (ctx && sqlite) sqlite.exec(`ROLLBACK TO SAVEPOINT ${testSp}; RELEASE SAVEPOINT ${testSp}`);
   });
 
   after(() => {
-    if (!ctx) return;
-    try { exec(`ROLLBACK TO SAVEPOINT ${suiteSp}; RELEASE SAVEPOINT ${suiteSp}`); } catch {}
+    if (!sqlite) return;
+    try { sqlite.exec(`ROLLBACK TO SAVEPOINT ${suiteSp}; RELEASE SAVEPOINT ${suiteSp}`); } catch {}
+    if (ownsSqlite) {
+      try { sqlite.close(); } catch {}
+    }
+    sqlite = undefined;
   });
 
   return new Proxy({} as Ctx, {

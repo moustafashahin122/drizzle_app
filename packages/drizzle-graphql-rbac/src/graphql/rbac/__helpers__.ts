@@ -2,10 +2,17 @@
  * Domain-specific test fixtures for the RBAC module.
  *
  * Tables (`users`, `roles`, `todos`) are declared once, the schema is applied
- * to the framework's shared singleton sqlite handle at module load, and the
- * drizzle wrapper is exported so every test file in this directory works
- * against the same connection. Per-test rollback is handled by
- * `transactionCase` (see `../../testing/`).
+ * to a **module-private** sqlite handle at module load, and the drizzle
+ * wrapper is exported so every test file in this directory works against the
+ * same connection. Per-test rollback is handled by the wrapped
+ * `transactionCase` below, which is pre-bound to this private handle so the
+ * SAVEPOINTs land on the same DB the test fixtures use.
+ *
+ * Why module-private rather than the old process-wide singleton: keeping the
+ * handle in this module instead of exposing it through the public testing
+ * surface stops host apps from accidentally sharing a DB with the framework's
+ * own RBAC tests, and stops two consumers from clobbering each other's
+ * schemas if `node --test` ever runs them in the same process.
  *
  * Roles are real DB rows in this fixture (mirroring production: `roles` table
  * holds the role definitions, `users.role_id` holds each user's assignment).
@@ -20,17 +27,13 @@ import { sqliteTable, integer, text, type AnySQLiteColumn } from "drizzle-orm/sq
 import { graphql, type GraphQLSchema } from "graphql";
 
 import {
-  getSharedSqlite,
-  transactionCase,
+  transactionCase as baseTransactionCase,
   pushDrizzleSchema,
 } from "../../testing/base.js";
 import { buildSchema } from "../builder/builder.js";
 import { buildRbac } from "./rbac.js";
 import type { BuiltRbac, RbacContext, ResolvedUserRole } from "./rbac.js";
 import type { RbacConfig } from "./config.js";
-
-// Re-export so test files keep their existing import.
-export { transactionCase };
 
 export const roles = sqliteTable("roles", {
   id: integer("id").primaryKey({ autoIncrement: true }),
@@ -66,15 +69,36 @@ export const todosRelations = relations(todos, ({ one }) => ({
 
 export const allTables = { users, roles, todos, usersRelations, todosRelations };
 
-/** Shared sqlite + drizzle. Schema is pushed once at module load below. */
-export const sqlite = getSharedSqlite();
+/**
+ * Module-private sqlite + drizzle. Every test file in this directory imports
+ * `db` from here and works against the same connection, so the per-test
+ * `transactionCase` SAVEPOINTs need to land on this same handle — that's
+ * what the wrapped `transactionCase` below does (it passes `{ sqlite }` to
+ * the underlying helper).
+ *
+ * Not exported to the public testing surface; host apps get a fresh DB per
+ * suite via `createAppTestHarness` instead.
+ */
+export const sqlite: Database.Database = new Database(":memory:");
 export const db = drizzle(sqlite, { schema: allTables });
 export type Db = typeof db;
 
-// Materialize the rbac test schema onto the shared handle. Top-level await
-// here means every importer transitively awaits this push before running.
-// drizzle-kit's push is idempotent on an already-materialized schema.
+// Materialize the rbac test schema. Top-level await here means every
+// importer transitively awaits this push before running. drizzle-kit's push
+// is idempotent on an already-materialized schema.
 await pushDrizzleSchema(sqlite, allTables);
+
+/**
+ * `transactionCase` pre-bound to this module's private sqlite handle so the
+ * SAVEPOINTs operate on the same DB the fixture writes to. Test files in
+ * this directory keep their existing `transactionCase(async () => …)` calls
+ * unchanged.
+ */
+export function transactionCase<Ctx extends object>(
+  setUpClass: () => Promise<Ctx> | Ctx,
+): Ctx {
+  return baseTransactionCase(() => setUpClass(), { sqlite });
+}
 
 /** Build an isolated DB with the engine's test schema. */
 export async function freshDb(): Promise<{ sqlite: Database.Database; db: Db }> {

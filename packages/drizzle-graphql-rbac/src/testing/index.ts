@@ -12,10 +12,10 @@
  * intentionally not re-exported here.
  */
 export {
-  getSharedSqlite,
   transactionCase,
   pushDrizzleSchema,
   cookieValue,
   jsonFetch,
 } from "./base.js";
+export type { TransactionCaseOptions } from "./base.js";
 export { createAppTestHarness } from "./app_testing.js";

@@ -13,6 +13,7 @@
  *     return { alice };
  *   });
  */
+import type Database from "better-sqlite3";
 import { drizzle as drizzleSqlite } from "drizzle-orm/better-sqlite3";
 import bcrypt from "bcryptjs";
 import { graphql, type GraphQLSchema } from "graphql";
@@ -22,7 +23,7 @@ import { createApp, type CreateAppOptions, type CreatedApp } from "../app.js";
 import { buildSchema as buildGraphqlSchema } from "../graphql/builder/builder.js";
 import { issueSession } from "../auth/session.js";
 import { setUserRole } from "../graphql/rbac/persistence.js";
-import { getSharedSqlite, transactionCase, pushDrizzleSchema } from "./base.js";
+import { transactionCase, pushDrizzleSchema } from "./base.js";
 
 type AppTestConfig = Omit<CreateAppOptions, "db">;
 type Schema = AppTestConfig["schema"];
@@ -70,18 +71,12 @@ interface BuiltApp<S extends Schema> {
 export function createAppTestHarness<S extends Schema>(
   appConfig: AppTestConfig & { schema: S },
 ): AppTestHarness<S> {
-  // The app is built once per process — shared across all suites that use this
-  // harness. Tests get isolation from the SAVEPOINT fixture, not from rebuilding.
-  let buildPromise: Promise<BuiltApp<S>> | undefined;
-
-  const buildOnce = (): Promise<BuiltApp<S>> => {
-    if (!buildPromise) buildPromise = buildAppOnce(appConfig);
-    return buildPromise;
-  };
-
+  // Each suite owns its own sqlite + Hono app + RBAC engine. The sqlite
+  // handle comes from `transactionCase`, which opens a fresh `:memory:`
+  // database in `before` and closes it in `after`. No process-wide singleton.
   const setupAppTestCase: AppTestHarness<S>["setupAppTestCase"] = (setUp) =>
-    transactionCase(async () => {
-      const built = await buildOnce();
+    transactionCase(async (sqlite) => {
+      const built = await buildAppForSuite(appConfig, sqlite);
       const base = makeTestCtx(built);
       const seed = setUp ? await setUp(base) : ({} as any);
       return { ...base, seed } as AppTestCtx<S, any>;
@@ -104,10 +99,10 @@ export function createAppTestHarness<S extends Schema>(
 // internals
 // ---------------------------------------------------------------------------
 
-async function buildAppOnce<S extends Schema>(
+async function buildAppForSuite<S extends Schema>(
   appConfig: AppTestConfig & { schema: S },
+  sqlite: Database.Database,
 ): Promise<BuiltApp<S>> {
-  const sqlite = getSharedSqlite();
   const sudoDb = drizzleSqlite(sqlite, { schema: appConfig.schema });
   await pushDrizzleSchema(sqlite, appConfig.schema as Record<string, unknown>);
 
