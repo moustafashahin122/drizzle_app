@@ -45,7 +45,7 @@ import {
   Table,
   type Column,
 } from "drizzle-orm";
-import { jsKeyOf } from "./util.js";
+import { jsKeyOf } from "./jsKey.js";
 
 /**
  * Symbols Drizzle uses to attach inline foreign keys to a table instance, one

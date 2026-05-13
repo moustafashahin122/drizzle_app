@@ -20,24 +20,9 @@ import {
 import type { DrizzleLike, TableMeta } from "./types.js";
 import type { RbacContext } from "../rbac/rbac.js";
 import { isPrimary } from "./drizzle-internals.js";
+import { jsKeyOf } from "./jsKey.js";
 
-/**
- * Reverse-lookup the JS key of a Drizzle column inside a `{ jsKey: Column }` map.
- *
- * Drizzle's `getTableColumns(table)` returns a record keyed by the JS field name
- * the user wrote in their schema; this helper finds that key when only the
- * column instance is in hand (e.g. when walking foreign-key references or
- * relation `fields` arrays).
- *
- * @returns The matching JS key, or `undefined` if `target` isn't in `columns`.
- */
-export function jsKeyOf(
-  columns: Record<string, Column>,
-  target: Column,
-): string | undefined {
-  for (const [k, c] of Object.entries(columns)) if (c === target) return k;
-  return undefined;
-}
+export { jsKeyOf };
 
 /**
  * Default placeholder map for resolver-supplied domains. Pulls

@@ -13,9 +13,13 @@
  * Note: `db`, `schema`, and `rbac` have NO defaults — they are app-specific
  * and must be provided by the user's config file.
  */
-import type { ServerConfig } from "./config.js";
-
-export const frameworkDefaultConfig: Partial<ServerConfig> = {
+/**
+ * Loosely typed so this module has no import edge back to `./config.ts` —
+ * keeps the defaults / config split acyclic. `runServer` spreads this onto a
+ * fully-typed `ServerConfig` so the strong types are enforced at the merge
+ * site, not here.
+ */
+export const frameworkDefaultConfig = {
   // Transport
   port: 3000,
   host: "0.0.0.0",
