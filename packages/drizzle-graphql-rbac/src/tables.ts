@@ -1,55 +1,28 @@
 /**
  * @module drizzle-graphql-rbac/tables
  *
- * Drizzle table definitions the framework owns:
+ * Framework-owned table declarations, dialect-selected at import time.
  *
- * - **Identity** — `users`, `sessions`.
- * - **RBAC** — `roles`. Each user holds at most one role via `users.role_id`.
+ * The dialect is picked by env:
+ *   - `DATABASE_URL=postgres://…` or `DATABASE_URL=postgresql://…` → Postgres.
+ *   - anything else (incl. unset, e.g. tests) → SQLite.
  *
- * Roles are declared in code (the host app's `defineRoles({...})` config)
- * and reconciled into this table at startup by `syncRoles` — names missing
- * from code are deleted (and any referencing `users.role_id` nulled out),
- * names new in code are inserted, and `is_admin` is refreshed from code on
- * every surviving row. The DB row is the persisted state RBAC consults at
- * request time; the code config is the source of truth for what should
- * exist and what its `is_admin` value should be.
+ * Both flavors share identical JS keys and column names so all framework
+ * code (auth, persistence, the GraphQL builder) is dialect-agnostic at the
+ * source level. Types are exported from the sqlite flavor — the pg variants
+ * are structurally compatible (same JS keys, same JS value types per column).
  */
-import { sql } from "drizzle-orm";
-import { sqliteTable, integer, text, type AnySQLiteColumn } from "drizzle-orm/sqlite-core";
+import * as sqliteTables from "./tables.sqlite.js";
+import * as pgTables from "./tables.pg.js";
 
-export const roles = sqliteTable("roles", {
-  id: integer("id").primaryKey({ autoIncrement: true }),
-  name: text("name").notNull().unique(),
-  isAdmin: integer("is_admin", { mode: "boolean" }).notNull().default(false),
-});
-export type Role = typeof roles.$inferSelect;
-export type NewRole = typeof roles.$inferInsert;
+const url = process.env.DATABASE_URL ?? "";
+const usePg = url.startsWith("postgres://") || url.startsWith("postgresql://");
 
-export const users = sqliteTable("users", {
-  id: integer("id").primaryKey({ autoIncrement: true }),
-  name: text("name").notNull(),
-  email: text("email").notNull().unique(),
-  passwordHash: text("password_hash").notNull(),
-  active: integer("active", { mode: "boolean" }).notNull().default(true),
-  // ON DELETE SET NULL: when a role row is removed by syncRoles, every user
-  // pointing at it is silently demoted to roleless (which RBAC denies) instead
-  // of cascading deletes through the user table.
-  roleId: integer("role_id").references((): AnySQLiteColumn => roles.id, {
-    onDelete: "set null",
-  }),
-  createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
-});
-export type User = typeof users.$inferSelect;
-export type NewUser = typeof users.$inferInsert;
+const t: typeof sqliteTables = (usePg ? pgTables : sqliteTables) as typeof sqliteTables;
 
-export const sessions = sqliteTable("sessions", {
-  id: integer("id").primaryKey({ autoIncrement: true }),
-  token: text("token").notNull().unique(),
-  userId: integer("user_id").notNull().references(() => users.id),
-  createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
-  expiresAt: text("expires_at").notNull(),
-});
-export type Session = typeof sessions.$inferSelect;
+export const roles = t.roles;
+export const users = t.users;
+export const sessions = t.sessions;
 
 /** The full set of framework-owned tables, ready to spread into a schema namespace. */
 export const frameworkTables = {
@@ -57,3 +30,5 @@ export const frameworkTables = {
   users,
   sessions,
 };
+
+export type { Role, NewRole, User, NewUser, Session } from "./tables.sqlite.js";

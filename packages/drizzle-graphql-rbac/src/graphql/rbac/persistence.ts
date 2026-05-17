@@ -62,41 +62,47 @@ export async function syncRoles(
 
   // Run all reconciliation writes (unhook, delete, insert, update) in a single
   // transaction so partial failures don't leave the table in a state where
-  // users point at deleted roles or `is_admin` is half-converged. The callback
-  // is intentionally synchronous and uses explicit `.run()`: better-sqlite3's
-  // `db.transaction` rejects Promise-returning callbacks, and on async
-  // dialects this entire reconciliation runs once at startup so atomicity via
-  // a sync code path is sufficient.
-  const tx = db as SudoDb & {
-    transaction: (cb: (tx: SudoDb) => void) => void;
-  };
-  tx.transaction((trx) => {
-    // (1) Orphans — unhook referencing users first (defense in depth — the
-    // FK's ON DELETE SET NULL would handle it, but doing it explicitly keeps
-    // behaviour identical across dialects), then delete the role rows.
-    if (orphanIds.length) {
-      trx
-        .update(users)
-        .set({ roleId: null })
-        .where(inArray(users.roleId, orphanIds))
-        .run();
-      trx.delete(roles).where(inArray(roles.id, orphanIds)).run();
-    }
+  // users point at deleted roles or `is_admin` is half-converged. Dialect
+  // branch: better-sqlite3's `db.transaction` is strictly synchronous (and
+  // requires `.run()` to flush each chained builder); async dialects (pg)
+  // expect a Promise-returning callback. Detect via the Drizzle dialect tag.
+  const dialectName = (db as { dialect?: { constructor?: { name?: string } } })?.dialect?.constructor?.name;
+  const isSync = dialectName === "SQLiteSyncDialect";
 
-    // (2) Insert rows for code-declared roles missing from DB.
-    if (toInsert.length) {
-      trx
-        .insert(roles)
-        .values(toInsert.map((r) => ({ name: r.key, isAdmin: r.isAdmin })))
-        .run();
-    }
-
-    // (3) Invalidate `is_admin` on survivors — code config wins. Only write
-    // rows whose value actually drifted, to avoid pointless journal churn.
-    for (const u of toUpdate) {
-      trx.update(roles).set({ isAdmin: u.isAdmin }).where(eq(roles.id, u.id)).run();
-    }
-  });
+  if (isSync) {
+    (db as SudoDb & { transaction: (cb: (tx: SudoDb) => void) => void }).transaction((trx) => {
+      if (orphanIds.length) {
+        trx.update(users).set({ roleId: null }).where(inArray(users.roleId, orphanIds)).run();
+        trx.delete(roles).where(inArray(roles.id, orphanIds)).run();
+      }
+      if (toInsert.length) {
+        trx
+          .insert(roles)
+          .values(toInsert.map((r) => ({ name: r.key, isAdmin: r.isAdmin })))
+          .run();
+      }
+      for (const u of toUpdate) {
+        trx.update(roles).set({ isAdmin: u.isAdmin }).where(eq(roles.id, u.id)).run();
+      }
+    });
+  } else {
+    await (db as SudoDb & {
+      transaction: (cb: (tx: SudoDb) => Promise<void>) => Promise<void>;
+    }).transaction(async (trx) => {
+      if (orphanIds.length) {
+        await trx.update(users).set({ roleId: null }).where(inArray(users.roleId, orphanIds));
+        await trx.delete(roles).where(inArray(roles.id, orphanIds));
+      }
+      if (toInsert.length) {
+        await trx
+          .insert(roles)
+          .values(toInsert.map((r) => ({ name: r.key, isAdmin: r.isAdmin })));
+      }
+      for (const u of toUpdate) {
+        await trx.update(roles).set({ isAdmin: u.isAdmin }).where(eq(roles.id, u.id));
+      }
+    });
+  }
 
   return await db.select().from(roles);
 }

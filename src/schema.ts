@@ -1,36 +1,31 @@
 /**
  * @module app/schema
  *
- * Pure Drizzle table declarations for the demo app. No DB connection is
- * opened here — `src/db.ts` owns the file-backed handle for production and
- * `src/testing/appTestCase.ts` opens its own handle against the shared
- * in-memory sqlite. Both import from this module so the schema is defined
- * exactly once.
+ * Dialect-dispatching re-export. Picks `./schema.pg.js` when
+ * `DATABASE_URL` looks like Postgres, otherwise `./schema.sqlite.js`.
  *
- * Drizzle Kit's config (`drizzle.config.ts`) also points at this file so
- * migration generation never triggers a file-DB open.
+ * Both flavors expose the exact same JS keys (`users`, `sessions`, `roles`,
+ * `projects`, `todos`, `frameworkTables`), so callers don't care which is
+ * active. Types are exported from the sqlite flavor; the column-level
+ * `$inferSelect` / `$inferInsert` shapes are structurally compatible.
+ *
+ * drizzle-kit reads this file via `drizzle.config.ts` — that config branches
+ * on `DATABASE_URL` too, so migrations get the right dialect.
  */
-import { sql } from "drizzle-orm";
-import { sqliteTable, integer, text } from "drizzle-orm/sqlite-core";
-import { users } from "drizzle-graphql-rbac/tables";
+import * as sqliteSchema from "./schema.sqlite.js";
+import * as pgSchema from "./schema.pg.js";
 
-export { roles, users, sessions, frameworkTables } from "drizzle-graphql-rbac/tables";
-export type { Role, NewRole, User, NewUser, Session } from "drizzle-graphql-rbac/tables";
+const url = process.env.DATABASE_URL ?? "";
+const usePg = url.startsWith("postgres://") || url.startsWith("postgresql://");
 
-export const projects = sqliteTable("projects", {
-  id: integer("id").primaryKey({ autoIncrement: true }),
-  name: text("name").notNull(),
-});
-export type Project = typeof projects.$inferSelect;
-export type NewProject = typeof projects.$inferInsert;
+const active: typeof sqliteSchema = (usePg ? pgSchema : sqliteSchema) as unknown as typeof sqliteSchema;
 
-export const todos = sqliteTable("todos", {
-  id: integer("id").primaryKey({ autoIncrement: true }),
-  title: text("title").notNull(),
-  completed: integer("completed", { mode: "boolean" }).notNull().default(false),
-  createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
-  assigneeId: integer("assignee_id").references(() => users.id),
-  projectId: integer("project_id").references(() => projects.id),
-});
-export type Todo = typeof todos.$inferSelect;
-export type NewTodo = typeof todos.$inferInsert;
+export const roles = active.roles;
+export const users = active.users;
+export const sessions = active.sessions;
+export const projects = active.projects;
+export const todos = active.todos;
+
+export const frameworkTables = { roles, users, sessions };
+
+export type { Role, NewRole, User, NewUser, Session, Project, NewProject, Todo, NewTodo } from "./schema.sqlite.js";

@@ -60,7 +60,9 @@ function mapError(err: any): { status: ContentfulStatusCode; body: { error: stri
   if (code === "FORBIDDEN") return { status: 403, body: { error: err.message } };
   if (code === "BAD_USER_INPUT") return { status: 400, body: { error: err.message } };
   if (code === "UNAUTHENTICATED") return { status: 401, body: { error: err.message } };
-  if (String(err?.message ?? "").includes("UNIQUE")) {
+  const message = String(err?.message ?? "");
+  // sqlite: "UNIQUE constraint failed"; pg: "duplicate key value..." (23505).
+  if (message.includes("UNIQUE") || message.includes("duplicate key") || err?.code === "23505") {
     return { status: 409, body: { error: "Email already registered" } };
   }
   return { status: 500, body: { error: err?.message ?? "Internal error" } };

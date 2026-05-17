@@ -118,7 +118,10 @@ export function buildAuthRoutes(deps: AuthRoutesDeps) {
       user = row as User;
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
-      if (message.includes("UNIQUE")) {
+      // sqlite: "UNIQUE constraint failed"; pg: "duplicate key value violates
+      // unique constraint" (SQLSTATE 23505). Match either dialect's signal.
+      const code = (err as { code?: string } | null)?.code;
+      if (message.includes("UNIQUE") || message.includes("duplicate key") || code === "23505") {
         return c.json({ error: "Email already registered" }, 409);
       }
       throw err;

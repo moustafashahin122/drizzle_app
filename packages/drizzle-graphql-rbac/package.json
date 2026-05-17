@@ -8,6 +8,8 @@
   "exports": {
     ".": "./src/index.ts",
     "./tables": "./src/tables.ts",
+    "./tables/sqlite": "./src/tables.sqlite.ts",
+    "./tables/pg": "./src/tables.pg.ts",
     "./testing": "./src/testing/index.ts"
   },
   "scripts": {
@@ -18,12 +20,13 @@
     "drizzle-orm": ">=0.36",
     "graphql": ">=16",
     "graphql-yoga": ">=5",
-    "hono": ">=4"
+    "hono": ">=4",
+    "pg": ">=8"
   },
   "peerDependenciesMeta": {
-    "drizzle-kit": {
-      "optional": true
-    }
+    "better-sqlite3": { "optional": true },
+    "pg": { "optional": true },
+    "drizzle-kit": { "optional": true }
   },
   "dependencies": {
     "@hono/node-server": "^1.13.7",
