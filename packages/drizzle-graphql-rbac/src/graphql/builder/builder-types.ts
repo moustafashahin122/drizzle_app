@@ -45,7 +45,7 @@ function buildObjectFields(
   meta: TableMeta,
   metas: Map<string, TableMeta>,
   db: DrizzleLike,
-  domainCtxFor: (m: TableMeta) => DomainContext,
+  domainContextFor: (m: TableMeta) => DomainContext,
   guardFor: (m: TableMeta) => Guard,
   hiddenOutput: Set<string>,
   relationBatchSize: number,
@@ -64,9 +64,9 @@ function buildObjectFields(
   // The scalar FK column remains usable in `set` / Insert / Update inputs
   // (and inside a domain leaf) because they iterate the unchanged column map.
   for (const rel of meta.relations) {
-    const refMeta = metas.get(getTableName(rel.referencedTable));
-    if (!refMeta) continue;
-    fields[rel.fieldName] = buildRelationField(rel, meta, refMeta, db, domainCtxFor(refMeta), relationBatchSize, maxListLimit, guardFor(refMeta));
+    const referencedMeta = metas.get(getTableName(rel.referencedTable));
+    if (!referencedMeta) continue;
+    fields[rel.fieldName] = buildRelationField(rel, meta, referencedMeta, db, domainContextFor(referencedMeta), relationBatchSize, maxListLimit, guardFor(referencedMeta));
   }
   return fields;
 }
@@ -78,13 +78,13 @@ function buildObjectFields(
  * lazily once every table in the schema has been registered.
  */
 export function buildTableMeta(
-  jsKey: string,
+  schemaKey: string,
   table: any,
   typeName: string,
-  intro: ReturnType<typeof introspectSchema>,
+  introspection: ReturnType<typeof introspectSchema>,
   metas: Map<string, TableMeta>,
   db: DrizzleLike,
-  domainCtxFor: (m: TableMeta) => DomainContext,
+  domainContextFor: (m: TableMeta) => DomainContext,
   guardFor: (m: TableMeta) => Guard,
   hiddenOutput: Set<string>,
   hiddenInput: Set<string>,
@@ -93,18 +93,18 @@ export function buildTableMeta(
 ): TableMeta {
   const sqlName = getTableName(table);
   const columns = getTableColumns(table) as ColumnMap;
-  const relations = intro.relations.get(sqlName) ?? [];
+  const relations = introspection.relations.get(sqlName) ?? [];
 
   const objectType = new GraphQLObjectType({
     name: typeName,
-    fields: () => buildObjectFields(meta, metas, db, domainCtxFor, guardFor, hiddenOutput, relationBatchSize, maxListLimit),
+    fields: () => buildObjectFields(meta, metas, db, domainContextFor, guardFor, hiddenOutput, relationBatchSize, maxListLimit),
   });
   const insertInput = buildInsertInput(typeName, columns, hiddenInput);
   const updateInput = buildUpdateInput(typeName, columns, hiddenInput);
   const orderByInput = buildOrderByInput(typeName, columns);
 
   const meta: TableMeta = {
-    jsKey,
+    schemaKey,
     typeName,
     table,
     columns,

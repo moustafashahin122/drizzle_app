@@ -2,7 +2,7 @@
  * RBAC enforcement at the GraphQL layer.
  *
  * Proves that `buildSchema(..., { rbac: { enforce } })` wires the rbac engine
- * into the generated resolvers — independently of the rdb proxy, which has
+ * into the generated resolvers — independently of the rbacDb proxy, which has
  * its own tests. Auth, ACL, record-rule narrowing, and admin bypass are all
  * exercised through real `graphql(...)` calls so the public contract is what
  * gets validated.

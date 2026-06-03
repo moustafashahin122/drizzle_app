@@ -1,5 +1,5 @@
 /**
- * @module graphql/builder/jsKey
+ * @module graphql/builder/schemaKey
  *
  * Standalone helper extracted from `./util.ts` so that `relations.ts` can
  * import it without introducing a cycle through `util.ts → types.ts →
@@ -8,11 +8,11 @@
 import type { Column } from "drizzle-orm";
 
 /**
- * Reverse-lookup the JS key of a Drizzle column inside a `{ jsKey: Column }` map.
+ * Reverse-lookup the JS key of a Drizzle column inside a `{ schemaKey: Column }` map.
  *
  * @returns The matching JS key, or `undefined` if `target` isn't in `columns`.
  */
-export function jsKeyOf(
+export function schemaKeyOf(
   columns: Record<string, Column>,
   target: Column,
 ): string | undefined {

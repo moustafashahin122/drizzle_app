@@ -16,15 +16,15 @@ import * as sqliteSchema from "./schema.sqlite.js";
 import * as pgSchema from "./schema.pg.js";
 
 const url = process.env.DATABASE_URL ?? "";
-const usePg = url.startsWith("postgres://") || url.startsWith("postgresql://");
+const isPostgres = url.startsWith("postgres://") || url.startsWith("postgresql://");
 
-const active: typeof sqliteSchema = (usePg ? pgSchema : sqliteSchema) as unknown as typeof sqliteSchema;
+const activeSchema: typeof sqliteSchema = (isPostgres ? pgSchema : sqliteSchema) as unknown as typeof sqliteSchema;
 
-export const roles = active.roles;
-export const users = active.users;
-export const sessions = active.sessions;
-export const projects = active.projects;
-export const todos = active.todos;
+export const roles = activeSchema.roles;
+export const users = activeSchema.users;
+export const sessions = activeSchema.sessions;
+export const projects = activeSchema.projects;
+export const todos = activeSchema.todos;
 
 export const frameworkTables = { roles, users, sessions };
 

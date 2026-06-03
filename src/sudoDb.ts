@@ -10,7 +10,7 @@
  *
  * The connection is exported as `sudoDb` — the name signals that any direct
  * use bypasses RBAC enforcement. App code should generally go through the
- * per-request `rdbFor(ctx)` factory returned by `createApp`. Reach for
+ * per-request `rbacDbFor(ctx)` factory returned by `createApp`. Reach for
  * `sudoDb` only in pre-user bootstrap paths (`server.ts` startup, the seed
  * scripts in `src/scripts/`).
  */
@@ -19,14 +19,18 @@ import * as schema from "./schema.js";
 
 const dbLog = logger.child({ component: "app.db" });
 const url = process.env.DATABASE_URL ?? "";
-const usePg = url.startsWith("postgres://") || url.startsWith("postgresql://");
+const isPostgres = url.startsWith("postgres://") || url.startsWith("postgresql://");
 
 async function buildDb() {
-  if (usePg) {
+  if (isPostgres) {
     const { Pool } = await import("pg");
     const { drizzle } = await import("drizzle-orm/node-postgres");
+    // Pool max defaults to 32 so concurrent GraphQL workers don't queue on the
+    // pg default of 10 — at remote-DB RTTs that queueing dominates p95.
+    const poolMax = Number(process.env.DATABASE_POOL_MAX ?? 32);
     const pool = new Pool({
       connectionString: url,
+      max: Number.isFinite(poolMax) && poolMax > 0 ? poolMax : 32,
       // Neon requires SSL; node-postgres reads `sslmode=require` from the URL
       // but does not infer the trusted CA chain — let it use the system store
       // with rejectUnauthorized true. For self-signed dev Postgres set

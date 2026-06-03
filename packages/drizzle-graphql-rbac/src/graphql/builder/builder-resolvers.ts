@@ -32,8 +32,8 @@ import { selectProjected, whereDomainToSql } from "./util.js";
  * Attach the standard CRUD root fields for a table to the Query and Mutation
  * field maps:
  *
- * - `Query.<jsKey>(where?, orderBy?, limit?, offset?): [<Type>!]!`
- * - `Query.<jsKey>Single(where?, orderBy?): <Type>` (returns first match or null)
+ * - `Query.<schemaKey>(where?, orderBy?, limit?, offset?): [<Type>!]!`
+ * - `Query.<schemaKey>Single(where?, orderBy?): <Type>` (returns first match or null)
  * - `Mutation.insertInto<TypeName>(values: [<Type>Insert!]!): [<Type>!]!`
  * - `Mutation.update<TypeName>(set: <Type>Update!, where?): [<Type>!]!`
  * - `Mutation.deleteFrom<TypeName>(where?): [<Type>!]!`
@@ -50,8 +50,8 @@ export function addRootFields(
   guard: Guard,
   maxListLimit: number,
 ) {
-  queryFields[meta.jsKey] = buildListQueryField(meta, db, ctx, guard, maxListLimit);
-  queryFields[`${meta.jsKey}Single`] = buildSingleQueryField(meta, db, ctx, guard);
+  queryFields[meta.schemaKey] = buildListQueryField(meta, db, ctx, guard, maxListLimit);
+  queryFields[`${meta.schemaKey}Single`] = buildSingleQueryField(meta, db, ctx, guard);
   mutationFields[`insertInto${meta.typeName}`] = buildInsertMutationField(meta, db, guard);
   mutationFields[`update${meta.typeName}`] = buildUpdateMutationField(meta, db, ctx, guard);
   mutationFields[`deleteFrom${meta.typeName}`] = buildDeleteMutationField(meta, db, ctx, guard);
@@ -72,7 +72,7 @@ function listArgsConfig(meta: TableMeta) {
   };
 }
 
-/** `Query.<jsKey>(where?, orderBy?, limit?, offset?)` — paginated list. */
+/** `Query.<schemaKey>(where?, orderBy?, limit?, offset?)` — paginated list. */
 function buildListQueryField(
   meta: TableMeta,
   db: DrizzleLike,
@@ -96,7 +96,7 @@ function buildListQueryField(
   };
 }
 
-/** `Query.<jsKey>Single(where?, orderBy?)` — first matching row or null. */
+/** `Query.<schemaKey>Single(where?, orderBy?)` — first matching row or null. */
 function buildSingleQueryField(
   meta: TableMeta,
   db: DrizzleLike,

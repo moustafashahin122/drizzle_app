@@ -23,7 +23,7 @@
  * import { accessRights } from "./accessRights.js";
  * import { recordRules } from "./recordRules.js";
  *
- * const { app, rbac, rdbFor } = createApp({
+ * const { app, rbac, rbacDbFor } = createApp({
  *   db: sudoDb,
  *   schema,
  *   rbac: { roles, accessRights, recordRules },
@@ -47,7 +47,7 @@ import {
   type ResolvedUserRole,
 } from "./graphql/rbac/rbac.js";
 import type { RbacConfig } from "./graphql/rbac/config.js";
-import { mergeFrameworkRbac } from "./frameworkRbac.js";
+import { mergeBuiltInRoles } from "./builtInRoles.js";
 import { buildRbacDb, type RbacDb } from "./graphql/rbac/rbacDb.js";
 import {
   syncRoles as syncRolesPersistence,
@@ -180,12 +180,12 @@ export interface CreatedApp {
    * custom routes. Pass the request's resolved auth context (the same shape
    * the framework's GraphQL/REST handlers build from `sessionMiddleware`).
    */
-  rdbFor: (ctx: RbacContext) => RbacDb;
+  rbacDbFor: (ctx: RbacContext) => RbacDb;
   /**
    * The raw, unwrapped Drizzle handle, re-exported under a name that flags
    * its bypass semantics. Use it only in pre-user bootstrap paths (seed
    * scripts, anywhere that must run before a user context exists).
-   * Per-request code should go through `rdbFor`.
+   * Per-request code should go through `rbacDbFor`.
    */
   sudoDb: SudoDb;
 }
@@ -233,8 +233,8 @@ export async function createApp(opts: CreateAppOptions): Promise<CreatedApp> {
   };
 
   // Merge framework-owned roles (currently just `admin`) into the user-supplied
-  // config. Apps should not redefine `admin`; if they do, mergeFrameworkRbac throws.
-  const mergedRbac = mergeFrameworkRbac(rbacConfig);
+  // config. Apps should not redefine `admin`; if they do, mergeBuiltInRoles throws.
+  const mergedRbac = mergeBuiltInRoles(rbacConfig);
   const rbac = buildRbac(mergedRbac);
 
   const { schema: gqlSchema } = buildSchema(db, schema, {
@@ -247,7 +247,7 @@ export async function createApp(opts: CreateAppOptions): Promise<CreatedApp> {
     maxListLimit,
   });
 
-  const rdbFor = buildRbacDb({ db, schema, enforce: rbac.enforce });
+  const rbacDbFor = buildRbacDb({ db, schema, enforce: rbac.enforce });
 
   interface ServerCtx {
     user: User | null;
@@ -291,7 +291,7 @@ export async function createApp(opts: CreateAppOptions): Promise<CreatedApp> {
         session: session ?? null,
         role: role ?? null,
         batch,
-        db: rdbFor({ user: user ?? null, role: role ?? null, batch }),
+        db: rbacDbFor({ user: user ?? null, role: role ?? null, batch }),
       };
     },
   });
@@ -338,7 +338,7 @@ export async function createApp(opts: CreateAppOptions): Promise<CreatedApp> {
       schema: roleAwareSchema,
       usersTable: schema.users,
       rolesTable: schema.roles,
-      rdbFor,
+      rbacDbFor,
       rbac,
     }),
   );
@@ -370,7 +370,7 @@ export async function createApp(opts: CreateAppOptions): Promise<CreatedApp> {
   // synchronously so the host can decide whether to abort startup.
   await syncRoles();
 
-  return { app, rbac, syncRoles, rdbFor, sudoDb: db };
+  return { app, rbac, syncRoles, rbacDbFor, sudoDb: db };
 }
 
 // Re-exported helpers — host apps building custom routes against role state

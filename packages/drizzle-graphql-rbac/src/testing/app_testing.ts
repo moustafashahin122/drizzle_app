@@ -63,7 +63,7 @@ interface AppTestHarness<S extends Schema> {
 interface BuiltApp<S extends Schema> {
   sudoDb: SudoDb;
   app: CreatedApp["app"];
-  rdbFor: CreatedApp["rdbFor"];
+  rbacDbFor: CreatedApp["rbacDbFor"];
   graphqlSchema: GraphQLSchema;
   schema: S;
 }
@@ -106,7 +106,7 @@ async function buildAppForSuite<S extends Schema>(
   const sudoDb = drizzleSqlite(sqlite, { schema: appConfig.schema });
   await pushDrizzleSchema(sqlite, appConfig.schema as Record<string, unknown>);
 
-  const { app, rbac, rdbFor } = await createApp({
+  const { app, rbac, rbacDbFor } = await createApp({
     db: sudoDb,
     ...appConfig,
     publicDir: null,
@@ -121,7 +121,7 @@ async function buildAppForSuite<S extends Schema>(
     rbac: { enforce: rbac.enforce },
   });
 
-  return { sudoDb, app, rdbFor, graphqlSchema, schema: appConfig.schema };
+  return { sudoDb, app, rbacDbFor, graphqlSchema, schema: appConfig.schema };
 }
 
 function makeTestCtx<S extends Schema>(
@@ -172,7 +172,7 @@ function makeRunDirect<S extends Schema>(built: BuiltApp<S>): AppTestCtx<S, any>
         role,
         session: null,
         batch,
-        db: built.rdbFor({ user: user as any, role, batch }),
+        db: built.rbacDbFor({ user: user as any, role, batch }),
       },
       variableValues: opts.variables,
     });

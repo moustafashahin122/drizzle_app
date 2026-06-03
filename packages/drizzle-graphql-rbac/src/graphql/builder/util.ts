@@ -20,9 +20,9 @@ import {
 import type { DrizzleLike, TableMeta } from "./types.js";
 import type { RbacContext } from "../rbac/rbac.js";
 import { isPrimary } from "./drizzle-internals.js";
-import { jsKeyOf } from "./jsKey.js";
+import { schemaKeyOf } from "./schemaKey.js";
 
-export { jsKeyOf };
+export { schemaKeyOf };
 
 /**
  * Default placeholder map for resolver-supplied domains. Pulls
@@ -84,8 +84,8 @@ export function projectionForSelection(
 
   const proj: Record<string, Column> = {};
   // Primary key columns are unconditionally projected.
-  for (const [k, c] of Object.entries(meta.columns)) {
-    if (isPrimary(c)) proj[k] = c;
+  for (const [columnKey, c] of Object.entries(meta.columns)) {
+    if (isPrimary(c)) proj[columnKey] = c;
   }
 
   const relByName = new Map(meta.relations.map((r) => [r.fieldName, r]));
@@ -103,8 +103,8 @@ export function projectionForSelection(
       // relations they're the local PK/unique columns (typically already in
       // the projection via the PK pass above).
       for (const lc of rel.fields) {
-        const k = jsKeyOf(meta.columns, lc);
-        if (k) proj[k] = lc;
+        const columnKey = schemaKeyOf(meta.columns, lc);
+        if (columnKey) proj[columnKey] = lc;
       }
     }
   }

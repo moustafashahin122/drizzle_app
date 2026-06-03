@@ -102,9 +102,9 @@ export type { RolePersistenceSchema } from "./graphql/rbac/persistence.js";
 // merge them into a user config when wiring the engine directly.
 export {
   ADMIN_ROLE,
-  FRAMEWORK_ROLES,
-  mergeFrameworkRbac,
-} from "./frameworkRbac.js";
+  BUILT_IN_ROLES,
+  mergeBuiltInRoles,
+} from "./builtInRoles.js";
 
 // Code-defined RBAC config helpers + types.
 export {

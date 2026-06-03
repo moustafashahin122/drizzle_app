@@ -64,8 +64,8 @@ export interface DrizzleLike {
  */
 export interface TableMeta {
   /** JS export key in the user's schema namespace (also the root query field name). */
-  jsKey: string;
-  /** GraphQL ObjectType name (defaults to `cap(jsKey)`; mutations are named `insertInto<typeName>`, etc.). */
+  schemaKey: string;
+  /** GraphQL ObjectType name (defaults to `cap(schemaKey)`; mutations are named `insertInto<typeName>`, etc.). */
   typeName: string;
   /** Drizzle table reference, passed through to query builders. */
   table: Table;
@@ -115,13 +115,13 @@ export interface RbacConfig {
  */
 export function makeGuard(
   rbac: RbacConfig | undefined,
-  jsKey: string,
+  schemaKey: string,
   columns: ColumnMap,
 ): Guard {
   if (!rbac) return null;
-  if (rbac.bypassResources?.has(jsKey)) return null;
+  if (rbac.bypassResources?.has(schemaKey)) return null;
   return async (ctx, action) =>
-    (await rbac.enforce(ctx, jsKey, action, columns)).where;
+    (await rbac.enforce(ctx, schemaKey, action, columns)).where;
 }
 
 /**

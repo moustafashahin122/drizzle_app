@@ -41,7 +41,7 @@ import {
   getUserRole,
   setUserRole,
 } from "../graphql/rbac/persistence.js";
-import { ADMIN_ROLE } from "../frameworkRbac.js";
+import { ADMIN_ROLE } from "../builtInRoles.js";
 
 class HttpError extends Error {
   constructor(public status: ContentfulStatusCode, message: string) {
@@ -77,7 +77,7 @@ export interface AdminRoutesDeps {
   /** The `roles` Drizzle table — used to list / look up roles for assignment. */
   rolesTable: typeof rolesTableType;
   /** Per-request RBAC-bound db factory built by `buildRbacDb`. */
-  rdbFor: (ctx: import("../graphql/rbac/rbac.js").RbacContext) => RbacDb;
+  rbacDbFor: (ctx: import("../graphql/rbac/rbac.js").RbacContext) => RbacDb;
   /** The RBAC engine — used for resource enforcement. */
   rbac: BuiltRbac;
 }
@@ -87,7 +87,7 @@ export interface AdminRoutesDeps {
  * `app.route("/admin", buildAdminRoutes(deps))`.
  */
 export function buildAdminRoutes(deps: AdminRoutesDeps) {
-  const { db, schema, rdbFor, usersTable, rbac } = deps;
+  const { db, schema, rbacDbFor, usersTable, rbac } = deps;
   const usersColumns = getTableColumns(usersTable) as ColumnMap;
   const persistenceSchema = { users: schema.users, roles: schema.roles };
   const app = new Hono<AuthEnv>();
@@ -110,7 +110,7 @@ export function buildAdminRoutes(deps: AdminRoutesDeps) {
     batch: new Map(),
   });
 
-  const rdbForReq = (c: Context<AuthEnv>): RbacDb => rdbFor(ctxFor(c));
+  const rbacDbForReq = (c: Context<AuthEnv>): RbacDb => rbacDbFor(ctxFor(c));
 
   const requirePerm = (c: Context<AuthEnv>, action: "read" | "update" | "delete") =>
     rbac.enforce(ctxFor(c), "users", action, usersColumns);
@@ -131,7 +131,7 @@ export function buildAdminRoutes(deps: AdminRoutesDeps) {
   };
 
   app.get("/users", async (c) => {
-    const rows: User[] = await rdbForReq(c)
+    const rows: User[] = await rbacDbForReq(c)
       .select()
       .from(usersTable)
       .orderBy(asc(usersTable.id));
@@ -165,7 +165,7 @@ export function buildAdminRoutes(deps: AdminRoutesDeps) {
     }
 
     const passwordHash = await bcrypt.hash(password, 12);
-    const [row] = await rdbForReq(c)
+    const [row] = await rbacDbForReq(c)
       .insert(usersTable)
       .values({ name, email, passwordHash, active, roleId })
       .returning();
@@ -186,7 +186,7 @@ export function buildAdminRoutes(deps: AdminRoutesDeps) {
       throw new HttpError(400, "No editable fields supplied");
     }
 
-    const rows: User[] = await rdbForReq(c)
+    const rows: User[] = await rbacDbForReq(c)
       .update(usersTable)
       .set(set)
       .where(eq(usersTable.id, id))
@@ -209,7 +209,7 @@ export function buildAdminRoutes(deps: AdminRoutesDeps) {
     // user's `role_id` column is just a value on the row about to be deleted;
     // no cleanup needed on the roles table.
     await db.delete(schema.sessions).where(eq(schema.sessions.userId, id));
-    const rows: User[] = await rdbForReq(c)
+    const rows: User[] = await rbacDbForReq(c)
       .delete(usersTable)
       .where(eq(usersTable.id, id))
       .returning();

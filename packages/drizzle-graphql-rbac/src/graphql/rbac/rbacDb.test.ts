@@ -5,8 +5,8 @@
  * cross-owner deny, allow-vs-deny pairs across CRUD verbs) is covered
  * comprehensively in `accessRights.test.ts` and `recordRules.test.ts`.
  *
- * This file covers only the contracts unique to the rdb proxy itself:
- *   - the `isAdmin: true` short-circuit at the rdb layer
+ * This file covers only the contracts unique to the rbacDb proxy itself:
+ *   - the `isAdmin: true` short-circuit at the rbacDb layer
  *   - drizzle's chained query methods (orderBy, limit) survive the proxy
  *   - the `bypassResources` opt-out
  *   - the `.sudo` escape hatch
@@ -59,16 +59,16 @@ const rbacConfig = {
 
 const tc = transactionCase(async () => {
   const rbac = buildRbac(rbacConfig);
-  const rdbFor = buildRbacDb({ db, schema: allTables, enforce: rbac.enforce });
+  const rbacDbFor = buildRbacDb({ db, schema: allTables, enforce: rbac.enforce });
   const cast = await seedReaderAdmin(rbac);
-  return { db, rbac, rdbFor, cast };
+  return { db, rbac, rbacDbFor, cast };
 });
 
 describe("rbacDb — proxy-specific contracts", () => {
-  it("admin role short-circuits enforcement at the rdb layer (sees every row)", async () => {
-    const { rdbFor, cast: { alice, bob, carol } } = tc;
-    const rdb = rdbFor(ctxFor(bob.id));
-    const rows = await rdb.select().from(todos);
+  it("admin role short-circuits enforcement at the rbacDb layer (sees every row)", async () => {
+    const { rbacDbFor, cast: { alice, bob, carol } } = tc;
+    const rbacDb = rbacDbFor(ctxFor(bob.id));
+    const rows = await rbacDb.select().from(todos);
 
     assert.equal(rows.length, 4);
     const indexed = byTitle(rows as any[]);
@@ -81,9 +81,9 @@ describe("rbacDb — proxy-specific contracts", () => {
   });
 
   it("forwards orderBy and limit through the proxy, preserving order and length", async () => {
-    const { rdbFor, cast: { bob } } = tc;
-    const rdb = rdbFor(ctxFor(bob.id));
-    const rows = await rdb.select().from(todos).orderBy(todos.id).limit(2);
+    const { rbacDbFor, cast: { bob } } = tc;
+    const rbacDb = rbacDbFor(ctxFor(bob.id));
+    const rows = await rbacDb.select().from(todos).orderBy(todos.id).limit(2);
 
     assert.equal(rows.length, 2);
     assert.deepEqual(
@@ -101,8 +101,8 @@ describe("rbacDb — proxy-specific contracts", () => {
       enforce: rbac.enforce,
       bypassResources: new Set(["todos"]),
     });
-    const rdb = bypassRdbFor(ctxFor(carol.id)); // Carol has no role
-    const rows = await rdb.select().from(todos);
+    const rbacDb = bypassRdbFor(ctxFor(carol.id)); // Carol has no role
+    const rows = await rbacDb.select().from(todos);
 
     assert.equal(rows.length, 4);
     const indexed = byTitle(rows as any[]);
@@ -114,17 +114,17 @@ describe("rbacDb — proxy-specific contracts", () => {
     assert.equal(indexed["carol-1"].ownerId, carol.id);
   });
 
-  it("rdb.sudo is the unwrapped db — reads and writes skip enforcement", async () => {
-    const { db, rdbFor, cast: { alice, carol } } = tc;
-    const rdb = rdbFor(ctxFor(carol.id)); // Carol has no role; sudo must still work
+  it("rbacDb.sudo is the unwrapped db — reads and writes skip enforcement", async () => {
+    const { db, rbacDbFor, cast: { alice, carol } } = tc;
+    const rbacDb = rbacDbFor(ctxFor(carol.id)); // Carol has no role; sudo must still work
 
     // Read through .sudo bypasses enforcement.
-    const rows = await rdb.sudo.select().from(todos);
+    const rows = await rbacDb.sudo.select().from(todos);
     assert.equal(rows.length, 4);
 
     // Write through .sudo must be visible on the underlying db — proves
     // `.sudo` is the same instance, not a copy.
-    await rdb.sudo.insert(todos).values({ title: "sudo-write", ownerId: alice.id });
+    await rbacDb.sudo.insert(todos).values({ title: "sudo-write", ownerId: alice.id });
     const [hit] = await db.select().from(todos).where(eq(todos.title, "sudo-write"));
     assert.equal(hit.title, "sudo-write");
     assert.equal(hit.ownerId, alice.id);
@@ -133,9 +133,9 @@ describe("rbacDb — proxy-specific contracts", () => {
 
 describe("rbacDb.query — relational query API", () => {
   it("findMany injects the record-rule where (reader sees only own todos)", async () => {
-    const { rdbFor, cast: { alice } } = tc;
-    const rdb = rdbFor(ctxFor(alice.id));
-    const rows = await rdb.query.todos.findMany();
+    const { rbacDbFor, cast: { alice } } = tc;
+    const rbacDb = rbacDbFor(ctxFor(alice.id));
+    const rows = await rbacDb.query.todos.findMany();
     assert.equal(rows.length, 2);
     assert.deepEqual(
       rows.map((r: any) => r.title).sort(),
@@ -144,10 +144,10 @@ describe("rbacDb.query — relational query API", () => {
   });
 
   it("findFirst injects the record-rule where (reader cannot see other actors' rows)", async () => {
-    const { rdbFor, cast: { alice, bob } } = tc;
-    const rdb = rdbFor(ctxFor(alice.id));
+    const { rbacDbFor, cast: { alice, bob } } = tc;
+    const rbacDb = rbacDbFor(ctxFor(alice.id));
     // bob-1 exists but is owned by bob — must not be findFirst-able by alice.
-    const row = await rdb.query.todos.findFirst({
+    const row = await rbacDb.query.todos.findFirst({
       where: (t: any, { eq: e }: any) => e(t.title, "bob-1"),
     });
     assert.equal(row, undefined, "bob-1 must be filtered out by the reader record rule");
@@ -155,20 +155,20 @@ describe("rbacDb.query — relational query API", () => {
   });
 
   it("admin (isAdmin) sees every row through findMany — no record-rule injection", async () => {
-    const { rdbFor, cast: { bob } } = tc;
-    const rdb = rdbFor(ctxFor(bob.id));
-    const rows = await rdb.query.todos.findMany();
+    const { rbacDbFor, cast: { bob } } = tc;
+    const rbacDb = rbacDbFor(ctxFor(bob.id));
+    const rows = await rbacDb.query.todos.findMany();
     assert.equal(rows.length, 4);
   });
 
   it("with: walks one level and injects the related table's record rule", async () => {
-    const { rdbFor, cast: { alice } } = tc;
-    const rdb = rdbFor(ctxFor(alice.id));
+    const { rbacDbFor, cast: { alice } } = tc;
+    const rbacDb = rbacDbFor(ctxFor(alice.id));
     // alice can read users (rule: id = current_user.id → only her own row).
     // The "ownerId" relation on each todo resolves to a user row; the rule
     // hides every user except alice, so todos owned by alice carry the
     // related user row and others should carry null.
-    const rows = await rdb.query.todos.findMany({ with: { ownerId: true } });
+    const rows = await rbacDb.query.todos.findMany({ with: { ownerId: true } });
     // Reader sees only her own 2 todos due to the todos rule.
     assert.equal(rows.length, 2);
     for (const r of rows) {
@@ -178,10 +178,10 @@ describe("rbacDb.query — relational query API", () => {
   });
 
   it("with: nested two levels — record rules apply at every level", async () => {
-    const { rdbFor, cast: { alice } } = tc;
-    const rdb = rdbFor(ctxFor(alice.id));
+    const { rbacDbFor, cast: { alice } } = tc;
+    const rbacDb = rbacDbFor(ctxFor(alice.id));
     // todos → ownerId (user) → todos (inverse "many" promoted from users.todos)
-    const rows = await rdb.query.todos.findMany({
+    const rows = await rbacDb.query.todos.findMany({
       with: { ownerId: { with: { todos: true } } },
     });
     assert.equal(rows.length, 2);
@@ -205,43 +205,43 @@ describe("rbacDb.query — relational query API", () => {
       enforce: rbac.enforce,
       bypassResources: new Set(["todos"]),
     });
-    const rdb = bypassRdbFor(ctxFor(carol.id)); // no role, but bypass on todos
-    const rows = await rdb.query.todos.findMany();
+    const rbacDb = bypassRdbFor(ctxFor(carol.id)); // no role, but bypass on todos
+    const rows = await rbacDb.query.todos.findMany();
     assert.equal(rows.length, 4);
   });
 
   it("query honors .sudo passthrough", async () => {
-    const { rdbFor, cast: { carol } } = tc;
-    const rdb = rdbFor(ctxFor(carol.id)); // no role; enforced query would throw
-    const rows = await rdb.sudo.query.todos.findMany();
+    const { rbacDbFor, cast: { carol } } = tc;
+    const rbacDb = rbacDbFor(ctxFor(carol.id)); // no role; enforced query would throw
+    const rows = await rbacDb.sudo.query.todos.findMany();
     assert.equal(rows.length, 4);
   });
 
   it("findMany throws FORBIDDEN when the caller lacks the read ACL", async () => {
-    const { rdbFor, cast: { carol } } = tc;
-    const rdb = rdbFor(ctxFor(carol.id)); // no role → no read on todos
+    const { rbacDbFor, cast: { carol } } = tc;
+    const rbacDb = rbacDbFor(ctxFor(carol.id)); // no role → no read on todos
     await assert.rejects(
-      () => rdb.query.todos.findMany(),
+      () => rbacDb.query.todos.findMany(),
       /FORBIDDEN|forbidden|denied/i,
       "expected enforce to throw when the user has no read ACL on todos",
     );
   });
 
   it("callback-form `where` AND-combines with the record-rule extra (not OR or override)", async () => {
-    const { rdbFor, cast: { alice } } = tc;
-    const rdb = rdbFor(ctxFor(alice.id));
+    const { rbacDbFor, cast: { alice } } = tc;
+    const rbacDb = rbacDbFor(ctxFor(alice.id));
     // The user's callback narrows to title="bob-1" (a row alice does NOT own).
     // Without record-rule injection findMany would return bob-1; with it, the
     // AND with `ownerId = alice.id` must filter it out — proving the combiner
     // intersects rather than replacing the user filter.
-    const rows = await rdb.query.todos.findMany({
+    const rows = await rbacDb.query.todos.findMany({
       where: (t: any, { eq: e }: any) => e(t.title, "bob-1"),
     });
     assert.equal(rows.length, 0, "rule must AND with user filter; bob-1 is not alice's");
 
     // Sanity: same callback against an owned title returns the row, proving
     // the callback was actually applied (not dropped on the floor).
-    const own = await rdb.query.todos.findMany({
+    const own = await rbacDb.query.todos.findMany({
       where: (t: any, { eq: e }: any) => e(t.title, "alice-1"),
     });
     assert.equal(own.length, 1);
@@ -265,31 +265,31 @@ describe("rbacDb.query — relational query API", () => {
       schema: allTables,
       enforce: localRbac.enforce,
     });
-    const rdb = localRdbFor(ctxFor(alice.id));
+    const rbacDb = localRdbFor(ctxFor(alice.id));
     // `with: { ownerId: ... }` triggers enforce(users, "read") on the related
     // table; alice has no users grant, so the walker must surface the throw.
     await assert.rejects(
-      () => rdb.query.todos.findMany({ with: { ownerId: true } }),
+      () => rbacDb.query.todos.findMany({ with: { ownerId: true } }),
       /FORBIDDEN|forbidden|denied/i,
     );
   });
 
   it("with: passes through unknown relation keys unchanged (Drizzle surfaces the error)", async () => {
-    const { rdbFor, cast: { bob } } = tc; // admin — bypasses enforce
-    const rdb = rdbFor(ctxFor(bob.id));
+    const { rbacDbFor, cast: { bob } } = tc; // admin — bypasses enforce
+    const rbacDb = rbacDbFor(ctxFor(bob.id));
     // Unknown relation key — our walker doesn't know it, so it passes through;
     // Drizzle is then the one that complains. We assert *something* throws, not
     // a specific message, because the wording is Drizzle's to own.
     await assert.rejects(
-      () => rdb.query.todos.findMany({ with: { nonexistent: true } }),
+      () => rbacDb.query.todos.findMany({ with: { nonexistent: true } }),
     );
   });
 });
 
 describe("rbacDb — proxy plumbing", () => {
   it("select(table) on a table not in the schema namespace throws a clear message", () => {
-    const { rdbFor, cast: { bob } } = tc;
-    const rdb = rdbFor(ctxFor(bob.id));
+    const { rbacDbFor, cast: { bob } } = tc;
+    const rbacDb = rbacDbFor(ctxFor(bob.id));
     // A table object the factory never saw — must NOT silently bypass enforce
     // and must NOT crash with an opaque undefined-deref. The error names the
     // contract so callers can act on it.
@@ -297,16 +297,16 @@ describe("rbacDb — proxy plumbing", () => {
       id: integer("id").primaryKey({ autoIncrement: true }),
     });
     assert.throws(
-      () => rdb.select().from(stray),
+      () => rbacDb.select().from(stray),
       /not registered in the schema namespace/,
       "unregistered tables must be rejected at .from()",
     );
   });
 
   it("select(projection) forwards the projected shape verbatim through the proxy", async () => {
-    const { rdbFor, cast: { bob } } = tc; // admin → sees all rows
-    const rdb = rdbFor(ctxFor(bob.id));
-    const rows: any[] = await rdb.select({ id: todos.id }).from(todos);
+    const { rbacDbFor, cast: { bob } } = tc; // admin → sees all rows
+    const rbacDb = rbacDbFor(ctxFor(bob.id));
+    const rows: any[] = await rbacDb.select({ id: todos.id }).from(todos);
     assert.equal(rows.length, 4);
     for (const r of rows) {
       assert.deepEqual(
@@ -322,9 +322,9 @@ describe("rbacDb — proxy plumbing", () => {
     // Exercises the makeWhereInjectingProxy branch where combineWhere returns
     // undefined and the proxy must NOT attach a `.where(...)` to the chain.
     // If a stray where slipped in, the row count would not match.
-    const { db, rdbFor, cast: { bob } } = tc;
-    const rdb = rdbFor(ctxFor(bob.id));
-    const updated: any[] = await rdb.update(todos).set({ title: "all-updated" }).returning();
+    const { db, rbacDbFor, cast: { bob } } = tc;
+    const rbacDb = rbacDbFor(ctxFor(bob.id));
+    const updated: any[] = await rbacDb.update(todos).set({ title: "all-updated" }).returning();
     assert.equal(updated.length, 4, "no where attached ⇒ every row updated");
     const all = await db.select().from(todos);
     assert.equal(all.length, 4);
@@ -334,15 +334,15 @@ describe("rbacDb — proxy plumbing", () => {
     );
   });
 
-  it("query.<unknownJsKey> falls through to the raw db.query[prop]", () => {
-    const { rdbFor, cast: { bob } } = tc;
-    const rdb = rdbFor(ctxFor(bob.id));
+  it("query.<unknownSchemaKey> falls through to the raw db.query[prop]", () => {
+    const { rbacDbFor, cast: { bob } } = tc;
+    const rbacDb = rbacDbFor(ctxFor(bob.id));
     // `nonexistent` is not a table in `allTables`; drizzle's relational query
     // object also has no such key, so the proxy's fallthrough returns
     // `db.query?.[prop]` which is `undefined`. The contract is "don't throw,
     // let drizzle decide" — proven by the absence of an exception and the
     // undefined value.
-    assert.equal(rdb.query.nonexistent, undefined);
+    assert.equal(rbacDb.query.nonexistent, undefined);
   });
 });
 
@@ -365,8 +365,8 @@ describe("rbacDb.bypassResources — opt-out passthrough for every mutating verb
 
   it("update on a bypassed resource skips enforce — a role-less user can mutate", async () => {
     const { db, cast: { carol } } = tc;
-    const rdb = buildBypassRdbFor()(ctxFor(carol.id));
-    const updated: any[] = await rdb
+    const rbacDb = buildBypassRdbFor()(ctxFor(carol.id));
+    const updated: any[] = await rbacDb
       .update(todos)
       .set({ title: "bypass-updated" })
       .where(eq(todos.title, "alice-1"))
@@ -385,8 +385,8 @@ describe("rbacDb.bypassResources — opt-out passthrough for every mutating verb
 
   it("delete on a bypassed resource skips enforce — a role-less user can delete", async () => {
     const { db, cast: { carol } } = tc;
-    const rdb = buildBypassRdbFor()(ctxFor(carol.id));
-    const deleted: any[] = await rdb
+    const rbacDb = buildBypassRdbFor()(ctxFor(carol.id));
+    const deleted: any[] = await rbacDb
       .delete(todos)
       .where(eq(todos.title, "alice-1"))
       .returning();
@@ -403,8 +403,8 @@ describe("rbacDb.bypassResources — opt-out passthrough for every mutating verb
 
   it("insert on a bypassed resource skips enforce — a role-less user can create", async () => {
     const { db, cast: { carol } } = tc;
-    const rdb = buildBypassRdbFor()(ctxFor(carol.id));
-    const inserted: any[] = await rdb
+    const rbacDb = buildBypassRdbFor()(ctxFor(carol.id));
+    const inserted: any[] = await rbacDb
       .insert(todos)
       .values({ title: "bypass-inserted", ownerId: carol.id })
       .returning();
@@ -421,18 +421,18 @@ describe("rbacDb.bypassResources — opt-out passthrough for every mutating verb
 
 describe("rbacDb.transaction — sync-dialect guard", () => {
   it("throws on better-sqlite3 (sync dialect) with a sudo-handoff hint", async () => {
-    const { rdbFor, cast: { alice } } = tc;
-    const rdb = rdbFor(ctxFor(alice.id));
+    const { rbacDbFor, cast: { alice } } = tc;
+    const rbacDb = rbacDbFor(ctxFor(alice.id));
     assert.throws(
-      () => rdb.transaction(async () => undefined),
-      /sync dialects.*rdb\.sudo\.transaction/i,
+      () => rbacDb.transaction(async () => undefined),
+      /sync dialects.*rbacDb\.sudo\.transaction/i,
     );
   });
 
   it(".sudo.transaction is the documented escape and runs the sync callback", async () => {
-    const { rdbFor, cast: { alice } } = tc;
-    const rdb = rdbFor(ctxFor(alice.id));
-    const out: any[] = rdb.sudo.transaction((tx: any) => {
+    const { rbacDbFor, cast: { alice } } = tc;
+    const rbacDb = rbacDbFor(ctxFor(alice.id));
+    const out: any[] = rbacDb.sudo.transaction((tx: any) => {
       const inserted = tx
         .insert(todos)
         .values({ title: "tx-sudo", ownerId: alice.id })
@@ -442,7 +442,7 @@ describe("rbacDb.transaction — sync-dialect guard", () => {
     });
     assert.equal(out[0].title, "tx-sudo");
     // Use sudo to read it back (alice's read view also includes it since she owns it).
-    const [hit] = await rdb.select().from(todos).where(eq(todos.title, "tx-sudo"));
+    const [hit] = await rbacDb.select().from(todos).where(eq(todos.title, "tx-sudo"));
     assert.equal(hit.title, "tx-sudo");
     void users;
   });

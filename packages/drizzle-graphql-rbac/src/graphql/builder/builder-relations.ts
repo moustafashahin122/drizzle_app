@@ -27,7 +27,7 @@ import type { DomainContext } from "../domain/domain.js";
 import { GraphQLJSON } from "./scalars.js";
 import type { DrizzleLike, Guard, TableMeta } from "./types.js";
 import {
-  jsKeyOf,
+  schemaKeyOf,
   projectionForSelection,
   selectProjected,
   whereDomainToSql,
@@ -79,7 +79,7 @@ export function buildRelationField(
    * disabled or the referenced resource is on the bypass list — in that
    * case nested traversal behaves like a sudo read.
    */
-  refGuard: Guard,
+  referencedGuard: Guard,
 ): GraphQLFieldConfig<any, any> {
 
   const isMany = rel.kind === "many";
@@ -98,9 +98,9 @@ export function buildRelationField(
         }
       : undefined,
     resolve: async (parent, args, context, info) => {
-      const localCols = rel.fields;
-      const refCols = rel.references;
-      if (!localCols?.length || !refCols?.length) return isMany ? [] : null;
+      const localColumns = rel.fields;
+      const referencedColumns = rel.references;
+      if (!localColumns?.length || !referencedColumns?.length) return isMany ? [] : null;
 
       // Clamp the caller's limit to the configured cap for many-relations.
       // `one` relations don't expose a `limit` arg. Copy; don't mutate.
@@ -110,19 +110,19 @@ export function buildRelationField(
       }
 
       const keys: unknown[] = [];
-      for (let i = 0; i < refCols.length; i++) {
-        const localKey = jsKeyOf(parentMeta.columns, localCols[i]);
-        if (!localKey) return isMany ? [] : null;
-        const v = parent?.[localKey];
-        if (v === undefined || v === null) return isMany ? [] : null;
-        keys.push(v);
+      for (let i = 0; i < referencedColumns.length; i++) {
+        const localColumnKey = schemaKeyOf(parentMeta.columns, localColumns[i]);
+        if (!localColumnKey) return isMany ? [] : null;
+        const keyValue = parent?.[localColumnKey];
+        if (keyValue === undefined || keyValue === null) return isMany ? [] : null;
+        keys.push(keyValue);
       }
 
       // Enforce RBAC on the referenced table: throws FORBIDDEN if the caller
       // has no read ACL, otherwise returns the row-level extra-where to AND
       // into the join. Without this, nested relation traversal would bypass
       // record rules that root resolvers do enforce.
-      const rbacWhere = refGuard ? await refGuard(context, "read") : undefined;
+      const rbacWhere = referencedGuard ? await referencedGuard(context, "read") : undefined;
       const argsWhere = isMany
         ? whereDomainToSql(args?.where, refMeta, refCtx, context)
         : undefined;
@@ -134,12 +134,12 @@ export function buildRelationField(
       const batch: BatchCache | undefined = context?.batch;
       const canBatch =
         !!batch &&
-        refCols.length === 1 &&
+        referencedColumns.length === 1 &&
         !(isMany && (args?.limit != null || args?.offset != null));
 
       if (!canBatch) {
         const conds: SQL[] = [];
-        for (let i = 0; i < refCols.length; i++) conds.push(eq(refCols[i], keys[i] as any));
+        for (let i = 0; i < referencedColumns.length; i++) conds.push(eq(referencedColumns[i], keys[i] as any));
         const joinSql = conds.length === 1 ? conds[0] : and(...conds);
         const where = combineWhere(joinSql, userWhere);
         const rows = await applyListArgs(
@@ -191,7 +191,7 @@ function createRelationLoader(
   relationBatchSize: number,
 ): RelationLoader {
   const refCol = rel.references![0];
-  const refKeyName = jsKeyOf(refMeta.columns, refCol);
+  const refKeyName = schemaKeyOf(refMeta.columns, refCol);
   // Ensure the join column is in the projection — even if the client didn't
   // request it, the loader needs it to bucket rows back to their parents.
   let proj = projection;

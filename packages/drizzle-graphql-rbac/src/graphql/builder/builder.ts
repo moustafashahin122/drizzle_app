@@ -22,8 +22,8 @@
  *    `Insert` / `Update` / `OrderBy` input types.
  * 3. **Pass 2** (`./builder-resolvers.ts`) — wire per-table root fields onto
  *    `Query` and `Mutation`:
- *      - `<jsKey>(where?: JSON, orderBy?, limit?, offset?): [<Type>!]!`
- *      - `<jsKey>Single(where?: JSON, orderBy?): <Type>`
+ *      - `<schemaKey>(where?: JSON, orderBy?, limit?, offset?): [<Type>!]!`
+ *      - `<schemaKey>Single(where?: JSON, orderBy?): <Type>`
  *      - `insertInto<Type>(values: [<Type>Insert!]!): [<Type>!]!`
  *      - `update<Type>(set: <Type>Update!, where?: JSON): [<Type>!]!`
  *      - `deleteFrom<Type>(where?: JSON): [<Type>!]!`
@@ -122,7 +122,7 @@ export interface BuildSchemaOptions {
    * row-level filter). Admin callers receive `{}` (no filter, no throw).
    *
    * `resource` is the table's JS schema key (the same key used for the
-   * `Query.<jsKey>` root field).
+   * `Query.<schemaKey>` root field).
    *
    * Insert resolvers run the ACL check only; record rules on `create` are
    * not modeled — any `where` fragment returned for `create` is ignored.
@@ -203,16 +203,16 @@ export function buildSchema(
   // Per-table guard, reused by both root resolvers and nested-relation
   // traversal so nested fields enforce the same record rules and read ACL on
   // the referenced resource.
-  const guardFor = (m: TableMeta) => makeGuard(rbac, m.jsKey, m.columns);
+  const guardFor = (m: TableMeta) => makeGuard(rbac, m.schemaKey, m.columns);
 
   // Pass 1: build object types (with relation field thunks) + input types.
-  for (const [jsKey, table] of intro.tablesByKey) {
+  for (const [schemaKey, table] of intro.tablesByKey) {
     const sqlName = getTableName(table);
-    const typeName = options.typeNames?.[jsKey] ?? cap(jsKey);
-    const hiddenOutput = new Set(options.hiddenOutputColumns?.[jsKey] ?? []);
-    const hiddenInput = new Set(options.hiddenInputColumns?.[jsKey] ?? []);
+    const typeName = options.typeNames?.[schemaKey] ?? cap(schemaKey);
+    const hiddenOutput = new Set(options.hiddenOutputColumns?.[schemaKey] ?? []);
+    const hiddenInput = new Set(options.hiddenInputColumns?.[schemaKey] ?? []);
     const meta = buildTableMeta(
-      jsKey,
+      schemaKey,
       table,
       typeName,
       intro,
@@ -237,7 +237,7 @@ export function buildSchema(
 
   if (options.extraQueryFields || options.extraMutationFields) {
     const typesByKey: Record<string, GraphQLObjectType> = {};
-    for (const m of metas.values()) typesByKey[m.jsKey] = m.objectType;
+    for (const m of metas.values()) typesByKey[m.schemaKey] = m.objectType;
     Object.assign(queryFields, options.extraQueryFields?.(typesByKey) ?? {});
     Object.assign(mutationFields, options.extraMutationFields?.(typesByKey) ?? {});
   }

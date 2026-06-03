@@ -49,17 +49,17 @@ const aclConfig = {
 
 const tc = transactionCase(async () => {
   const rbac = buildRbac(aclConfig);
-  const rdbFor = buildRbacDb({ db, schema: allTables, enforce: rbac.enforce });
+  const rbacDbFor = buildRbacDb({ db, schema: allTables, enforce: rbac.enforce });
   const cast = await seedUserManager(rbac);
-  return { db, rbac, rdbFor, cast };
+  return { db, rbac, rbacDbFor, cast };
 });
 
 describe("access rights — verb-level gating with no record rules", () => {
   describe("user role — has read/create/update, lacks delete", () => {
     it("can read every row in the table (no record rule narrows)", async () => {
-      const { rdbFor, cast: { alice, bob, carol } } = tc;
-      const rdb = rdbFor(ctxFor(alice.id));
-      const rows = await rdb.select().from(todos);
+      const { rbacDbFor, cast: { alice, bob, carol } } = tc;
+      const rbacDb = rbacDbFor(ctxFor(alice.id));
+      const rows = await rbacDb.select().from(todos);
 
       assert.equal(rows.length, 4, "user with read+no-rule must see every row");
       const indexed = byTitle(rows as any[]);
@@ -72,9 +72,9 @@ describe("access rights — verb-level gating with no record rules", () => {
     });
 
     it("can create a todo; row persists with the supplied FK", async () => {
-      const { db, rdbFor, cast: { alice } } = tc;
-      const rdb = rdbFor(ctxFor(alice.id));
-      const out = await rdb
+      const { db, rbacDbFor, cast: { alice } } = tc;
+      const rbacDb = rbacDbFor(ctxFor(alice.id));
+      const out = await rbacDb
         .insert(todos)
         .values({ title: "alice-3", ownerId: alice.id })
         .returning();
@@ -93,9 +93,9 @@ describe("access rights — verb-level gating with no record rules", () => {
     });
 
     it("can update ANY row — without a record rule, ACL does not row-scope", async () => {
-      const { db, rdbFor, cast: { alice, bob } } = tc;
-      const rdb = rdbFor(ctxFor(alice.id));
-      const updated = await rdb
+      const { db, rbacDbFor, cast: { alice, bob } } = tc;
+      const rbacDb = rbacDbFor(ctxFor(alice.id));
+      const updated = await rbacDb
         .update(todos)
         .set({ title: "edited-by-alice" })
         .where(eq(todos.title, "bob-1"))
@@ -116,17 +116,17 @@ describe("access rights — verb-level gating with no record rules", () => {
     });
 
     it("cannot delete any row — verb flag missing → Access denied; DB untouched", async () => {
-      const { db, rdbFor, cast: { alice } } = tc;
-      const rdb = rdbFor(ctxFor(alice.id));
+      const { db, rbacDbFor, cast: { alice } } = tc;
+      const rbacDb = rbacDbFor(ctxFor(alice.id));
 
       // Try to delete own row — ACL denies before any row-scope check.
       await assert.rejects(
-        () => rdb.delete(todos).where(eq(todos.title, "alice-1")).returning(),
+        () => rbacDb.delete(todos).where(eq(todos.title, "alice-1")).returning(),
         /Access denied/,
       );
       // And cross-owner — same deny, same reason (it's verb-level).
       await assert.rejects(
-        () => rdb.delete(todos).where(eq(todos.title, "bob-1")).returning(),
+        () => rbacDb.delete(todos).where(eq(todos.title, "bob-1")).returning(),
         /Access denied/,
       );
 
@@ -141,9 +141,9 @@ describe("access rights — verb-level gating with no record rules", () => {
 
   describe("manager role — full CRUD, every verb permitted", () => {
     it("can read every row", async () => {
-      const { rdbFor, cast: { alice, bob, carol } } = tc;
-      const rdb = rdbFor(ctxFor(carol.id));
-      const rows = await rdb.select().from(todos);
+      const { rbacDbFor, cast: { alice, bob, carol } } = tc;
+      const rbacDb = rbacDbFor(ctxFor(carol.id));
+      const rows = await rbacDb.select().from(todos);
       assert.equal(rows.length, 4);
       // Full tuples by title — a Set-based check would still pass if a row
       // were silently swapped or duplicated.
@@ -158,9 +158,9 @@ describe("access rights — verb-level gating with no record rules", () => {
     });
 
     it("can update a user's row (cross-owner allowed at ACL layer)", async () => {
-      const { db, rdbFor, cast: { bob, carol } } = tc;
-      const rdb = rdbFor(ctxFor(carol.id));
-      const updated = await rdb
+      const { db, rbacDbFor, cast: { bob, carol } } = tc;
+      const rbacDb = rbacDbFor(ctxFor(carol.id));
+      const updated = await rbacDb
         .update(todos)
         .set({ title: "edited-by-manager" })
         .where(eq(todos.title, "bob-1"))
@@ -173,9 +173,9 @@ describe("access rights — verb-level gating with no record rules", () => {
     });
 
     it("can delete a user's row; only that row disappears", async () => {
-      const { db, rdbFor, cast: { bob, carol } } = tc;
-      const rdb = rdbFor(ctxFor(carol.id));
-      const deleted = await rdb
+      const { db, rbacDbFor, cast: { bob, carol } } = tc;
+      const rbacDb = rbacDbFor(ctxFor(carol.id));
+      const deleted = await rbacDb
         .delete(todos)
         .where(eq(todos.title, "bob-1"))
         .returning();
@@ -192,9 +192,9 @@ describe("access rights — verb-level gating with no record rules", () => {
     });
 
     it("can create a todo of their own", async () => {
-      const { db, rdbFor, cast: { carol } } = tc;
-      const rdb = rdbFor(ctxFor(carol.id));
-      const out = await rdb
+      const { db, rbacDbFor, cast: { carol } } = tc;
+      const rbacDb = rbacDbFor(ctxFor(carol.id));
+      const out = await rbacDb
         .insert(todos)
         .values({ title: "carol-2", ownerId: carol.id })
         .returning();
@@ -209,25 +209,25 @@ describe("access rights — verb-level gating with no record rules", () => {
   describe("non-actor deny paths", () => {
     const VERBS = ["select", "insert", "update", "delete"] as const;
 
-    function actFor(rdb: ReturnType<ReturnType<typeof buildRbacDb>>, verb: typeof VERBS[number], ownerId: number) {
+    function actFor(rbacDb: ReturnType<ReturnType<typeof buildRbacDb>>, verb: typeof VERBS[number], ownerId: number) {
       switch (verb) {
-        case "select": return () => rdb.select().from(todos);
-        case "insert": return () => rdb.insert(todos).values({ title: "x", ownerId }).returning();
-        case "update": return () => rdb.update(todos).set({ title: "x" }).where(eq(todos.title, "alice-1")).returning();
-        case "delete": return () => rdb.delete(todos).where(eq(todos.title, "alice-1")).returning();
+        case "select": return () => rbacDb.select().from(todos);
+        case "insert": return () => rbacDb.insert(todos).values({ title: "x", ownerId }).returning();
+        case "update": return () => rbacDb.update(todos).set({ title: "x" }).where(eq(todos.title, "alice-1")).returning();
+        case "delete": return () => rbacDb.delete(todos).where(eq(todos.title, "alice-1")).returning();
       }
     }
 
     it("role-less authenticated user is denied on every verb; DB unchanged", async () => {
-      const { db, rdbFor, cast: { alice } } = tc;
+      const { db, rbacDbFor, cast: { alice } } = tc;
       // Insert a 4th user with no role assignment. The savepoint rolls
       // this row back after the test, so subsequent tests see the same
       // 3-actor cast.
       const [dave] = await db.insert(users).values({ name: "Dave" }).returning();
-      const rdb = rdbFor(ctxFor(dave.id));
+      const rbacDb = rbacDbFor(ctxFor(dave.id));
 
       for (const verb of VERBS) {
-        await assert.rejects(actFor(rdb, verb, alice.id), /Access denied/, `verb=${verb}`);
+        await assert.rejects(actFor(rbacDb, verb, alice.id), /Access denied/, `verb=${verb}`);
       }
 
       const all = await db.select().from(todos);
@@ -236,11 +236,11 @@ describe("access rights — verb-level gating with no record rules", () => {
     });
 
     it("anonymous caller is rejected as Not authenticated on every verb", async () => {
-      const { db, rdbFor, cast: { alice } } = tc;
-      const rdb = rdbFor(anonCtx());
+      const { db, rbacDbFor, cast: { alice } } = tc;
+      const rbacDb = rbacDbFor(anonCtx());
 
       for (const verb of VERBS) {
-        await assert.rejects(actFor(rdb, verb, alice.id), /Not authenticated/, `verb=${verb}`);
+        await assert.rejects(actFor(rbacDb, verb, alice.id), /Not authenticated/, `verb=${verb}`);
       }
 
       const all = await db.select().from(todos);

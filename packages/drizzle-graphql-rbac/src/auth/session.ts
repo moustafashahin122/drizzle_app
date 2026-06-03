@@ -28,6 +28,23 @@ const SESSION_MS = SESSION_DAYS * 86_400_000;
 const SESSION_REFRESH_MS = SESSION_MS / 2;
 export const SESSION_COOKIE_NAME = "sid";
 
+// In-process resolution cache. Under load this collapses the per-request
+// session+user+role JOIN into one DB round-trip per token per TTL window —
+// for a remote DB this halves p50 on read-heavy traffic. TTL is short so
+// role/active-flag flips take effect quickly without explicit invalidation;
+// `destroySession` does invalidate immediately so logout is not delayed.
+type ResolvedSession = {
+  user: User | null;
+  session: Session | null;
+  role: { name: string; isAdmin: boolean } | null;
+};
+const SESSION_CACHE_TTL_MS = Number(process.env.SESSION_CACHE_TTL_MS ?? 2000);
+const sessionCache = new Map<string, { expiresAt: number; value: ResolvedSession }>();
+
+function invalidateSessionToken(token: string): void {
+  sessionCache.delete(token);
+}
+
 /**
  * Structural shape of the two tables the auth layer touches. Typed against
  * the framework's own `users` / `sessions` definitions in `../tables.js` —
@@ -150,6 +167,9 @@ export async function resolveSessionFromToken(
   role: { name: string; isAdmin: boolean } | null;
 }> {
   if (!token) return { user: null, session: null, role: null };
+
+  const cached = sessionCache.get(token);
+  if (cached && cached.expiresAt > Date.now()) return cached.value;
 
   const { users, sessions, roles } = schema;
   const now = Date.now();

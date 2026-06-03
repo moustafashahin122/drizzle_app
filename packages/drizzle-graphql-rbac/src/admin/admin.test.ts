@@ -39,14 +39,14 @@ before(async () => {
     recordRules: defineRecordRules({}),
   });
   await syncRoles(db, { roles, users }, rbac.roles());
-  const rdbFor = buildRbacDb({ db, schema: frameworkSchema, enforce: rbac.enforce });
+  const rbacDbFor = buildRbacDb({ db, schema: frameworkSchema, enforce: rbac.enforce });
   authApp = buildAuthRoutes({ db, schema: frameworkSchema });
   adminApp = buildAdminRoutes({
     db,
     schema: frameworkSchema,
     usersTable: users,
     rolesTable: roles,
-    rdbFor,
+    rbacDbFor,
     rbac,
   });
 });

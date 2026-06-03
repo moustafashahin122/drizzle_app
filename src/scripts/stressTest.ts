@@ -10,7 +10,7 @@
  * throughput, error counts, and latency percentiles per operation kind.
  */
 
-type Op = {
+type GraphQLOperation = {
   name: string;
   weight: number;
   build: (ctx: { userIdx: number; counter: number }) => { query: string; variables?: Record<string, unknown> };
@@ -20,8 +20,8 @@ type Session = { email: string; sid: string };
 
 const args = Object.fromEntries(
   process.argv.slice(2).map((a) => {
-    const m = a.match(/^--([^=]+)=(.*)$/);
-    return m ? [m[1], m[2]] : [a.replace(/^--/, ""), "true"];
+    const argsMatch = a.match(/^--([^=]+)=(.*)$/);
+    return argsMatch ? [argsMatch[1], argsMatch[2]] : [a.replace(/^--/, ""), "true"];
   }),
 ) as Record<string, string>;
 
@@ -40,12 +40,12 @@ async function login(email: string): Promise<Session> {
   });
   if (!res.ok) throw new Error(`login ${email} -> ${res.status}`);
   const setCookie = res.headers.get("set-cookie") ?? "";
-  const m = setCookie.match(/sid=([^;]+)/);
-  if (!m) throw new Error(`no sid cookie for ${email}`);
-  return { email, sid: m[1] };
+  const sidMatch = setCookie.match(/sid=([^;]+)/);
+  if (!sidMatch) throw new Error(`no sid cookie for ${email}`);
+  return { email, sid: sidMatch[1] };
 }
 
-const OPS: Op[] = [
+const OPERATIONS: GraphQLOperation[] = [
   {
     name: "todos.list",
     weight: 5,
@@ -101,24 +101,24 @@ const OPS: Op[] = [
   },
 ];
 
-const TOTAL_WEIGHT = OPS.reduce((s, o) => s + o.weight, 0);
+const TOTAL_WEIGHT = OPERATIONS.reduce((s, operation) => s + operation.weight, 0);
 
-function pickOp(): Op {
-  let r = Math.random() * TOTAL_WEIGHT;
-  for (const o of OPS) {
-    r -= o.weight;
-    if (r <= 0) return o;
+function pickOp(): GraphQLOperation {
+  let remainingWeight = Math.random() * TOTAL_WEIGHT;
+  for (const operation of OPERATIONS) {
+    remainingWeight -= operation.weight;
+    if (remainingWeight <= 0) return operation;
   }
-  return OPS[0]!;
+  return OPERATIONS[0]!;
 }
 
-type Stat = { count: number; errors: number; gqlErrors: number; latencies: number[] };
-const stats = new Map<string, Stat>();
-function getStat(name: string): Stat {
-  let s = stats.get(name);
+type OperationStat = { count: number; errors: number; gqlErrors: number; latencies: number[] };
+const statsByOperation = new Map<string, OperationStat>();
+function getStat(name: string): OperationStat {
+  let s = statsByOperation.get(name);
   if (!s) {
     s = { count: 0, errors: 0, gqlErrors: 0, latencies: [] };
-    stats.set(name, s);
+    statsByOperation.set(name, s);
   }
   return s;
 }
@@ -127,7 +127,7 @@ async function runWorker(sessions: Session[], stopAt: number, workerId: number):
   let counter = 0;
   while (Date.now() < stopAt) {
     const userIdx = workerId % sessions.length;
-    const sess = sessions[userIdx]!;
+    const session = sessions[userIdx]!;
     const op = pickOp();
     const body = op.build({ userIdx, counter: counter++ });
     const stat = getStat(op.name);
@@ -135,11 +135,11 @@ async function runWorker(sessions: Session[], stopAt: number, workerId: number):
     try {
       const res = await fetch(`${URL_BASE}/graphql`, {
         method: "POST",
-        headers: { "content-type": "application/json", cookie: `sid=${sess.sid}` },
+        headers: { "content-type": "application/json", cookie: `sid=${session.sid}` },
         body: JSON.stringify(body),
       });
-      const dt = performance.now() - t0;
-      stat.latencies.push(dt);
+      const latencyMs = performance.now() - t0;
+      stat.latencies.push(latencyMs);
       stat.count++;
       if (!res.ok) {
         stat.errors++;
@@ -155,13 +155,13 @@ async function runWorker(sessions: Session[], stopAt: number, workerId: number):
   }
 }
 
-function pct(sorted: number[], p: number): number {
+function pct(sorted: number[], percentile: number): number {
   if (sorted.length === 0) return 0;
-  const idx = Math.min(sorted.length - 1, Math.floor((p / 100) * sorted.length));
+  const idx = Math.min(sorted.length - 1, Math.floor((percentile / 100) * sorted.length));
   return sorted[idx]!;
 }
 
-function fmt(n: number): string {
+function formatMetric(n: number): string {
   return n.toFixed(1).padStart(7);
 }
 
@@ -187,20 +187,20 @@ async function main(): Promise<void> {
   console.log(
     `-----------------------------------------------------------------------------------`,
   );
-  for (const [name, s] of [...stats.entries()].sort()) {
+  for (const [name, s] of [...statsByOperation.entries()].sort()) {
     const sorted = [...s.latencies].sort((a, b) => a - b);
     totalReq += s.count;
     totalErr += s.errors;
     totalGqlErr += s.gqlErrors;
     console.log(
-      `${name.padEnd(22)}${String(s.count).padStart(6)}${String(s.errors).padStart(7)}${String(s.gqlErrors).padStart(8)}  ${fmt(s.count / elapsed)} ${fmt(pct(sorted, 50))} ${fmt(pct(sorted, 95))} ${fmt(pct(sorted, 99))} ${fmt(sorted.at(-1) ?? 0)}`,
+      `${name.padEnd(22)}${String(s.count).padStart(6)}${String(s.errors).padStart(7)}${String(s.gqlErrors).padStart(8)}  ${formatMetric(s.count / elapsed)} ${formatMetric(pct(sorted, 50))} ${formatMetric(pct(sorted, 95))} ${formatMetric(pct(sorted, 99))} ${formatMetric(sorted.at(-1) ?? 0)}`,
     );
   }
   console.log(
     `-----------------------------------------------------------------------------------`,
   );
   console.log(
-    `TOTAL                 ${String(totalReq).padStart(5)}${String(totalErr).padStart(7)}${String(totalGqlErr).padStart(8)}  ${fmt(totalReq / elapsed)}    (elapsed ${elapsed.toFixed(2)}s)`,
+    `TOTAL                 ${String(totalReq).padStart(5)}${String(totalErr).padStart(7)}${String(totalGqlErr).padStart(8)}  ${formatMetric(totalReq / elapsed)}    (elapsed ${elapsed.toFixed(2)}s)`,
   );
 }
 

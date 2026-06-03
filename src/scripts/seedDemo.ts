@@ -17,7 +17,7 @@ import {
   logger,
   syncRoles,
   buildRbacConfig,
-  mergeFrameworkRbac,
+  mergeBuiltInRoles,
 } from "drizzle-graphql-rbac";
 import { sudoDb } from "../sudoDb.js";
 import {
@@ -136,7 +136,7 @@ export async function seedDemo({ reset = false }: { reset?: boolean } = {}): Pro
   // Sync the `roles` table with the in-code role config before assigning
   // `users.role_id` — the server normally does this at startup, but a fresh
   // checkout might run `seed:demo` before ever starting the server.
-  const merged = mergeFrameworkRbac({ roles: codeRoles, accessRights, recordRules });
+  const merged = mergeBuiltInRoles({ roles: codeRoles, accessRights, recordRules });
   const resolved = buildRbacConfig(merged);
   await syncRoles(
     sudoDb,

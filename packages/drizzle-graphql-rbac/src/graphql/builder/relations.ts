@@ -45,7 +45,7 @@ import {
   Table,
   type Column,
 } from "drizzle-orm";
-import { jsKeyOf } from "./jsKey.js";
+import { schemaKeyOf } from "./schemaKey.js";
 
 /**
  * Symbols Drizzle uses to attach inline foreign keys to a table instance, one
@@ -200,12 +200,12 @@ export function introspectSchema(schema: Record<string, unknown>): SchemaIntrosp
     for (const fk of getInlineForeignKeys(sourceTable)) {
       if (fk.columns.length !== 1) continue; // skip composite FKs
       const localCol = fk.columns[0];
-      const refTable = fk.foreignTable;
-      const refName = getTableName(refTable);
+      const referencedTable = fk.foreignTable;
+      const referencedTableName = getTableName(referencedTable);
       // Only register if the referenced table is part of the schema we know about.
-      if (!tables.has(refName)) continue;
+      if (!tables.has(referencedTableName)) continue;
 
-      const localKey = jsKeyOf(sourceCols, localCol);
+      const localKey = schemaKeyOf(sourceCols, localCol);
       if (!localKey) continue;
 
       // Forward "one": named after the FK column's JS key (e.g. "assigneeId").
@@ -214,7 +214,7 @@ export function introspectSchema(schema: Record<string, unknown>): SchemaIntrosp
           fieldName: localKey,
           kind: "one",
           sourceTable,
-          referencedTable: refTable,
+          referencedTable: referencedTable,
           fields: fk.columns,
           references: fk.foreignColumns,
         });
@@ -225,20 +225,20 @@ export function introspectSchema(schema: Record<string, unknown>): SchemaIntrosp
       // (e.g. "todos" on the assignees object). Skip if already taken.
       const inverseFieldName = keyByTableName.get(sourceName);
       if (!inverseFieldName) continue;
-      const refList = relationsByTable.get(refName) ?? [];
-      if (refList.some((r) => r.fieldName === inverseFieldName)) {
-        relationsByTable.set(refName, refList);
+      const referencedRelations = relationsByTable.get(referencedTableName) ?? [];
+      if (referencedRelations.some((r) => r.fieldName === inverseFieldName)) {
+        relationsByTable.set(referencedTableName, referencedRelations);
         continue;
       }
-      refList.push({
+      referencedRelations.push({
         fieldName: inverseFieldName,
         kind: "many",
-        sourceTable: refTable,
+        sourceTable: referencedTable,
         referencedTable: sourceTable,
         fields: fk.foreignColumns,
         references: fk.columns,
       });
-      relationsByTable.set(refName, refList);
+      relationsByTable.set(referencedTableName, referencedRelations);
     }
     relationsByTable.set(sourceName, list);
   }
@@ -247,9 +247,9 @@ export function introspectSchema(schema: Record<string, unknown>): SchemaIntrosp
   for (const [tableName, list] of relationsByTable) {
     for (const rel of list) {
       if (rel.kind !== "one" || !rel.fields || !rel.references) continue;
-      const refName = getTableName(rel.referencedTable);
-      const refList = relationsByTable.get(refName) ?? [];
-      for (const back of refList) {
+      const referencedTableName = getTableName(rel.referencedTable);
+      const referencedRelations = relationsByTable.get(referencedTableName) ?? [];
+      for (const back of referencedRelations) {
         if (back.kind === "many" && getTableName(back.referencedTable) === tableName &&
             back.relationName === rel.relationName && !back.fields) {
           back.fields = rel.references;

@@ -216,25 +216,25 @@ function dottedLeafToSql(
 ): SQL | undefined {
   if (!ctx) return undefined;
   const [head, ...rest] = path;
-  const rel = ctx.relations.find(
+  const relation = ctx.relations.find(
     (r) => r.fieldName === head && r.fields?.length === 1 && r.references?.length === 1,
   );
-  if (!rel) return undefined;
-  const refInfo = ctx.lookup(getTableName(rel.referencedTable));
-  if (!refInfo) return undefined;
+  if (!relation) return undefined;
+  const referencedInfo = ctx.lookup(getTableName(relation.referencedTable));
+  if (!referencedInfo) return undefined;
 
   const innerSql = rest.length > 1
-    ? dottedLeafToSql(rest, op, value, refInfo.columns, {
+    ? dottedLeafToSql(rest, op, value, referencedInfo.columns, {
         db: ctx.db,
-        relations: refInfo.relations,
+        relations: referencedInfo.relations,
         lookup: ctx.lookup,
       })
-    : leafToSql(refInfo.columns[rest[0]], op, value);
+    : leafToSql(referencedInfo.columns[rest[0]], op, value);
   if (!innerSql) return undefined;
 
-  const localCol = rel.fields![0];
-  const remoteCol = rel.references![0];
-  const sub = ctx.db.select({ __ref: remoteCol }).from(refInfo.table).where(innerSql);
+  const localCol = relation.fields![0];
+  const remoteCol = relation.references![0];
+  const sub = ctx.db.select({ __ref: remoteCol }).from(referencedInfo.table).where(innerSql);
   return inArray(localCol, sub);
 }
 

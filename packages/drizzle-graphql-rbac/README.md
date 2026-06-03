@@ -14,7 +14,7 @@ A single `createApp(...)` call stands up an HTTP service with a fully-typed Grap
 - **Origin-based CSRF.** Same-origin gate is enabled by default via Hono's `csrf` middleware (with an `origin` allowlist option); disable it explicitly only when fronted by a CSRF-aware gateway.
 - **Code-defined, in-memory RBAC.** Roles, access rights, and record rules are declared in TypeScript and compiled into the engine snapshot at startup — no migrations, no sync routines, no DB drift. User → role assignments live in process memory and can be mutated at runtime via the REST API or the engine handle.
 - **Row-level security with a domain DSL.** Per-role, per-action record rules written in an Odoo-style domain language (`["&", [...], ["|", [...], [...]]]`) are compiled to SQL and AND-injected into every read, update, and delete.
-- **Per-request enforcement wrapper.** `rdbFor(ctx)` returns a Drizzle handle that automatically applies the caller's RBAC envelope to `select`, `insert`, `update`, `delete` — use it in custom routes and they're protected for free.
+- **Per-request enforcement wrapper.** `rbacDbFor(ctx)` returns a Drizzle handle that automatically applies the caller's RBAC envelope to `select`, `insert`, `update`, `delete` — use it in custom routes and they're protected for free.
 - **Multi-role union semantics.** Users may hold any number of roles; grants combine as the union and per-role record rules OR together. Matches Odoo's behavior exactly.
 - **Composable primitives.** `createApp` is a convenience layer over `buildSchema`, `buildRbac`, `buildRbacDb`, `buildAuthRoutes`, and `buildAdminRoutes` — use them directly when you need a custom pipeline.
 - **Hermetic, no-mocks test suite.** Every subsystem is exercised end-to-end through the generated GraphQL schema against in-memory SQLite. Reusable fixtures are published under the `drizzle-graphql-rbac/testing` subpath.
@@ -413,7 +413,7 @@ const { rbac, config, secrets } = await runServer();
 
 `runServer()` parses CLI flags, loads the config file, merges with `frameworkDefaultConfig`, resolves secrets, builds the app via `createApp`, optionally upserts the admin user (only when `--create-admin` / `createAdmin: true` is set — failures are logged but do not abort startup), and starts a Node listener via `@hono/node-server`. It returns:
 
-- the standard `createApp` handle (`app`, `rbac`, `rdbFor`, `sudoDb`)
+- the standard `createApp` handle (`app`, `rbac`, `rbacDbFor`, `sudoDb`)
 - the resolved `port` and `host`
 - the fully-merged `config` (defaults ← user config ← CLI)
 - the resolved `secrets` (env ← CLI)
@@ -591,16 +591,16 @@ There is **no inheritance** — each role's grants stand alone. If `manager` sho
 
 ### The framework-owned `admin` role
 
-The framework ships a single built-in role under the key `"admin"` with `isAdmin: true`. `createApp` automatically merges it in via `mergeFrameworkRbac` — app authors must NOT declare a role with key `"admin"` themselves; the merge throws on collision. The constant `ADMIN_ROLE` (`= "admin"`) is exported so tooling and seed scripts can reference the key without hard-coding the literal.
+The framework ships a single built-in role under the key `"admin"` with `isAdmin: true`. `createApp` automatically merges it in via `mergeBuiltInRoles` — app authors must NOT declare a role with key `"admin"` themselves; the merge throws on collision. The constant `ADMIN_ROLE` (`= "admin"`) is exported so tooling and seed scripts can reference the key without hard-coding the literal.
 
 `isAdmin: true` is a **full bypass**: no access-rights check, no record-rule filter, no list cap, no hidden-column trimming. Use it strictly for human operators and service accounts that legitimately need god-mode. Grant ordinary feature access through normal `accessRights` entries on non-admin roles.
 
 If you're calling `buildRbac` directly (lower-level than `createApp`) and want the framework admin, opt in:
 
 ```ts
-import { mergeFrameworkRbac, buildRbac } from "drizzle-graphql-rbac";
+import { mergeBuiltInRoles, buildRbac } from "drizzle-graphql-rbac";
 
-const rbac = buildRbac(mergeFrameworkRbac({ roles, accessRights, recordRules }));
+const rbac = buildRbac(mergeBuiltInRoles({ roles, accessRights, recordRules }));
 ```
 
 #### Creating the admin user
@@ -908,7 +908,7 @@ The admin sub-app is mounted behind `requireAuth` and a `requireAdmin` gate (cal
 ### Options
 
 ```ts
-const { app, rbac, rdbFor, sudoDb } = createApp({
+const { app, rbac, rbacDbFor, sudoDb } = createApp({
   db,
   schema,
   rbac: { roles, accessRights, recordRules },
@@ -934,7 +934,7 @@ See [HTTP & GraphQL security gates](#http--graphql-security-gates) for the secur
 
 - **`app`** — a Hono app. Pass `app.fetch` to `@hono/node-server`'s `serve`, or to any Web Fetch host.
 - **`rbac`** — the engine handle. Use it to seed memberships at startup and read/mutate them at runtime: `assignRole`, `revokeRole`, `listUserRoles`, `listRoleKeys`, `hasRole`, `isAdmin`, `enforce`.
-- **`rdbFor(ctx)`** — per-request RBAC-bound Drizzle wrapper. Use it in custom routes so they're enforced just like the auto-CRUD.
+- **`rbacDbFor(ctx)`** — per-request RBAC-bound Drizzle wrapper. Use it in custom routes so they're enforced just like the auto-CRUD.
 - **`sudoDb`** — the raw, unwrapped Drizzle handle (same instance you passed in), re-exported under a name that flags its bypass semantics. Use only in pre-user bootstrap paths (startup seeding, seed scripts).
 
 ### Per-request RBAC db
@@ -944,8 +944,8 @@ Inside a custom Hono route, build a wrapped Drizzle handle for the current user 
 ```ts
 app.get("/me/todos", async (c) => {
   const user = c.get("user");
-  const rdb = rdbFor({ user, batch: new Map() });
-  const rows = await rdb.select().from(todos); // automatically RBAC-filtered
+  const rbacDb = rbacDbFor({ user, batch: new Map() });
+  const rows = await rbacDb.select().from(todos); // automatically RBAC-filtered
   return c.json({ rows });
 });
 ```
@@ -971,20 +971,20 @@ import {
   buildAuthRoutes,        // /auth/* sub-app
   buildAdminRoutes,       // /admin/* sub-app
   sessionMiddleware,
-  mergeFrameworkRbac,
+  mergeBuiltInRoles,
   defineRoles,
   defineAccessRights,
   defineRecordRules,
 } from "drizzle-graphql-rbac";
 
-const rbac = buildRbac(mergeFrameworkRbac({ roles, accessRights, recordRules }));
+const rbac = buildRbac(mergeBuiltInRoles({ roles, accessRights, recordRules }));
 
 const { schema: gqlSchema } = buildSchema(db, schema, {
   rbac: { enforce: rbac.enforce },
   hiddenOutputColumns: { users: ["passwordHash"] },
 });
 
-const rdbFor = buildRbacDb({ db, schema, enforce: rbac.enforce });
+const rbacDbFor = buildRbacDb({ db, schema, enforce: rbac.enforce });
 ```
 
 `buildRbac` returns `{ enforce, listRoleKeys, listUserRoles, assignRole, revokeRole, hasRole, isAdmin }`. You can write a custom `enforce` if you want extra placeholders, multi-tenancy filters, or audit logging — it just needs to return `Promise<{ where?: SQL }>` (and throw `GraphQLError` with `extensions.code = "FORBIDDEN"` to deny). See `src/graphql/rbac/rbac.ts` for the reference implementation.
@@ -1027,7 +1027,7 @@ import {
 | `src/index.ts`                        | Public surface — re-exports everything below.                                                         |
 | `src/app.ts`                          | `createApp` composition root.                                                                         |
 | `src/tables.ts`                       | Drizzle definitions for `users` and `sessions` (also exported via `./tables`).                        |
-| `src/frameworkRbac.ts`                | Framework-owned `admin` role + `mergeFrameworkRbac` helper.                                           |
+| `src/builtInRoles.ts`                | Framework-owned `admin` role + `mergeBuiltInRoles` helper.                                           |
 | `src/auth/`                           | `/auth/*` REST sub-app, session primitives, Hono middleware, CSRF.                                    |
 | `src/admin/`                          | `/admin/*` REST sub-app (user CRUD + role membership).                                                |
 | `src/graphql/builder/`                | Schema generator: types, root fields, where/orderBy translation, relations introspection, depth limit. |
@@ -1040,4 +1040,4 @@ import {
 | `src/logger.ts`                       | Pino root logger (pretty on TTY, JSON otherwise) re-exported from the package.                        |
 
 
-Source layout is the source of truth — the public surface is everything re-exported from `src/index.ts`. The reference app at the repo root demonstrates a complete wiring (auto-seeded users + demo data, in-memory role binding, custom Hono routes that use `rdbFor`).
+Source layout is the source of truth — the public surface is everything re-exported from `src/index.ts`. The reference app at the repo root demonstrates a complete wiring (auto-seeded users + demo data, in-memory role binding, custom Hono routes that use `rbacDbFor`).
